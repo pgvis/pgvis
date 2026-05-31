@@ -24,6 +24,6 @@ pub use logic::parse_logic_tree;
 pub use order::{OrderItem, OrderRelationTerm, parse_order};
 pub use select::parse_select;
 pub use types::{
-    Filter, FilterValue, IsKind, LogicNode, LogicTree, NullsOrder, Operator, OrderDirection,
-    OrderTerm, Quantifier, RangeSpec,
+    CursorSpec, Filter, FilterValue, IsKind, LogicNode, LogicTree, NullsOrder, Operator,
+    OrderDirection, OrderTerm, Quantifier, RangeSpec,
 };

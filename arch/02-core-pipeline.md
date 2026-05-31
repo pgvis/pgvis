@@ -54,11 +54,11 @@ that becomes a JSON-aggregated subquery, with an optional `!hint` and
 flattened into the parent), and `Star`. The informal grammar is documented at
 the top of that file.
 
-Filter, ordering, logic, and range types live in
+Filter, ordering, logic, range, and cursor types live in
 [query_params/types.rs](../crates/pgvis-core/src/query_params/types.rs)
 (`Filter`, `FilterValue`, `Operator`, `Quantifier`, `OrderTerm`,
-`OrderDirection`, `NullsOrder`, `LogicTree`, `RangeSpec`). These types are
-backend-agnostic and feed every surface identically.
+`OrderDirection`, `NullsOrder`, `LogicTree`, `RangeSpec`, `CursorSpec`). These
+types are backend-agnostic and feed every surface identically.
 
 Parser output is *syntactic only* — `users` in `select=users(*)` is just a name;
 nothing yet knows whether it is a column, a table, or a relationship.

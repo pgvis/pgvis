@@ -5,7 +5,7 @@ description: Use pgvis as a library in your Rust application.
 
 # Embedding in Rust
 
-pgvis is not just a standalone server — it's a library you can embed in any Rust application.
+pgvis is not just a standalone server — it's a library you can embed in any Rust application. The `pgvis-lib` crate provides a `Builder` that assembles the full stack in one call.
 
 ## Add the Dependency
 
@@ -15,28 +15,55 @@ pgvis-lib = "0.1"
 tokio = { version = "1", features = ["full"] }
 ```
 
-## Build a REST + MCP Router
+The `pgvis-lib` crate includes all backends and MCP by default. Feature flags:
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `postgres` | ✓ | PostgreSQL backend |
+| `sqlite` | ✓ | SQLite backend |
+| `mcp` | ✓ | MCP server support |
+
+## Quick Start: REST Router
 
 ```rust
 use pgvis_lib::Builder;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Build an axum Router with REST + MCP
     let router = Builder::new("postgres://localhost/mydb")
         .schemas(vec!["public"])
-        .with_mcp_http()
         .build()
         .await?;
 
-    // Serve with axum
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
     axum::serve(listener, router).await?;
     Ok(())
 }
 ```
 
-## Build an MCP-only Server (stdio)
+## REST + MCP (Streamable HTTP)
+
+```rust
+use pgvis_lib::Builder;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let router = Builder::new("postgres://localhost/mydb")
+        .schemas(vec!["public", "analytics"])
+        .with_mcp_http()
+        .build()
+        .await?;
+
+    // Serves REST at /api/{schema}/{table} AND MCP at /mcp
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    axum::serve(listener, router).await?;
+    Ok(())
+}
+```
+
+## MCP-only Server (stdio)
+
+For Claude Desktop or other agent integrations:
 
 ```rust
 use pgvis_lib::Builder;
@@ -53,15 +80,46 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-## Configuration
+## SQLite Backend
+
+The backend is auto-detected from the DSN:
 
 ```rust
 use pgvis_lib::Builder;
-use pgvis_core::config::Config;
+
+// File-based SQLite
+let router = Builder::new("sqlite:./mydata.db")
+    .build()
+    .await?;
+
+// In-memory SQLite (useful for testing)
+let router = Builder::new("sqlite::memory:")
+    .build()
+    .await?;
+```
+
+SQLite uses the `main` schema by default. The `.schemas()` call is ignored for SQLite.
+
+## Custom Configuration
+
+```rust
+use pgvis_lib::Builder;
+use pgvis_core::config::{Config, RoutingConfig, JwtAlgorithm};
 
 let config = Config {
     schemas: vec!["public".into(), "api".into()],
     max_rows: Some(1000),
+    statement_timeout_ms: Some(10_000),
+    jwt_secret: Some("my-secret-key".into()),
+    jwt_algo: JwtAlgorithm::HS256,
+    anon_role: Some("web_anon".into()),
+    aggregates_enabled: true,
+    read_only: false,
+    routing: RoutingConfig {
+        prefix: "v1".into(),
+        schema_in_path: true,
+        ..Default::default()
+    },
     ..Default::default()
 };
 
@@ -71,13 +129,103 @@ let router = Builder::new("postgres://localhost/mydb")
     .await?;
 ```
 
+## Accessing Internal Components
+
+Use `build_components()` for access to the schema cache, backend, and other internals:
+
+```rust
+use pgvis_lib::Builder;
+
+let components = Builder::new("postgres://localhost/mydb")
+    .schemas(vec!["public"])
+    .build_components()
+    .await?;
+
+// Access the schema cache
+let cache = components.cache.load();
+println!("Tables: {}", cache.tables.len());
+for table in &cache.tables {
+    println!("  {}.{} ({} columns)",
+        table.id.schema, table.id.name, table.columns.len());
+}
+
+// Generate OpenAPI spec
+let spec = pgvis_lib::pgvis_router::openapi::generate_spec(&cache, &components.config);
+let json = serde_json::to_string_pretty(&spec)?;
+println!("{json}");
+
+// Serve the router
+let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+axum::serve(listener, components.router).await?;
+```
+
+### `Components` struct
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `backend` | `Arc<dyn Backend>` | Database backend (execute queries) |
+| `cache` | `Arc<ArcSwap<SchemaCache>>` | Hot-swappable schema cache |
+| `config` | `Arc<Config>` | Shared configuration |
+| `dialect` | `Arc<Dialect>` | SQL dialect (Postgres/SQLite) |
+| `router` | `axum::Router` | The fully-wired REST + OpenAPI router |
+
+## Composing with Your Own Routes
+
+Since pgvis returns a standard `axum::Router`, you can compose it with your own routes:
+
+```rust
+use axum::{Router, routing::get};
+use pgvis_lib::Builder;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let pgvis_router = Builder::new("postgres://localhost/mydb")
+        .build()
+        .await?;
+
+    let app = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route("/custom", get(|| async { "my custom endpoint" }))
+        .merge(pgvis_router);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+```
+
+## Error Handling
+
+`Builder::build()` and `build_components()` return `Result<_, pgvis_core::error::Error>`. Common failure cases:
+
+- Database connection failed (wrong DSN, server unreachable)
+- Introspection failed (insufficient permissions)
+- No tables found in the specified schemas
+
+```rust
+match Builder::new("postgres://localhost/mydb").build().await {
+    Ok(router) => { /* serve */ },
+    Err(e) => {
+        eprintln!("pgvis initialization failed: {e}");
+        std::process::exit(1);
+    }
+}
+```
+
 ## Architecture
 
 The embed API (`pgvis-lib`) is the same code path the CLI uses. There is no "server-only" logic — the `Builder` assembles:
 
 1. A database backend (connection pool + introspection)
-2. A schema cache (tables, relationships, routines)
-3. Configuration
-4. An axum `Router` or MCP `Server`
+2. A schema cache (tables, columns, relationships, routines, constraints)
+3. A dialect (Postgres or SQLite capability flags)
+4. Configuration
+5. An axum `Router` (REST + OpenAPI) or MCP `Server`
 
-All wired together with the same I/O-free core engine.
+All wired together with the same I/O-free core engine. The pipeline is:
+
+```
+ApiRequest → plan_request() → ActionPlan → render() → SQL → execute() → QueryResult
+```
+
+This pipeline is shared between REST dispatch and MCP tool execution — behaviour is identical regardless of surface.

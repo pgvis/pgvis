@@ -295,6 +295,7 @@ pub async fn handle_tool_call(
         on_conflict,
         columns: None,
         logic_filters,
+        cursor: None,
     };
 
     // 4. Plan the request (same pipeline as REST)

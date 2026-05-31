@@ -7,15 +7,34 @@ description: All the ways to install and run pgvis.
 
 ## From Source (Cargo)
 
+Requires Rust 2024 edition toolchain (1.85+).
+
 ```bash
 # Clone the repository
 git clone https://github.com/pgvis/pgvis.git
 cd pgvis
 
-# Build release binary
+# Build release binary (includes Postgres + SQLite + MCP support)
 cargo build --release --bin pgvis
 
 # The binary is at ./target/release/pgvis
+./target/release/pgvis --version
+```
+
+### Feature flags
+
+The workspace supports compile-time feature selection:
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `postgres` | ✓ | PostgreSQL backend (requires libpq at runtime) |
+| `sqlite` | ✓ | SQLite backend (bundled, no system dependency) |
+| `mcp` | ✓ | MCP server support (stdio + Streamable HTTP) |
+
+To build without SQLite, for example:
+
+```bash
+cargo build --release --bin pgvis --no-default-features --features postgres,mcp
 ```
 
 ## Nix
@@ -23,41 +42,133 @@ cargo build --release --bin pgvis
 If you have Nix with flakes enabled:
 
 ```bash
-# Build
+# Build the binary
 nix build github:pgvis/pgvis
 
-# Or run directly
+# Run directly without installing
 nix run github:pgvis/pgvis -- serve --dsn "postgres://localhost/mydb"
 
-# Development shell
+# Development shell (includes Rust toolchain, PostgreSQL client, sqlx-cli)
 nix develop
 ```
+
+The flake provides a complete development environment with all system dependencies.
 
 ## Docker (Coming Soon)
 
 ```bash
 docker run -e PGVIS_DSN="postgres://host.docker.internal/mydb" \
-  ghcr.io/pgvis/pgvis serve --bind 0.0.0.0:3000
+  -p 3000:3000 \
+  ghcr.io/pgvis/pgvis serve
 ```
 
 ## Verifying Installation
 
 ```bash
+# Check version
 pgvis --version
+
+# Show help
 pgvis --help
+
+# Test against a database
+pgvis --dsn "postgres://localhost/mydb" inspect | head -20
 ```
 
-## Configuration
+## CLI Reference
 
-pgvis reads configuration from environment variables prefixed with `PGVIS_`:
+```
+pgvis [OPTIONS] <COMMAND>
 
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `PGVIS_DSN` | Database connection string | *required* |
-| `PGVIS_BIND` | Server bind address | `0.0.0.0:3000` |
-| `PGVIS_SCHEMAS` | Schemas to expose (comma-separated) | `public` |
-| `PGVIS_JWT_SECRET` | JWT verification secret | none (anonymous) |
-| `PGVIS_ANON_ROLE` | Role for unauthenticated requests | none |
-| `PGVIS_MAX_ROWS` | Maximum rows returned | unlimited |
+Options:
+  -d, --dsn <DSN>        Database connection string [env: PGVIS_DSN]
+  -c, --config <FILE>    Path to TOML config file [env: PGVIS_CONFIG]
+  -h, --help             Print help
+  -V, --version          Print version
 
-See the [Configuration Reference](/reference/configuration) for the full list.
+Commands:
+  serve    Start the HTTP server (REST + optional MCP)
+  mcp      Run an MCP server over stdio
+  openapi  Print the OpenAPI 3.0 document and exit
+  inspect  Dump the introspected schema cache as JSON
+```
+
+### `pgvis serve`
+
+```
+pgvis serve [OPTIONS]
+
+Options:
+  -b, --bind <ADDR>      Bind address [default: 0.0.0.0:3000] [env: PGVIS_BIND]
+  -s, --schema <NAME>    Schemas to expose (repeatable or comma-separated)
+                         [default: public] [env: PGVIS_SCHEMAS]
+      --mcp-http         Also serve MCP at /mcp endpoint via Streamable HTTP
+```
+
+### `pgvis mcp`
+
+```
+pgvis mcp [OPTIONS]
+
+Options:
+  -s, --schema <NAME>    Schemas to expose [default: public] [env: PGVIS_SCHEMAS]
+      --read-only        Expose only read tools (no create/update/delete/RPC)
+```
+
+### `pgvis openapi`
+
+Prints the OpenAPI 3.0 JSON document to stdout and exits. Pipe to a file or tool:
+
+```bash
+pgvis --dsn "$PGVIS_DSN" openapi > openapi.json
+pgvis --dsn "$PGVIS_DSN" openapi | jq '.paths | keys'
+```
+
+### `pgvis inspect`
+
+Dumps the introspected schema cache as JSON — useful for debugging what pgvis sees:
+
+```bash
+pgvis --dsn "$PGVIS_DSN" inspect | jq '.tables | length'
+pgvis --dsn "$PGVIS_DSN" inspect | jq '.tables[0].columns[].name'
+```
+
+## DSN Format
+
+pgvis auto-detects the backend from the connection string:
+
+| Pattern | Backend |
+|---------|---------|
+| `postgres://...` or `postgresql://...` | PostgreSQL |
+| `sqlite:./path.db` or `sqlite::memory:` | SQLite |
+| `file:path` | SQLite |
+| `*.db`, `*.sqlite`, `*.sqlite3` | SQLite |
+| Anything else | PostgreSQL (default) |
+
+### PostgreSQL examples
+
+```bash
+# Full URI
+pgvis --dsn "postgres://user:password@localhost:5432/mydb"
+
+# Unix socket
+pgvis --dsn "postgres:///mydb?host=/var/run/postgresql"
+```
+
+### SQLite examples
+
+```bash
+# File path
+pgvis --dsn "sqlite:./data/app.db"
+
+# In-memory (for testing)
+pgvis --dsn "sqlite::memory:"
+
+# Bare file path (auto-detected by extension)
+pgvis --dsn "./mydata.sqlite3"
+```
+
+## Next Steps
+
+- [Quick Start](/quickstart) — your first requests in 5 minutes
+- [Configuration Reference](/reference/configuration) — all environment variables, TOML fields, and defaults

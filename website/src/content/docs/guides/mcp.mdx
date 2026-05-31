@@ -5,33 +5,60 @@ description: Using pgvis as an MCP server for LLM agents.
 
 # MCP for AI Agents
 
-pgvis automatically generates [Model Context Protocol](https://modelcontextprotocol.io) tools from your database schema. Every table becomes a set of typed tools that LLM agents can discover and call.
+pgvis automatically generates [Model Context Protocol](https://modelcontextprotocol.io) tools from your database schema. Every table becomes a set of typed tools that LLM agents can discover and call — no glue code, no hand-written tool schemas.
 
 ## What Gets Generated
 
-For each table in your exposed schemas, pgvis creates:
+### Table tools
 
-| Tool | Purpose |
-|------|---------|
-| `list_{table}` | Query rows with filtering, ordering, pagination |
-| `create_{table}` | Insert one or more rows |
-| `update_{table}` | Update rows matching a filter |
-| `delete_{table}` | Delete rows matching a filter |
+For each table in your exposed schemas, pgvis creates up to four tools:
 
-For each function:
+| Tool | Purpose | Omitted when |
+|------|---------|--------------|
+| `list_{table}` | Query rows with filtering, ordering, pagination | Never |
+| `create_{table}` | Insert one or more rows | `read_only = true` or table not insertable |
+| `update_{table}` | Update rows matching a filter | `read_only = true` or table not updatable |
+| `delete_{table}` | Delete rows matching a filter | `read_only = true` or table not deletable |
 
-| Tool | Purpose |
-|------|---------|
-| `call_{function}` | Call the database function with typed arguments |
+### Function tools
 
-## Stdio Transport (Claude Desktop)
+| Tool | Purpose | Omitted when |
+|------|---------|--------------|
+| `call_{function}` | Call the database function with typed arguments | `read_only = true` and function is VOLATILE |
 
-Add to your Claude Desktop MCP configuration:
+### Tool naming
+
+Tool names include the schema prefix by default:
+
+```
+public/list_users
+public/create_users
+public/call_search_items
+analytics/list_events
+```
+
+The separator is configurable via `routing.mcp_separator` (default: `/`). With `mcp_separator = '.'`:
+
+```
+public.list_users
+public.create_users
+```
+
+When `routing.schema_in_path = false`, the default schema prefix is omitted:
+
+```
+list_users         (public schema, default)
+analytics/list_events  (non-default schema still prefixed)
+```
+
+## Transport: Stdio (Claude Desktop)
+
+Add to your Claude Desktop MCP configuration (`~/.config/claude/mcp.json`):
 
 ```json
 {
   "mcpServers": {
-    "pgvis": {
+    "mydb": {
       "command": "pgvis",
       "args": ["--dsn", "postgres://user@localhost/mydb", "mcp"]
     }
@@ -39,45 +66,219 @@ Add to your Claude Desktop MCP configuration:
 }
 ```
 
-## HTTP Transport
+### Read-only mode
 
-Run alongside the REST API:
+For LLMs that should browse but not mutate:
+
+```json
+{
+  "mcpServers": {
+    "mydb": {
+      "command": "pgvis",
+      "args": ["--dsn", "postgres://user@localhost/mydb", "mcp", "--read-only"]
+    }
+  }
+}
+```
+
+This omits all `create_`, `update_`, `delete_` tools and VOLATILE function tools from the tool catalogue.
+
+### Multiple schemas
+
+```json
+{
+  "mcpServers": {
+    "mydb": {
+      "command": "pgvis",
+      "args": [
+        "--dsn", "postgres://user@localhost/mydb",
+        "mcp",
+        "--schema", "public",
+        "--schema", "analytics"
+      ]
+    }
+  }
+}
+```
+
+### SQLite
+
+```json
+{
+  "mcpServers": {
+    "localdb": {
+      "command": "pgvis",
+      "args": ["--dsn", "sqlite:./mydata.db", "mcp"]
+    }
+  }
+}
+```
+
+## Transport: Streamable HTTP
+
+Run MCP alongside the REST API on the same port:
 
 ```bash
 pgvis --dsn "postgres://user@localhost/mydb" serve --mcp-http
 ```
 
-The MCP endpoint is available at `/mcp`.
+The MCP endpoint is available at `POST /mcp` using the Streamable HTTP transport protocol.
 
 ## Discovery Resources
 
-pgvis exposes MCP resources for schema discovery:
+pgvis exposes MCP resources that agents can read for schema discovery:
 
-- `pgvis://schemas` — list all available schemas
-- `pgvis://{schema}/schema` — describe tables, columns, and relationships in a schema
+| URI | Content |
+|-----|---------|
+| `pgvis://schemas` | List of all exposed schema names |
+| `pgvis://{schema}/schema` | Full description: tables, columns (name, type, nullable, PK), and relationships |
 
-## Tool Input Schema
+These resources give the agent context about the database structure before it starts calling tools.
 
-Each tool has a typed JSON Schema for its inputs. For example, `list_users` might accept:
+## Tool Input Schemas
+
+Each tool has a fully-typed JSON Schema for its inputs. The schema is generated from the database introspection.
+
+### `list_{table}` example
 
 ```json
 {
-  "select": "id,name,email",
-  "filter": { "active": "eq.true" },
-  "order": "name.asc",
-  "limit": 10
+  "name": "public/list_users",
+  "description": "Query rows from public.users (Application users)",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "select": {
+        "type": "string",
+        "description": "Columns to return (comma-separated). Default: all columns"
+      },
+      "id": { "type": "string", "description": "Filter on id (integer). Use operator syntax: eq.1, gt.5, in.(1,2,3)" },
+      "name": { "type": "string", "description": "Filter on name (text). Use operator syntax: eq.Alice, like.*ice*" },
+      "email": { "type": "string", "description": "Filter on email (text)" },
+      "order": { "type": "string", "description": "Order by columns: name.asc, id.desc" },
+      "limit": { "type": "integer", "description": "Max rows to return" },
+      "offset": { "type": "integer", "description": "Rows to skip" },
+      "and": { "type": "string", "description": "AND logic filter: (col.op.val,col.op.val)" },
+      "or": { "type": "string", "description": "OR logic filter: (col.op.val,col.op.val)" }
+    }
+  }
 }
 ```
 
-## Embedding in Your Own App
+### `create_{table}` example
+
+```json
+{
+  "name": "public/create_users",
+  "description": "Insert rows into public.users",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "name": { "type": "string", "description": "name (text, required)" },
+      "email": { "type": "string", "description": "email (text, nullable)" },
+      "role": { "type": "string", "description": "role (text, default: 'user')" },
+      "age": { "type": "integer", "description": "age (integer, nullable)" }
+    },
+    "required": ["name"]
+  }
+}
+```
+
+### `update_{table}` example
+
+```json
+{
+  "name": "public/update_users",
+  "description": "Update rows in public.users matching filters",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "id": { "type": "string", "description": "Filter: id (use operator syntax)" },
+      "set_name": { "type": "string", "description": "New value for name" },
+      "set_email": { "type": "string", "description": "New value for email" }
+    }
+  }
+}
+```
+
+### `call_{function}` example
+
+```json
+{
+  "name": "public/call_search_items",
+  "description": "Call function public.search_items(query text) → SETOF items",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "query": { "type": "string", "description": "query (text)" }
+    },
+    "required": ["query"]
+  }
+}
+```
+
+## Execution Flow
+
+When an agent calls a tool:
+
+1. **Parse** — tool arguments are mapped to an `ApiRequest` (same as REST)
+2. **Plan** — validated against the schema cache, relationships resolved
+3. **Render** — parameterized SQL generated (dialect-aware)
+4. **Execute** — SQL runs against the database with statement timeout
+5. **Return** — rows (or error) returned as MCP tool result content
+
+The MCP path uses the exact same pipeline as REST — behaviour never diverges.
+
+## Preferences via Tool Arguments
+
+MCP tools support the same preferences as the REST API's `Prefer` header:
+
+```json
+{
+  "name": "public/create_users",
+  "args": {
+    "name": "Alice",
+    "email": "alice@example.com",
+    "return": "representation",
+    "resolution": "merge-duplicates"
+  }
+}
+```
+
+## Statement Timeout
+
+MCP tool calls respect the `statement_timeout_ms` configuration. If a query exceeds the timeout, the tool returns an error result rather than hanging indefinitely.
+
+## Embedding MCP in Your Own App
 
 ```rust
 use pgvis_lib::Builder;
 
-let mcp = Builder::new("postgres://localhost/mydb")
-    .schemas(vec!["public"])
-    .build_mcp_server()
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Build an MCP server for stdio transport
+    let mcp = Builder::new("postgres://localhost/mydb")
+        .schemas(vec!["public"])
+        .build_mcp_server()
+        .await?;
+
+    // Serve over stdio (Claude Desktop / agent integrations)
+    pgvis_lib::pgvis_mcp::serve_stdio(mcp).await?;
+    Ok(())
+}
+```
+
+Or serve MCP alongside REST on HTTP:
+
+```rust
+use pgvis_lib::Builder;
+
+let router = Builder::new("postgres://localhost/mydb")
+    .with_mcp_http()
+    .build()
     .await?;
 
-pgvis_lib::pgvis_mcp::serve_stdio(mcp).await?;
+// Router now serves REST at /api/... AND MCP at /mcp
+let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+axum::serve(listener, router).await?;
 ```

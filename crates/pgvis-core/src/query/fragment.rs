@@ -4,8 +4,8 @@
 //! `read.rs`, `mutate.rs`, and `call.rs` to avoid duplication.
 
 use crate::plan::types::{
-    FilterRewrite, ResolvedFilter, ResolvedLogicNode, ResolvedLogicTree, ResolvedOrder,
-    ResolvedSelect,
+    FilterRewrite, ResolvedCursor, ResolvedFilter, ResolvedLogicNode, ResolvedLogicTree,
+    ResolvedOrder, ResolvedSelect,
 };
 use crate::query_params::types::{FilterValue, IsKind, NullsOrder, Operator, OrderDirection};
 use crate::select_ast::{JsonOperand, JsonOperation};
@@ -428,6 +428,26 @@ pub fn render_limit_offset(limit: Option<u64>, offset: Option<u64>) -> Option<St
         (None, Some(o)) => Some(format!("OFFSET {o}")),
         (None, None) => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cursor condition
+// ---------------------------------------------------------------------------
+
+/// Render a cursor-based WHERE condition for keyset pagination.
+///
+/// Generates a condition like `"table"."id" > $N` where the value is pushed
+/// as a bind parameter. The operator is pre-determined by the planner based
+/// on the ORDER BY direction (ASC → `>`, DESC → `<`).
+pub fn render_cursor_condition(
+    cursor: &ResolvedCursor,
+    table_alias: Option<&str>,
+    ctx: &mut RenderContext<'_>,
+) -> String {
+    let col_ref = qualified_column(table_alias, &cursor.column, ctx);
+    let op = operator_to_sql(&cursor.operator);
+    let placeholder = ctx.push_param(Value::from(cursor.value.as_str()));
+    format!("{col_ref} {op} {placeholder}")
 }
 
 // ---------------------------------------------------------------------------

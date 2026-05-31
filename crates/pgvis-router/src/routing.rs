@@ -25,7 +25,7 @@ use pgvis_core::config::OpenApiMode;
 use pgvis_core::plan::{ActionPlan, ApiRequest, RequestBody, RequestMethod, plan_request};
 use pgvis_core::preferences::{PreferTx, Preferences};
 use pgvis_core::query;
-use pgvis_core::query_params::{self, LogicTree, OrderItem};
+use pgvis_core::query_params::{self, CursorSpec, LogicTree, OrderItem};
 use pgvis_core::select_ast::SelectItem;
 use pgvis_core::{Config, Dialect, SchemaCache};
 
@@ -429,7 +429,13 @@ async fn dispatch_request(
         Err(err) => return response::format_error(&err),
     };
 
-    // 6. Format the QueryResult into an HTTP response
+    // 6. Extract cursor column from the plan (for X-Next-Cursor header)
+    let cursor_column = match &plan {
+        ActionPlan::Read(read_plan) => read_plan.range.cursor_column.clone(),
+        _ => None,
+    };
+
+    // 7. Format the QueryResult into an HTTP response
     let is_singular = headers
         .get("accept")
         .and_then(|v| v.to_str().ok())
@@ -438,7 +444,14 @@ async fn dispatch_request(
 
     let request_offset = params.get("offset").and_then(|s| s.parse::<u64>().ok());
 
-    response::format_response(&result, &method, &preferences, is_singular, request_offset)
+    response::format_response(
+        &result,
+        &method,
+        &preferences,
+        is_singular,
+        request_offset,
+        cursor_column.as_deref(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +528,9 @@ fn build_api_request(
     // Parse logic filters (and=, or=, not.and=, not.or=)
     let logic_filters = parse_logic_filters_from_params(params);
 
+    // Parse cursor pagination (cursor_column, cursor_value)
+    let cursor = parse_cursor_from_params(params);
+
     ApiRequest {
         schema,
         target,
@@ -529,6 +545,7 @@ fn build_api_request(
         on_conflict,
         columns,
         logic_filters,
+        cursor,
     }
 }
 
@@ -697,6 +714,8 @@ fn parse_filters_from_params(
         "offset",
         "on_conflict",
         "columns",
+        "cursor_column",
+        "cursor_value",
     ];
     let mut filters = Vec::new();
 
@@ -774,6 +793,22 @@ fn parse_range_from_params(
 
     if limit.is_some() || offset.is_some() {
         Some(pgvis_core::query_params::RangeSpec { limit, offset })
+    } else {
+        None
+    }
+}
+
+/// Parse cursor pagination parameters (`cursor_column`, `cursor_value`).
+///
+/// Returns `Some(CursorSpec)` if either parameter is present, activating cursor mode.
+/// When `cursor_column` is omitted, the planner defaults to the table's primary key.
+fn parse_cursor_from_params(params: &HashMap<String, String>) -> Option<CursorSpec> {
+    let column = params.get("cursor_column").cloned();
+    let value = params.get("cursor_value").cloned();
+
+    // Activate cursor pagination if either param is present
+    if column.is_some() || value.is_some() {
+        Some(CursorSpec { column, value })
     } else {
         None
     }

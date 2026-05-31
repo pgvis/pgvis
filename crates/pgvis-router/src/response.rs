@@ -32,6 +32,7 @@ pub fn format_response(
     preferences: &Preferences,
     is_singular: bool,
     request_offset: Option<u64>,
+    cursor_column: Option<&str>,
 ) -> Response {
     let mut headers = HeaderMap::new();
 
@@ -42,6 +43,15 @@ pub fn format_response(
     let content_range = build_content_range(result, request_offset);
     if let Ok(val) = HeaderValue::from_str(&content_range) {
         headers.insert("content-range", val);
+    }
+
+    // X-Next-Cursor header (for cursor-based pagination)
+    if let Some(col) = cursor_column {
+        if let Some(cursor_val) = extract_next_cursor(&result.body, col) {
+            if let Ok(val) = HeaderValue::from_str(&cursor_val) {
+                headers.insert("x-next-cursor", val);
+            }
+        }
     }
 
     // If partial content (has pagination), set 206
@@ -223,4 +233,27 @@ pub fn format_error(err: &pgvis_core::error::Error) -> Response {
         serde_json::to_vec(&body).unwrap_or_default(),
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Cursor pagination helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the next cursor value from the last row of the response body.
+///
+/// Looks at the last element of the JSON array result and extracts the value
+/// of the specified cursor column. Returns `None` if the body is empty or
+/// the column is not present.
+fn extract_next_cursor(body: &Value, cursor_column: &str) -> Option<String> {
+    let rows = body.as_array()?;
+    let last_row = rows.last()?;
+    let cursor_val = last_row.get(cursor_column)?;
+
+    Some(match cursor_val {
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => return None,
+        other => other.to_string(),
+    })
 }

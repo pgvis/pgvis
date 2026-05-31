@@ -1,32 +1,86 @@
 ---
 title: Introduction
-description: What is pgvis and why it exists.
+description: What is pgvis, what it does, and why it exists.
 ---
 
 # What is pgvis?
 
-**pgvis** turns any Postgres database into MCP tools for LLM agents — plus a PostgREST-compatible REST API and an OpenAPI 3.0 document — from one Rust engine.
+**pgvis** turns any PostgreSQL or SQLite database into a fully-featured API — a PostgREST-compatible REST endpoint, Model Context Protocol (MCP) tools for AI agents, and an OpenAPI 3.0 document — from a single Rust engine with zero glue code.
 
 ## The Problem
 
-Building database APIs is repetitive. Building MCP tools for AI agents is new and undocumented. Maintaining consistency between REST endpoints, API documentation, and agent tooling is painful.
+Building database APIs is repetitive. Building typed MCP tools for AI agents is new and manual. Keeping REST endpoints, API documentation, and agent tooling consistent is painful. And when you want to support more than one database, maintaining two query builders doubles the work.
 
 ## The Solution
 
-Point pgvis at a database. It introspects the schema once at startup and then serves that schema **three ways from a single pipeline** — one query parser, one planner, one SQL builder:
+Point pgvis at a database. It introspects the schema once at startup and then serves that schema **three ways from one pipeline** — one query parser, one planner, one SQL builder:
 
-- **MCP** — every table and function becomes a typed [Model Context Protocol](https://modelcontextprotocol.io) tool an LLM agent can call. No glue code, no hand-written tool schemas.
-- **REST** — a PostgREST-compatible HTTP API: the same query DSL, the same `Prefer` semantics, the same `PGRST*` error codes, so existing PostgREST clients work unchanged.
-- **OpenAPI** — an OpenAPI 3.0 document generated from the same introspected schema.
+| Surface | What it does |
+|---------|-------------|
+| **REST** | A PostgREST-compatible HTTP API: the same query DSL, `Prefer` semantics, and `PGRST*` error codes. Existing PostgREST clients work unchanged. |
+| **MCP** | Every table and function becomes a typed [Model Context Protocol](https://modelcontextprotocol.io) tool an LLM agent can discover and call — no hand-written schemas. |
+| **OpenAPI** | An OpenAPI 3.0 document generated from the same introspected schema, always in sync with routes. |
+
+## Feature Highlights
+
+- **30+ filter operators** — equality, comparison, pattern matching, full-text search, array/JSONB containment, range operators, IS DISTINCT FROM
+- **Logic filters** — combine conditions with `and=`/`or=` using nested boolean expressions
+- **Resource embedding** — traverse foreign-key relationships with `select=orders(items(*))` for nested JSON
+- **Cursor pagination** — keyset-based forward pagination via `cursor_column`/`cursor_value` with `X-Next-Cursor` header
+- **Offset/limit pagination** — classic pagination with `Content-Range` headers and exact/planned/estimated counts
+- **Mutations** — INSERT, UPDATE, DELETE with upsert (`Prefer: resolution=merge-duplicates`), bulk operations, and returning representations
+- **RPC** — call database functions with typed arguments, volatility-aware HTTP method routing
+- **JWT authentication** — HS256/HS384/HS512/RS256/EdDSA with role switching and Row-Level Security
+- **Two backends** — PostgreSQL and SQLite from the same engine, auto-detected from DSN
+- **Embeddable** — use `pgvis-lib` as a Rust library in your own axum app
 
 ## Key Properties
 
-- **One engine, three surfaces.** REST, OpenAPI, and MCP share the same planner and SQL builder — they stay consistent by construction.
-- **Backend-agnostic.** The I/O-free core works with any database that implements the `Backend` trait. Postgres and SQLite today.
-- **A library, not just a server.** Embed pgvis in any Rust application with `pgvis-lib`.
-- **Safe by construction.** Parameterized SQL, JWT auth, role switching, RLS, statement timeouts.
+| Property | Details |
+|----------|---------|
+| **One engine, three surfaces** | REST, OpenAPI, and MCP share the planner and SQL builder — they stay consistent by construction |
+| **Backend-agnostic** | An I/O-free core works with any database implementing the `Backend` trait. A `Dialect` capability system gates features per backend |
+| **PostgREST-compatible** | Same query DSL, same `Prefer` header semantics, same `PGRST*` error codes — drop-in replacement |
+| **Safe by construction** | Parameterized SQL (never string interpolation), JWT auth, role switching, RLS, statement timeouts |
+| **A library, not just a server** | Embed pgvis in any Rust application via `pgvis-lib::Builder` |
+
+## Architecture at a Glance
+
+```
+HTTP Request / MCP Tool Call
+        │
+        ▼
+   Parse → ApiRequest (query DSL, filters, cursor, preferences)
+        │
+        ▼
+   Plan  → ActionPlan (validate against schema cache, resolve joins)
+        │
+        ▼
+   Render → Parameterized SQL (dialect-aware, CTE-wrapped)
+        │
+        ▼
+   Execute → Backend::execute (Postgres pool / SQLite connection)
+        │
+        ▼
+   Format → JSON response + headers (Content-Range, X-Next-Cursor)
+```
+
+Seven crates, all dependencies pointing inward to the I/O-free core:
+
+| Crate | Role |
+|-------|------|
+| `pgvis-core` | Parser, planner, SQL builder, schema cache types |
+| `pgvis-postgres` | Postgres backend (pool, introspection, execution) |
+| `pgvis-sqlite` | SQLite backend (introspection, execution) |
+| `pgvis-router` | axum REST router + OpenAPI generator |
+| `pgvis-mcp` | MCP tool generation, execution, stdio + HTTP transport |
+| `pgvis-lib` | `Builder` facade — the single way to assemble the stack |
+| `pgvis-server` | The `pgvis` CLI binary |
 
 ## Next Steps
 
-- [Quick Start](/quickstart) — get running in 2 minutes
-- [Installation](/installation) — all the ways to install pgvis
+- [Quick Start](/quickstart) — get running in 5 minutes
+- [Installation](/installation) — Cargo, Nix, Docker
+- [REST API Guide](/guides/rest-api) — full query DSL reference
+- [MCP Guide](/guides/mcp) — using pgvis with LLM agents
+- [Configuration](/reference/configuration) — all settings and environment variables

@@ -6,7 +6,9 @@
 use crate::cache::{Cardinality, QualifiedIdentifier, Relationship, SchemaCache, Table};
 use crate::dialect::Dialect;
 use crate::error::{Error, ErrorCode};
-use crate::query_params::types::{Filter, LogicNode, LogicTree, Operator, OrderTerm, RangeSpec};
+use crate::query_params::types::{
+    CursorSpec, Filter, LogicNode, LogicTree, Operator, OrderDirection, OrderTerm, RangeSpec,
+};
 use crate::select_ast::{FieldSelect, RelationSelect, SelectItem, SpreadSelect};
 
 use super::planner::PlanConfig;
@@ -251,6 +253,8 @@ pub fn resolve_embed(
         range: ResolvedRange {
             limit: None,
             offset: None,
+            cursor: None,
+            cursor_column: None,
         },
         logic_filters: Vec::new(),
         aggregates: Vec::new(),
@@ -524,13 +528,81 @@ pub fn resolve_range(range: &Option<RangeSpec>, max_rows: Option<u64>) -> Resolv
             ResolvedRange {
                 limit: effective_limit,
                 offset: r.offset,
+                cursor: None,
+                cursor_column: None,
             }
         }
         None => ResolvedRange {
             limit: max_rows,
             offset: None,
+            cursor: None,
+            cursor_column: None,
         },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cursor resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve cursor pagination specification against the table schema and order.
+///
+/// When `cursor.column` is `None`, defaults to the table's first primary key column.
+/// The comparison operator (`>` or `<`) is determined from the ORDER BY direction
+/// on the cursor column (defaults to ASC / `>`).
+///
+/// Returns `None` if the cursor has no value (first page — no seek condition needed),
+/// but the caller should still ensure ORDER BY includes the cursor column.
+pub fn resolve_cursor(
+    table: &Table,
+    cursor: &CursorSpec,
+    order: &[ResolvedOrder],
+) -> Result<(Option<ResolvedCursor>, String), Error> {
+    // 1. Determine cursor column: explicit or default to primary key
+    let cursor_column = match &cursor.column {
+        Some(col) => col.clone(),
+        None => table.pk_cols.first().cloned().ok_or_else(|| Error::Plan {
+            message: "No cursor_column specified and table has no primary key".into(),
+            detail: None,
+            hint: Some(
+                "Specify cursor_column explicitly for tables without a primary key".into(),
+            ),
+            code: ErrorCode::InvalidRange,
+        })?,
+    };
+
+    // 2. Validate cursor column exists in the table
+    let col = table.columns.get(&cursor_column).ok_or_else(|| Error::Plan {
+        message: format!("Cursor column '{}' not found in table '{}'", cursor_column, table.ident.name),
+        detail: None,
+        hint: Some("cursor_column must reference an existing column in the table".into()),
+        code: ErrorCode::ColumnNotFound,
+    })?;
+
+    // 3. If no cursor value, this is the first page — no seek condition needed
+    let value = match &cursor.value {
+        Some(v) => v.clone(),
+        None => return Ok((None, cursor_column)),
+    };
+
+    // 4. Determine direction from order: if cursor column is DESC use Lt, else Gt
+    let direction = order
+        .iter()
+        .find(|o| o.column == cursor_column)
+        .map(|o| o.direction)
+        .unwrap_or(OrderDirection::Asc);
+
+    let operator = match direction {
+        OrderDirection::Asc => Operator::Gt,
+        OrderDirection::Desc => Operator::Lt,
+    };
+
+    Ok((Some(ResolvedCursor {
+        column: cursor_column.clone(),
+        value,
+        operator,
+        data_type: col.typ.clone(),
+    }), cursor_column))
 }
 
 // ---------------------------------------------------------------------------

@@ -82,11 +82,13 @@ Some fields are still populated empty
 - **`LISTEN/NOTIFY` hot reload.** `PgBackend::watch_schema` returns `None`; the
   reload pipeline ([05-schema-cache.md](05-schema-cache.md)) needs the push
   signal on a dedicated connection with reconnect/backoff.
-- **SQLite backend.** No `pgvis-sqlite` crate yet; the `SQLITE` dialect and
-  builder special-casing are ready ([03-backends-and-dialects.md](03-backends-and-dialects.md)).
-- **MCP execution.** `pgvis-lib` builds `McpServer` with cache/config/dialect
-  only; pass an `Arc<dyn Backend>` and call `render`/`execute` so MCP returns
-  rows instead of a plan summary ([tools.rs](../crates/pgvis-mcp/src/tools.rs)).
+- **SQLite backend. `[Closed]`** The `pgvis-sqlite` crate now provides
+  `SqliteBackend` implementing `Backend` (introspection + execution). DSN
+  detection in `pgvis-lib` auto-selects it for `sqlite:` URIs or `.db`/`.sqlite3`
+  file paths.
+- **MCP execution. `[Closed]`** `McpServer` now holds an `Arc<dyn Backend>` and
+  `handle_tool_call` renders SQL, calls `backend.execute()`, and returns real
+  rows (or error) as MCP tool results.
 - **`pgvis-server` config layering.** `serve`/`mcp`/`openapi`/`inspect` are
   wired through `pgvis-lib`, but `load_config` still returns `Config::default()`
   — figment TOML/`PGVIS_*` layering is stubbed

@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::dialect::Dialect;
 use crate::error::Error;
 use crate::preferences::{PreferCount, Preferences};
+use crate::query_params::types::OrderDirection;
 use crate::select_ast::SelectItem;
 
 use super::resolve;
@@ -132,10 +133,33 @@ fn plan_read(
         .collect();
 
     // Resolve ordering
-    let order = resolve::resolve_order(table, &request.order)?;
+    let mut order = resolve::resolve_order(table, &request.order)?;
 
     // Resolve range with server-side cap
-    let range = resolve::resolve_range(&request.range, config.max_rows);
+    let mut range = resolve::resolve_range(&request.range, config.max_rows);
+
+    // Resolve cursor pagination (if present)
+    if let Some(ref cursor_spec) = request.cursor {
+        let (resolved_cursor, cursor_col_name) =
+            resolve::resolve_cursor(table, cursor_spec, &order)?;
+        range.cursor = resolved_cursor;
+        range.cursor_column = Some(cursor_col_name.clone());
+        // When cursor is present, offset is meaningless — clear it
+        range.offset = None;
+
+        // Ensure the cursor column appears in ORDER BY for deterministic paging.
+        // If not already present, prepend it with ASC direction.
+        if !order.iter().any(|o| o.column == cursor_col_name) {
+            order.insert(
+                0,
+                ResolvedOrder {
+                    column: cursor_col_name,
+                    direction: OrderDirection::Asc,
+                    nulls: None,
+                },
+            );
+        }
+    }
 
     // Determine count strategy from preferences
     let count = resolve_count_strategy(&request.preferences);

@@ -175,3 +175,16 @@ pub struct RangeSpec {
     pub limit: Option<u64>,
     pub offset: Option<u64>,
 }
+
+/// Cursor pagination specification parsed from `cursor_column` + `cursor_value`.
+///
+/// When `column` is `None`, the planner defaults to the table's primary key.
+/// When `value` is `None`, this indicates the first page (no seek condition).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorSpec {
+    /// The column to use as the cursor. `None` means "use the table's primary key".
+    pub column: Option<String>,
+    /// The cursor value to seek after (exclusive).
+    /// `None` means "start from the beginning" (first page).
+    pub value: Option<String>,
+}

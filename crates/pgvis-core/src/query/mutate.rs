@@ -256,6 +256,8 @@ mod tests {
             range: ResolvedRange {
                 limit: None,
                 offset: None,
+                cursor: None,
+                cursor_column: None,
             },
             embeds: vec![],
             count: None,
@@ -323,6 +325,8 @@ mod tests {
             range: ResolvedRange {
                 limit: None,
                 offset: None,
+                cursor: None,
+                cursor_column: None,
             },
             embeds: vec![],
             count: None,

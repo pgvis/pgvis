@@ -68,10 +68,13 @@ into `RequestBody::Single`/`Bulk`. It then calls `plan_request`,
 to an HTTP response; errors are mapped to `err.http_status()` with the `PGRST*`
 code body (see [06-errors-and-config.md](06-errors-and-config.md)). This path is
 exercised end-to-end by the integration suite in
-[crates/pgvis-server/tests](../crates/pgvis-server/tests). **Remaining gaps**
-([08-future-scope.md](08-future-scope.md)): `and=`/`or=` query parsing
-(`logic_filters` is left empty), JWT claim extraction into `ExecContext`,
-relation ordering, and content negotiation.
+[crates/pgvis-server/tests](../crates/pgvis-server/tests). Logic filters
+(`and=`/`or=`) are parsed by `parse_logic_filters_from_params` and resolved
+into `ResolvedLogicTree` nodes. Cursor-based pagination
+(`cursor_column`/`cursor_value`) is also wired through `CursorSpec` →
+`ResolvedCursor` → a keyset `WHERE` clause with an `X-Next-Cursor` response
+header. **Remaining gaps** ([08-future-scope.md](08-future-scope.md)): JWT claim
+extraction into `ExecContext`, relation ordering, and content negotiation.
 
 ## OpenAPI `[In progress]`
 

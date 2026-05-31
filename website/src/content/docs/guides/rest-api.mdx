@@ -1,105 +1,823 @@
 ---
 title: REST API
-description: Full guide to the PostgREST-compatible REST API.
+description: Complete reference for the PostgREST-compatible REST API.
 ---
 
 # REST API Guide
 
-pgvis exposes a PostgREST-compatible REST API. If you've used PostgREST before, the query DSL is identical.
+pgvis exposes a PostgREST-compatible REST API. If you've used PostgREST before, the query DSL is identical — existing clients work unchanged.
 
 ## Route Structure
 
-By default, routes follow the pattern:
+Routes are determined by the [`routing`](/reference/configuration#routing) configuration.
+
+### Schema-in-path mode (default)
 
 ```
-GET /api/{schema}/{table}
+GET  /api/{schema}/{table}          — list rows
+POST /api/{schema}/{table}          — insert rows
+PATCH /api/{schema}/{table}         — update rows
+DELETE /api/{schema}/{table}        — delete rows
+POST /api/{schema}/rpc/{function}   — call a function
+GET  /                              — OpenAPI 3.0 spec
 ```
 
-For the `public` schema:
-```
+Example:
+```bash
 GET /api/public/users
-GET /api/public/orders
+GET /api/analytics/events
+POST /api/public/rpc/search_items
 ```
+
+### Flat mode (PostgREST-compatible)
+
+With `routing.schema_in_path = false` and `routing.prefix = ""`:
+
+```
+GET /users
+POST /rpc/my_function
+```
+
+The schema is resolved from the `Accept-Profile` / `Content-Profile` header or the configured `default_schema`.
+
+---
 
 ## Selecting Columns
 
-Use the `select` query parameter:
+Use the `select` query parameter to choose which columns appear in the response.
 
 ```bash
-# Specific columns
-curl "http://localhost:3000/api/public/users?select=id,name,email"
+# All columns (default when select is omitted)
+curl "/api/public/users"
 
-# All columns (default)
-curl "http://localhost:3000/api/public/users"
+# Specific columns
+curl "/api/public/users?select=id,name,email"
+
+# All columns explicitly
+curl "/api/public/users?select=*"
 ```
+
+### Column renaming
+
+Rename columns in the response using `:` syntax:
+
+```bash
+curl "/api/public/users?select=user_id:id,display_name:name"
+```
+
+Response:
+```json
+[{"user_id": 1, "display_name": "Alice"}]
+```
+
+### Aggregates
+
+When aggregates are enabled (`aggregates_enabled = true` in config):
+
+```bash
+curl "/api/public/items?select=category,total_price:price.sum(),avg_price:price.avg()&group=category"
+```
+
+Supported aggregate functions: `count`, `sum`, `avg`, `min`, `max`.
+
+---
 
 ## Filtering
 
-Filters use the `column=operator.value` syntax:
+Filters use the `column=operator.value` syntax on query parameters. Any query parameter that isn't a reserved word (`select`, `order`, `limit`, `offset`, `cursor_column`, `cursor_value`, `and`, `or`) is treated as a column filter.
 
-| Operator | Meaning | Example |
-|----------|---------|---------|
-| `eq` | Equals | `name=eq.Widget` |
-| `neq` | Not equals | `name=neq.Widget` |
-| `gt` | Greater than | `price=gt.100` |
-| `gte` | Greater or equal | `price=gte.100` |
-| `lt` | Less than | `price=lt.50` |
-| `lte` | Less or equal | `price=lte.50` |
-| `like` | LIKE pattern | `name=like.*widget*` |
-| `ilike` | Case-insensitive LIKE | `name=ilike.*widget*` |
-| `is` | IS (null, true, false) | `deleted_at=is.null` |
-| `in` | IN list | `status=in.(active,pending)` |
+### Comparison Operators
+
+| Operator | SQL | Example |
+|----------|-----|---------|
+| `eq` | `=` | `name=eq.Widget` |
+| `neq` | `!=` | `status=neq.archived` |
+| `gt` | `>` | `price=gt.100` |
+| `gte` | `>=` | `age=gte.18` |
+| `lt` | `<` | `price=lt.50` |
+| `lte` | `<=` | `priority=lte.3` |
+
+```bash
+# Items priced between 10 and 100
+curl "/api/public/items?price=gte.10&price=lte.100"
+```
+
+### Pattern Matching
+
+| Operator | SQL | Example |
+|----------|-----|---------|
+| `like` | `LIKE` | `name=like.*widget*` |
+| `ilike` | `ILIKE` | `name=ilike.*Widget*` |
+| `match` | `~` (regex) | `email=match.^admin` |
+| `imatch` | `~*` (case-insensitive regex) | `email=imatch.^admin` |
+
+Use `*` as the wildcard character (mapped to `%` in SQL):
+
+```bash
+# Names starting with "A"
+curl "/api/public/users?name=like.A*"
+
+# Case-insensitive search
+curl "/api/public/items?name=ilike.*phone*"
+```
+
+> **Note:** `ilike`, `match`, and `imatch` are Postgres-only. On SQLite, `ilike` is automatically rewritten to a `LIKE` with `LOWER()`.
+
+### IS Operators
+
+| Operator | SQL | Example |
+|----------|-----|---------|
+| `is` | `IS` | `deleted_at=is.null` |
+| `isdistinct` | `IS DISTINCT FROM` | `status=isdistinct.active` |
+
+Valid `is` values: `null`, `true`, `false`.
+
+```bash
+# Rows where deleted_at is NULL
+curl "/api/public/users?deleted_at=is.null"
+
+# Rows where active is true
+curl "/api/public/users?active=is.true"
+```
+
+### Set Operators
+
+| Operator | SQL | Example |
+|----------|-----|---------|
+| `in` | `IN` | `status=in.(active,pending,review)` |
+
+```bash
+# Items in specific categories
+curl "/api/public/items?category=in.(electronics,books,clothing)"
+```
+
+### Array / JSONB Operators (Postgres only)
+
+| Operator | SQL | Description |
+|----------|-----|-------------|
+| `cs` | `@>` | Contains |
+| `cd` | `<@` | Contained by |
+| `ov` | `&&` | Overlaps |
+
+```bash
+# Array contains value
+curl "/api/public/items?tags=cs.{electronics,sale}"
+
+# JSONB contains
+curl "/api/public/items?metadata=cs.{\"featured\":true}"
+```
+
+### Range Operators (Postgres only)
+
+| Operator | SQL | Description |
+|----------|-----|-------------|
+| `sl` | `<<` | Strictly left |
+| `sr` | `>>` | Strictly right |
+| `nxr` | `&<` | Does not extend to the right |
+| `nxl` | `&>` | Does not extend to the left |
+| `adj` | `-|-` | Adjacent |
+
+### Full-Text Search (Postgres only)
+
+| Operator | SQL Function | Example |
+|----------|-------------|---------|
+| `fts` | `to_tsquery` | `description=fts.web+development` |
+| `plfts` | `plainto_tsquery` | `description=plfts.web development` |
+| `phfts` | `phraseto_tsquery` | `description=phfts.web development` |
+| `wfts` | `websearch_to_tsquery` | `description=wfts."web development" OR mobile` |
+
+Optional language config:
+
+```bash
+# Full-text search with English config
+curl "/api/public/articles?body=fts(english).postgresql+tutorial"
+```
+
+### Quantifiers
+
+Comparison and pattern operators support quantifiers for array/set matching:
+
+| Quantifier | SQL | Example |
+|-----------|-----|---------|
+| `any` | `= ANY(...)` | `id=eq(any).{1,2,3}` |
+| `all` | `= ALL(...)` | `score=gt(all).{80,90}` |
+
+---
+
+## Negation
+
+Prefix any operator with `not.` to negate it:
+
+```bash
+# Not equal
+curl "/api/public/items?status=not.eq.archived"
+
+# Not in list
+curl "/api/public/items?category=not.in.(deprecated,removed)"
+
+# Not null
+curl "/api/public/users?email=not.is.null"
+
+# Not like
+curl "/api/public/items?name=not.like.*test*"
+
+# Not matching regex
+curl "/api/public/users?email=not.match.^temp"
+```
+
+---
+
+## Logic Filters
+
+Combine filters with boolean logic using `and=` and `or=` query parameters.
+
+### Basic OR
+
+```bash
+# Items that are either cheap OR in electronics
+curl "/api/public/items?or=(price.lt.10,category.eq.electronics)"
+```
+
+### Basic AND (explicit)
+
+```bash
+# Items that are expensive AND in stock
+curl "/api/public/items?and=(price.gt.100,in_stock.is.true)"
+```
+
+### Nested logic
+
+```bash
+# (price < 10 OR price > 1000) AND category = electronics
+curl "/api/public/items?and=(or(price.lt.10,price.gt.1000),category.eq.electronics)"
+```
+
+### Combining with regular filters
+
+Regular query parameter filters are ANDed together. Logic filters combine with them:
+
+```bash
+# in_stock = true AND (category = books OR category = electronics)
+curl "/api/public/items?in_stock=is.true&or=(category.eq.books,category.eq.electronics)"
+```
+
+---
 
 ## Ordering
 
+Use the `order` query parameter:
+
 ```bash
-# Single column
-curl "http://localhost:3000/api/public/items?order=price.desc"
+# Single column ascending (default direction)
+curl "/api/public/items?order=name"
+
+# Explicit direction
+curl "/api/public/items?order=price.desc"
 
 # Multiple columns
-curl "http://localhost:3000/api/public/items?order=category.asc,price.desc"
+curl "/api/public/items?order=category.asc,price.desc"
 ```
+
+### Null ordering
+
+Control where NULLs appear:
+
+```bash
+# NULLs first
+curl "/api/public/items?order=price.asc.nullsfirst"
+
+# NULLs last
+curl "/api/public/items?order=price.desc.nullslast"
+```
+
+---
 
 ## Pagination
 
+### Offset / Limit
+
+Classic pagination with `limit` and `offset`:
+
 ```bash
-# Limit and offset
-curl "http://localhost:3000/api/public/items?limit=10&offset=20"
+# First 10 rows
+curl "/api/public/items?limit=10"
+
+# Page 3 (rows 21-30)
+curl "/api/public/items?limit=10&offset=20"
 ```
+
+The response includes a `Content-Range` header:
+
+```
+Content-Range: 20-29/156
+```
+
+To get the total count, use `Prefer: count=exact`:
+
+```bash
+curl "/api/public/items?limit=10" -H "Prefer: count=exact"
+# Content-Range: 0-9/156
+```
+
+### Cursor Pagination
+
+For large datasets, cursor-based (keyset) pagination is more efficient than offset — it avoids the O(n) skip cost.
+
+```bash
+# First page: just specify the cursor column and limit
+curl "/api/public/items?order=id.asc&cursor_column=id&limit=10"
+```
+
+The response includes an `X-Next-Cursor` header with the last row's cursor value:
+
+```
+X-Next-Cursor: 10
+```
+
+Use that value for the next page:
+
+```bash
+# Next page
+curl "/api/public/items?order=id.asc&cursor_column=id&cursor_value=10&limit=10"
+```
+
+#### How it works
+
+- Adds `WHERE id > $cursor_value` (for ascending) or `WHERE id < $cursor_value` (for descending)
+- Automatically injects the cursor column into `ORDER BY` if not already present
+- Ignores any `offset` parameter when cursor is active
+- Returns `X-Next-Cursor` header only when there are results
+
+#### Default to primary key
+
+If `cursor_column` is omitted but the table has a primary key, the PK is used automatically:
+
+```bash
+# Uses the table's primary key as cursor column
+curl "/api/public/items?cursor_value=42&limit=10"
+```
+
+#### With descending order
+
+```bash
+# Newest first, paginate backward
+curl "/api/public/items?order=id.desc&cursor_column=id&cursor_value=100&limit=10"
+# SQL: WHERE id < 100 ORDER BY id DESC LIMIT 10
+```
+
+#### Error cases
+
+- If the cursor column doesn't exist → `400 Bad Request`
+- If the table has no PK and no `cursor_column` is specified → `400 Bad Request`
+
+---
+
+## Resource Embedding
+
+Traverse foreign-key relationships and embed related resources as nested JSON using the `select` parameter.
+
+### Many-to-one (child → parent)
+
+```bash
+# Orders with their user (orders.user_id → users.id)
+curl "/api/public/orders?select=id,total,users(id,name)"
+```
+
+Response:
+```json
+[
+  {
+    "id": 1,
+    "total": 99.99,
+    "users": {"id": 1, "name": "Alice"}
+  }
+]
+```
+
+### One-to-many (parent → children)
+
+```bash
+# Users with their orders (users.id ← orders.user_id)
+curl "/api/public/users?select=id,name,orders(id,total,status)"
+```
+
+Response:
+```json
+[
+  {
+    "id": 1,
+    "name": "Alice",
+    "orders": [
+      {"id": 1, "total": 99.99, "status": "completed"},
+      {"id": 2, "total": 45.00, "status": "pending"}
+    ]
+  }
+]
+```
+
+### Many-to-many (via junction table)
+
+```bash
+# Orders with their items (via order_items junction)
+curl "/api/public/orders?select=id,total,items(id,name,price)"
+```
+
+pgvis automatically detects M2M relationships through junction tables.
+
+### Nested embedding
+
+```bash
+# Users → Orders → Items (three levels)
+curl "/api/public/users?select=id,name,orders(id,total,items(name,price))"
+```
+
+### Filtering on parent
+
+```bash
+# Orders for a specific user, with items embedded
+curl "/api/public/orders?user_id=eq.1&select=id,total,items(*)"
+```
+
+### Column selection on embedded resources
+
+```bash
+# Only specific columns from the embedded resource
+curl "/api/public/orders?select=id,users(name,email)"
+```
+
+---
 
 ## Mutations
 
-```bash
-# Create
-curl -X POST "http://localhost:3000/api/public/items" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Widget", "price": 9.99}'
+### INSERT (POST)
 
-# Update
-curl -X PATCH "http://localhost:3000/api/public/items?id=eq.1" \
+```bash
+# Single row
+curl -X POST "/api/public/items" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Widget", "price": 9.99, "category": "gadgets"}'
+
+# Bulk insert
+curl -X POST "/api/public/items" \
+  -H "Content-Type: application/json" \
+  -d '[{"name": "A", "price": 1.0}, {"name": "B", "price": 2.0}]'
+```
+
+### UPSERT (POST with conflict resolution)
+
+```bash
+# Insert or update on conflict (merge duplicates)
+curl -X POST "/api/public/items" \
+  -H "Content-Type: application/json" \
+  -H "Prefer: resolution=merge-duplicates" \
+  -d '{"id": 1, "name": "Updated Widget", "price": 12.99}'
+
+# Insert or ignore on conflict
+curl -X POST "/api/public/items" \
+  -H "Prefer: resolution=ignore-duplicates" \
+  -d '{"id": 1, "name": "Ignored", "price": 0}'
+```
+
+### UPDATE (PATCH)
+
+Updates rows matching the filter criteria:
+
+```bash
+# Update price for a specific item
+curl -X PATCH "/api/public/items?id=eq.1" \
   -H "Content-Type: application/json" \
   -d '{"price": 12.99}'
 
-# Delete
-curl -X DELETE "http://localhost:3000/api/public/items?id=eq.1"
+# Update multiple rows
+curl -X PATCH "/api/public/items?category=eq.gadgets" \
+  -H "Content-Type: application/json" \
+  -d '{"in_stock": false}'
 ```
+
+> ⚠️ A PATCH without filters updates ALL rows. Be careful.
+
+### DELETE
+
+Deletes rows matching the filter criteria:
+
+```bash
+# Delete a specific item
+curl -X DELETE "/api/public/items?id=eq.1"
+
+# Delete with multiple filters
+curl -X DELETE "/api/public/items?category=eq.deprecated&in_stock=is.false"
+```
+
+### Getting the result back
+
+Use `Prefer: return=representation` to get the affected rows in the response:
+
+```bash
+curl -X POST "/api/public/items" \
+  -H "Content-Type: application/json" \
+  -H "Prefer: return=representation" \
+  -d '{"name": "New Item", "price": 5.99}'
+```
+
+Response (201 Created):
+```json
+[{"id": 42, "name": "New Item", "price": 5.99, "category": null, "in_stock": true}]
+```
+
+---
 
 ## RPC (Function Calls)
 
+Database functions are called via `POST /api/{schema}/rpc/{function_name}`:
+
 ```bash
-curl -X POST "http://localhost:3000/api/public/rpc/my_function" \
+# Call a function with arguments
+curl -X POST "/api/public/rpc/add" \
   -H "Content-Type: application/json" \
-  -d '{"arg1": "value1"}'
+  -d '{"a": 2, "b": 3}'
+
+# Function returning a set (table-like)
+curl -X POST "/api/public/rpc/search_items" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "widget"}'
+
+# Function with default parameters
+curl -X POST "/api/public/rpc/echo_params" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "World"}'
 ```
+
+### Volatility-based routing
+
+- `STABLE` / `IMMUTABLE` functions → also accessible via `GET /rpc/{name}?arg=value`
+- `VOLATILE` functions → `POST` only
+
+### Void functions
+
+Functions returning `void` respond with `204 No Content`.
+
+---
 
 ## Prefer Header
 
-Control response behavior with the `Prefer` header:
+The `Prefer` header controls response behaviour. Multiple preferences can be combined with commas.
+
+### `return`
+
+Controls what the response body contains after mutations:
+
+| Value | Behaviour |
+|-------|-----------|
+| `representation` | Return the affected rows as JSON |
+| `minimal` | Return empty body (just status code + headers) |
+| `headers-only` | Return empty body with headers showing affected count |
 
 ```bash
-# Return the created/updated rows
-curl -X POST ... -H "Prefer: return=representation"
+curl -X POST "/api/public/items" \
+  -H "Prefer: return=representation" \
+  -d '{"name": "Test"}'
+```
 
-# Return only count
-curl ... -H "Prefer: count=exact"
+### `count`
+
+Controls whether and how total count is computed:
+
+| Value | Behaviour |
+|-------|-----------|
+| `exact` | Full `COUNT(*)` — accurate but potentially slow |
+| `planned` | Use `EXPLAIN` row estimate — fast but approximate |
+| `estimated` | Use `planned` for large tables, `exact` for small ones |
+
+```bash
+curl "/api/public/items?limit=10" -H "Prefer: count=exact"
+# Content-Range: 0-9/1523
+```
+
+### `resolution`
+
+Controls UPSERT conflict handling (used with POST):
+
+| Value | Behaviour |
+|-------|-----------|
+| `merge-duplicates` | `ON CONFLICT DO UPDATE` |
+| `ignore-duplicates` | `ON CONFLICT DO NOTHING` |
+
+### `handling`
+
+| Value | Behaviour |
+|-------|-----------|
+| `strict` | Unknown preferences/invalid parameters return 400 |
+| `lenient` | Unknown preferences are silently ignored |
+
+### `missing`
+
+Controls handling of missing keys in JSON payloads:
+
+| Value | Behaviour |
+|-------|-----------|
+| `default` | Missing keys use column defaults |
+| `null` | Missing keys are set to NULL |
+
+### `tx`
+
+Controls transaction end behaviour (requires `tx_allow_override = true` in config):
+
+| Value | Behaviour |
+|-------|-----------|
+| `commit` | Normal commit (default) |
+| `rollback` | Roll back the transaction (useful for testing/dry-run) |
+
+### `timezone`
+
+Set the session timezone for the request:
+
+```bash
+curl "/api/public/events" -H "Prefer: timezone=America/New_York"
+```
+
+### `max-affected`
+
+Limit the number of affected rows (requires `handling=strict`):
+
+```bash
+curl -X DELETE "/api/public/items?status=eq.old" \
+  -H "Prefer: handling=strict, max-affected=10"
+```
+
+### `params`
+
+Control how RPC arguments are passed:
+
+| Value | Behaviour |
+|-------|-----------|
+| `single-object` | The entire JSON body is passed as a single argument |
+| `multiple-objects` | Each top-level key is a separate argument (default) |
+
+---
+
+## Response Headers
+
+### Content-Range
+
+Always present on GET responses:
+
+```
+Content-Range: 0-24/*      (count not requested)
+Content-Range: 0-24/156    (with Prefer: count=exact)
+Content-Range: */0          (empty result)
+```
+
+### X-Next-Cursor
+
+Present when using cursor pagination and there are results:
+
+```
+X-Next-Cursor: 42
+```
+
+### Content-Type
+
+```
+Content-Type: application/json; charset=utf-8
+```
+
+### Preference-Applied
+
+Echoes back the preferences that were honoured:
+
+```
+Preference-Applied: return=representation, count=exact
+```
+
+---
+
+## Query Plan
+
+When `plan_enabled = true` in config, request the execution plan instead of results:
+
+```bash
+curl "/api/public/items?price=gt.100" \
+  -H "Accept: application/vnd.pgrst.plan+json"
+```
+
+Returns the PostgreSQL `EXPLAIN` output as JSON.
+
+---
+
+## Error Format
+
+Errors follow PostgREST conventions with JSON body and appropriate HTTP status:
+
+```json
+{
+  "code": "PGRST204",
+  "message": "Column 'nonexistent' not found in table 'items'",
+  "details": null,
+  "hint": "Did you mean: name, price, category?"
+}
+```
+
+### Error Codes
+
+| Code | HTTP Status | Meaning |
+|------|-------------|---------|
+| `PGRST000` | 500 | Internal error |
+| `PGRST100` | 400 | Parse error in query parameters |
+| `PGRST102` | 400 | Invalid filter |
+| `PGRST103` | 400 | Invalid range |
+| `PGRST106` | 406 | Not acceptable (content negotiation) |
+| `PGRST200` | 404 | Table/view not found |
+| `PGRST202` | 404 | Function not found |
+| `PGRST204` | 400 | Column not found |
+| `PGRST300` | 409 | Ambiguous relationship |
+
+---
+
+## Schema Selection
+
+### Via URL path (default)
+
+With `routing.schema_in_path = true`:
+
+```bash
+GET /api/public/users     → public schema
+GET /api/analytics/events → analytics schema
+```
+
+### Via header
+
+With `routing.schema_in_path = false`:
+
+```bash
+# Read requests
+GET /users -H "Accept-Profile: analytics"
+
+# Write requests
+POST /items -H "Content-Profile: analytics"
+```
+
+When no profile header is sent, the `routing.default_schema` is used.
+
+---
+
+## Content Negotiation
+
+| Accept header | Response format |
+|--------------|-----------------|
+| `application/json` (default) | JSON array |
+| `application/vnd.pgrst.object+json` | Single JSON object (first row) |
+| `application/vnd.pgrst.plan+json` | Query execution plan |
+| `text/csv` | CSV format (planned) |
+
+---
+
+## Examples
+
+### Complete CRUD workflow
+
+```bash
+BASE="http://localhost:3000/api/public"
+
+# Create
+curl -X POST "$BASE/items" \
+  -H "Content-Type: application/json" \
+  -H "Prefer: return=representation" \
+  -d '{"name": "Laptop", "price": 999.99, "category": "electronics"}'
+# → [{"id": 1, "name": "Laptop", "price": 999.99, ...}]
+
+# Read with filter
+curl "$BASE/items?category=eq.electronics&order=price.desc"
+
+# Update
+curl -X PATCH "$BASE/items?id=eq.1" \
+  -H "Content-Type: application/json" \
+  -H "Prefer: return=representation" \
+  -d '{"price": 899.99}'
+
+# Delete
+curl -X DELETE "$BASE/items?id=eq.1"
+```
+
+### Paginated list with cursor
+
+```bash
+# First page
+RESPONSE=$(curl -sD - "$BASE/items?order=id.asc&cursor_column=id&limit=20")
+CURSOR=$(echo "$RESPONSE" | grep -i x-next-cursor | cut -d: -f2 | tr -d ' \r')
+
+# Next page
+curl "$BASE/items?order=id.asc&cursor_column=id&cursor_value=$CURSOR&limit=20"
+```
+
+### Complex query with embedding and logic filters
+
+```bash
+# Active users with their recent completed orders (nested items included)
+# who are either admins OR have placed orders worth > $100
+curl "$BASE/users?select=id,name,email,orders(id,total,status,items(name,price))&\
+active=is.true&\
+or=(role.eq.admin,orders.total.gt.100)&\
+orders.status=eq.completed&\
+order=name.asc&\
+limit=50"
 ```

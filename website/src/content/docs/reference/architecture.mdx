@@ -5,49 +5,198 @@ description: How pgvis is structured internally.
 
 # Architecture
 
-pgvis is a seven-crate Rust workspace. All dependencies point inward to the I/O-free core.
+pgvis is a seven-crate Rust workspace. All dependencies point inward to the I/O-free core — the engine is embeddable, testable, and backend-agnostic.
 
 ## Crate Map
 
-| Crate | Role |
-|-------|------|
-| `pgvis-core` | I/O-free engine: query parser, plan layer, SQL builder, schema cache |
-| `pgvis-postgres` | Postgres backend: connection pool, introspection, execution |
-| `pgvis-sqlite` | SQLite backend: introspection and execution |
-| `pgvis-router` | axum REST router + OpenAPI generator |
-| `pgvis-mcp` | MCP tools & resources (stdio + Streamable HTTP) |
-| `pgvis-lib` | `Builder` facade — the one way to assemble the stack |
-| `pgvis-server` | The `pgvis` CLI binary |
+```
+┌─────────────────────────────────────────────────┐
+│                  pgvis-server                     │ ← CLI binary
+├──────────────────────┬──────────────────────────┤
+│                  pgvis-lib                        │ ← Builder facade
+├──────────┬───────────┼───────────┬──────────────┤
+│pgvis-router│        │pgvis-mcp  │              │ ← Surfaces
+│(REST+OpenAPI)       │(tools+stdio+HTTP)         │
+├──────────┴───────────┴───────────┴──────────────┤
+│                  pgvis-core                       │ ← I/O-free engine
+├──────────────────────┬──────────────────────────┤
+│  pgvis-postgres      │  pgvis-sqlite            │ ← Backends
+└──────────────────────┴──────────────────────────┘
+```
+
+| Crate | Role | Key modules |
+|-------|------|-------------|
+| `pgvis-core` | I/O-free engine: parser, planner, SQL builder, schema cache types, config, error codes | `query_params`, `plan`, `query`, `cache`, `config`, `dialect` |
+| `pgvis-postgres` | PostgreSQL backend: connection pool, introspection queries, query execution | `introspect`, `execute` |
+| `pgvis-sqlite` | SQLite backend: introspection from `sqlite_master`, execution via rusqlite | `introspect`, `execute` |
+| `pgvis-router` | axum REST router + OpenAPI 3.0 generator | `routing`, `response`, `openapi` |
+| `pgvis-mcp` | MCP tool generation, execution, stdio + Streamable HTTP transport | `tools`, `server`, `transport` |
+| `pgvis-lib` | `Builder` API — the single way to assemble the stack | `Builder`, `Components`, `detect_db_kind` |
+| `pgvis-server` | The `pgvis` CLI: `serve`, `mcp`, `openapi`, `inspect` subcommands | `main` with clap + figment |
 
 ## Request Lifecycle
 
+### REST path
+
 ```
-HTTP Request / MCP Tool Call
-        │
-        ▼
-   Parse into ApiRequest
-        │
-        ▼
-   plan_request (validate, resolve relationships)
-        │
-        ▼
-   render SQL (parameterized)
-        │
-        ▼
-   Backend::execute (Postgres/SQLite)
-        │
-        ▼
-   Format Response (JSON / OpenAPI / MCP result)
+HTTP Request (axum handler)
+    │
+    ├─ Parse query params → ApiRequest
+    │    ├─ select= → SelectItems (winnow parser)
+    │    ├─ column=op.val → Filter[]
+    │    ├─ and=/or= → LogicTree[]
+    │    ├─ order= → OrderTerm[]
+    │    ├─ limit/offset → RangeSpec
+    │    ├─ cursor_column/cursor_value → CursorSpec
+    │    ├─ Prefer header → Preferences
+    │    └─ JSON body → RequestBody
+    │
+    ├─ plan_request(ApiRequest, SchemaCache, Dialect, Config)
+    │    ├─ Validate table/columns exist
+    │    ├─ Resolve foreign-key joins (embedding)
+    │    ├─ Resolve cursor → keyset WHERE condition
+    │    ├─ Check dialect capabilities (filter rewrites)
+    │    └─ → ActionPlan (ReadPlan | MutatePlan | CallPlan | InspectPlan)
+    │
+    ├─ query::render(ActionPlan, Dialect)
+    │    ├─ Build CTE-wrapped SELECT/INSERT/UPDATE/DELETE
+    │    ├─ Parameterized ($1, $2, ...) — never string interpolation
+    │    └─ → (sql: String, params: Vec<Value>)
+    │
+    ├─ Backend::execute(ExecContext, sql, params)
+    │    ├─ SET LOCAL role (JWT role)
+    │    ├─ SET LOCAL statement_timeout
+    │    ├─ Run pre_request hook
+    │    ├─ Execute query
+    │    └─ → QueryResult { body, total_count }
+    │
+    └─ format_response(QueryResult, preferences)
+         ├─ JSON body
+         ├─ Content-Range header
+         ├─ X-Next-Cursor header (if cursor pagination)
+         └─ → HTTP Response
 ```
+
+### MCP path
+
+```
+MCP Tool Call (stdio JSON-RPC or Streamable HTTP)
+    │
+    ├─ parse_tool_name → (schema, verb, table/function)
+    ├─ parse tool arguments → ApiRequest (same struct as REST)
+    ├─ plan_request → ActionPlan (same planner)
+    ├─ query::render → SQL (same builder)
+    ├─ Backend::execute → QueryResult (same execution)
+    └─ Format as MCP tool result (JSON content)
+```
+
+## The Core Pipeline
+
+### Stage 1: Parsing (`query_params`)
+
+The `query_params` module uses **winnow** parser combinators to parse the PostgREST query DSL:
+
+- `select=id,name,orders(*)` → `Vec<SelectItem>` (columns, aggregates, embedded resources)
+- `price=gte.100` → `Filter { column, operator: Gte, value: "100" }`
+- `or=(price.lt.10,price.gt.100)` → `LogicTree::Or(vec![...])`
+- `order=name.asc.nullsfirst` → `OrderTerm { column, direction, nulls }`
+- `cursor_column=id&cursor_value=42` → `CursorSpec { column, value }`
+
+Parser output is **syntactic only** — names are just strings, not yet validated against the schema.
+
+### Stage 2: Planning (`plan`)
+
+The planner validates and resolves parsed input against the `SchemaCache`:
+
+- Verifies tables/columns exist (with typo suggestions via Levenshtein distance)
+- Resolves foreign-key relationships for embedding
+- Applies `Dialect` capability checks (e.g., `ILIKE` → `LIKE+LOWER` on SQLite)
+- Resolves cursor to keyset WHERE condition with correct comparison operator
+- Produces a fully-resolved `ActionPlan`:
+  - `ReadPlan` — SELECT with joins, filters, ordering, cursor, pagination
+  - `MutatePlan` — INSERT/UPDATE/DELETE with conflict resolution
+  - `CallPlan` — RPC function call with typed parameters
+  - `InspectPlan` — schema inspection
+
+### Stage 3: SQL Builder (`query`)
+
+Renders `ActionPlan` into parameterized SQL:
+
+- Uses a `RenderContext` that manages parameter indices (`$1`, `$2`, ...)
+- CTE envelope: wraps results in `WITH body AS (...) SELECT ...` for consistent shape
+- Dialect-aware: PostgreSQL vs SQLite syntax differences
+- Embedding: lateral joins (Postgres) or correlated subqueries (SQLite)
+- Cursor: injects `WHERE column > $N` (ascending) or `WHERE column < $N` (descending)
+
+## Schema Cache
+
+The `SchemaCache` is the introspected database metadata snapshot. It contains:
+
+| Type | Content |
+|------|---------|
+| `Table` | Name, columns, primary key, insertable/updatable/deletable flags, comments |
+| `Column` | Name, type, nullable, default, is_pk, max_length |
+| `Relationship` | Foreign key relationships (M2O, O2M, M2M via junction tables) |
+| `Routine` | Functions: name, parameters, return type, volatility, language |
+| `UniqueConstraint` | Unique indexes for upsert resolution |
+
+The cache is loaded once at startup and stored in an `Arc<ArcSwap<SchemaCache>>` for hot-reload capability.
+
+## The `Dialect` System
+
+Instead of a trait per backend, pgvis uses a **data struct** with boolean capability flags:
+
+```rust
+pub struct Dialect {
+    pub name: &'static str,           // "postgres" or "sqlite"
+    pub supports_ilike: bool,         // ILIKE keyword
+    pub supports_regex_match: bool,   // ~ and ~* operators
+    pub supports_array_ops: bool,     // @>, <@, &&
+    pub supports_range_ops: bool,     // <<, >>, &<, &>, -|-
+    pub supports_fts: bool,           // to_tsquery, @@
+    pub supports_lateral_join: bool,  // LATERAL subqueries
+    pub supports_json_agg: bool,      // json_agg / json_group_array
+    pub supports_set_timezone: bool,  // SET timezone
+    pub param_style: ParamStyle,      // $1 vs ?
+    pub identifier_quote: char,       // " vs `
+    // ...
+}
+```
+
+At plan time, unsupported operators are either rewritten (e.g., `ILIKE` → `LIKE` + `LOWER()` on SQLite) or rejected with a clear error message.
+
+## The `Backend` Trait
+
+```rust
+#[async_trait]
+pub trait Backend: Send + Sync {
+    async fn introspect(&self, config: &IntrospectConfig) -> Result<SchemaCache, Error>;
+    async fn execute(&self, ctx: &ExecContext, sql: &str, params: &[Value]) -> Result<QueryResult, Error>;
+    fn dialect(&self) -> &Dialect;
+}
+```
+
+Two implementations:
+- `PgBackend` — uses `deadpool-postgres` for connection pooling
+- `SqliteBackend` — uses `rusqlite` with `tokio::task::spawn_blocking`
 
 ## Key Design Decisions
 
-1. **I/O-free core** — `pgvis-core` does no I/O. Database drivers implement a `Backend` trait. This makes the engine embeddable and testable.
+1. **I/O-free core** — `pgvis-core` does no I/O. Testable with unit tests, no database needed.
+2. **One pipeline, three surfaces** — REST, OpenAPI, and MCP all lower into `ApiRequest → plan → SQL`.
+3. **`Dialect` as data, not trait** — capability flags drive plan-time gating without complex generics.
+4. **Hand-rolled SQL builder** — full control over output, no ORM abstraction cost.
+5. **Object-safe `Backend`** — `BoxFuture` return type enables `Arc<dyn Backend>`.
+6. **winnow parsers** — zero-allocation parser combinators for the query DSL.
+7. **PostgREST-compatible** — same DSL, same headers, same error codes. Drop-in replacement.
 
-2. **One pipeline, three surfaces** — REST, OpenAPI, and MCP all lower into `ApiRequest → plan → SQL`. Behavior never diverges.
+For the detailed architecture documents, see the [`arch/`](https://github.com/pgvis/pgvis/tree/main/arch) directory:
 
-3. **Backend-agnostic** — A `Dialect` capability system drives feature gating. SQLite works with no core rewrite.
-
-4. **PostgREST-compatible** — Same query DSL, `Prefer` semantics, and error codes. Drop-in replacement for existing clients.
-
-For the full architecture reference, see the [arch/ directory](https://github.com/pgvis/pgvis/tree/main/arch) in the repository.
+- [01 — Overview](https://github.com/pgvis/pgvis/blob/main/arch/01-overview.md)
+- [02 — Core Pipeline](https://github.com/pgvis/pgvis/blob/main/arch/02-core-pipeline.md)
+- [03 — Backends and Dialects](https://github.com/pgvis/pgvis/blob/main/arch/03-backends-and-dialects.md)
+- [04 — Surfaces](https://github.com/pgvis/pgvis/blob/main/arch/04-surfaces.md)
+- [05 — Schema Cache](https://github.com/pgvis/pgvis/blob/main/arch/05-schema-cache.md)
+- [06 — Errors and Config](https://github.com/pgvis/pgvis/blob/main/arch/06-errors-and-config.md)
+- [07 — Design Decisions](https://github.com/pgvis/pgvis/blob/main/arch/07-design-decisions.md)
+- [08 — Future Scope](https://github.com/pgvis/pgvis/blob/main/arch/08-future-scope.md)

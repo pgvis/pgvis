@@ -49,6 +49,13 @@ pub fn render_read(plan: &ReadPlan, ctx: &mut RenderContext<'_>) -> Result<Strin
     let where_clause =
         fragment::render_where_clause(&plan.filters, &plan.logic_filters, Some(table_alias), ctx);
 
+    // --- Cursor condition (keyset pagination) ---
+    let cursor_condition = plan
+        .range
+        .cursor
+        .as_ref()
+        .map(|cursor| fragment::render_cursor_condition(cursor, Some(table_alias), ctx));
+
     // --- GROUP BY ---
     let group_by = fragment::render_group_by(&plan.select, Some(table_alias), ctx);
 
@@ -61,9 +68,23 @@ pub fn render_read(plan: &ReadPlan, ctx: &mut RenderContext<'_>) -> Result<Strin
     // --- Assemble ---
     let mut sql = format!("SELECT {select_clause} FROM {from_clause}");
 
-    if let Some(wc) = where_clause {
-        sql.push_str(" WHERE ");
-        sql.push_str(&wc);
+    // Combine WHERE clause and cursor condition
+    match (&where_clause, &cursor_condition) {
+        (Some(wc), Some(cc)) => {
+            sql.push_str(" WHERE ");
+            sql.push_str(wc);
+            sql.push_str(" AND ");
+            sql.push_str(cc);
+        }
+        (Some(wc), None) => {
+            sql.push_str(" WHERE ");
+            sql.push_str(wc);
+        }
+        (None, Some(cc)) => {
+            sql.push_str(" WHERE ");
+            sql.push_str(cc);
+        }
+        (None, None) => {}
     }
 
     if let Some(gb) = group_by {
@@ -426,6 +447,8 @@ mod tests {
             range: ResolvedRange {
                 limit: Some(10),
                 offset: None,
+                cursor: None,
+                cursor_column: None,
             },
             logic_filters: vec![],
             aggregates: vec![],

@@ -1,63 +1,176 @@
 ---
 title: Quick Start
-description: Get pgvis running in under 2 minutes.
+description: Get pgvis running in under 5 minutes.
 ---
 
 # Quick Start
 
-Get a REST API, MCP tools, and OpenAPI spec from your Postgres database in under 2 minutes.
+Get a REST API, MCP tools, and an OpenAPI spec from your database in under 5 minutes.
 
 ## Prerequisites
 
 - A stable Rust toolchain (edition 2024) — or use Nix
-- A running PostgreSQL instance
+- A running PostgreSQL instance (or use SQLite for zero-dependency testing)
 
-## Build & Run
+## Option A: PostgreSQL
 
 ```bash
 # Build the CLI
 cargo build --release --bin pgvis
 
-# Point it at your database and serve
-export PGVIS_DSN="postgres://user@localhost/mydb"
-./target/release/pgvis serve --bind 0.0.0.0:3000
+# Point it at your database
+export PGVIS_DSN="postgres://user:password@localhost/mydb"
+./target/release/pgvis serve
 ```
 
-## First Request
+pgvis introspects all tables, views, and functions in the `public` schema and starts serving on `http://localhost:3000`.
+
+## Option B: SQLite (No Server Required)
 
 ```bash
-# List rows from a table in the public schema
-curl "http://localhost:3000/api/public/your_table"
+# Use any existing SQLite database
+export PGVIS_DSN="sqlite:./mydata.db"
+./target/release/pgvis serve
+```
 
-# Select specific columns
-curl "http://localhost:3000/api/public/items?select=id,name,price"
+pgvis auto-detects SQLite from the DSN and uses the `main` schema.
 
-# Filter rows
-curl "http://localhost:3000/api/public/items?price=gte.99.99"
+## First Requests
+
+### List rows
+
+```bash
+curl "http://localhost:3000/api/public/users"
+```
+
+Response:
+```json
+[
+  {"id": 1, "name": "Alice", "email": "alice@example.com"},
+  {"id": 2, "name": "Bob", "email": "bob@example.com"}
+]
+```
+
+### Select specific columns
+
+```bash
+curl "http://localhost:3000/api/public/users?select=id,name"
+```
+
+### Filter rows
+
+```bash
+# Exact match
+curl "http://localhost:3000/api/public/users?name=eq.Alice"
+
+# Numeric comparison
+curl "http://localhost:3000/api/public/items?price=gte.100"
+
+# Pattern matching
+curl "http://localhost:3000/api/public/items?name=ilike.*widget*"
+```
+
+### Order and paginate
+
+```bash
+# Order by price descending, take first 10
+curl "http://localhost:3000/api/public/items?order=price.desc&limit=10"
+
+# Cursor-based pagination (efficient for large datasets)
+curl "http://localhost:3000/api/public/items?order=id.asc&cursor_column=id&cursor_value=42&limit=10"
+```
+
+### Embed related resources
+
+```bash
+# Get orders with their items (via foreign key)
+curl "http://localhost:3000/api/public/orders?select=id,total,items(*)"
+```
+
+### Create a row
+
+```bash
+curl -X POST "http://localhost:3000/api/public/items" \
+  -H "Content-Type: application/json" \
+  -H "Prefer: return=representation" \
+  -d '{"name": "Widget", "price": 9.99}'
+```
+
+### Call a function
+
+```bash
+curl -X POST "http://localhost:3000/api/public/rpc/add" \
+  -H "Content-Type: application/json" \
+  -d '{"a": 2, "b": 3}'
 ```
 
 ## MCP for AI Agents
 
-```bash
-# stdio transport (for Claude Desktop)
-pgvis --dsn "postgres://user@localhost/mydb" mcp
+### Claude Desktop (stdio transport)
 
-# or HTTP transport alongside REST
+Add to your Claude Desktop MCP configuration (`~/.config/claude/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "mydb": {
+      "command": "./target/release/pgvis",
+      "args": ["--dsn", "postgres://user@localhost/mydb", "mcp"]
+    }
+  }
+}
+```
+
+Claude can now query your database using natural language — pgvis generates typed tools for every table and function.
+
+### Read-only mode (safer for LLMs)
+
+```json
+{
+  "mcpServers": {
+    "mydb": {
+      "command": "./target/release/pgvis",
+      "args": ["--dsn", "postgres://user@localhost/mydb", "mcp", "--read-only"]
+    }
+  }
+}
+```
+
+### HTTP transport (alongside REST)
+
+```bash
 pgvis --dsn "postgres://user@localhost/mydb" serve --mcp-http
+# MCP available at POST /mcp
+```
+
+## OpenAPI Document
+
+```bash
+# Print the OpenAPI 3.0 spec to stdout
+pgvis --dsn "postgres://user@localhost/mydb" openapi > openapi.json
+```
+
+## Inspect Schema Cache
+
+```bash
+# Dump the introspected schema as JSON (tables, columns, relationships, routines)
+pgvis --dsn "postgres://user@localhost/mydb" inspect
 ```
 
 ## Nix Users
 
 ```bash
-# Drop into a dev shell
+# Development shell with all dependencies
 nix develop
 
-# Or build directly
+# Or build the binary directly
 nix build
+./result/bin/pgvis serve --dsn "postgres://user@localhost/mydb"
 ```
 
 ## Next Steps
 
 - [Installation](/installation) — Docker, Nix, cargo install
-- [REST Guide](/guides/rest-api) — full query DSL reference
-- [MCP Guide](/guides/mcp) — using pgvis with LLM agents
+- [REST API Guide](/guides/rest-api) — full query DSL with all 30+ operators
+- [MCP Guide](/guides/mcp) — tool generation, resources, transport options
+- [Configuration](/reference/configuration) — environment variables, TOML config, CLI flags

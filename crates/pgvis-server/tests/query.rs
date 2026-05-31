@@ -707,6 +707,166 @@ async fn test_nonexistent_column_filter() {
 }
 
 // ============================================================================
+// Cursor Pagination
+// ============================================================================
+
+#[tokio::test]
+async fn test_cursor_basic() {
+    // cursor_value=3 with order=id.asc means WHERE id > 3, limit 3 → ids 4, 5, 6
+    let resp = get("/api/test/items?cursor_column=id&cursor_value=3&limit=3&order=id.asc").await;
+    let next_cursor = resp
+        .headers()
+        .get("x-next-cursor")
+        .map(|v| v.to_str().unwrap().to_string());
+    let body = assert_json(resp, StatusCode::OK).await;
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 3);
+    assert_eq!(arr[0]["id"], 4);
+    assert_eq!(arr[1]["id"], 5);
+    assert_eq!(arr[2]["id"], 6);
+    assert_eq!(next_cursor.as_deref(), Some("6"), "X-Next-Cursor should be last row's id");
+}
+
+#[tokio::test]
+async fn test_cursor_first_page_no_value() {
+    // No cursor_value means first page — no WHERE cursor condition
+    let resp = get("/api/test/items?cursor_column=id&limit=3&order=id.asc").await;
+    let next_cursor = resp
+        .headers()
+        .get("x-next-cursor")
+        .map(|v| v.to_str().unwrap().to_string());
+    let body = assert_json(resp, StatusCode::OK).await;
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 3);
+    assert_eq!(arr[0]["id"], 1);
+    assert_eq!(arr[1]["id"], 2);
+    assert_eq!(arr[2]["id"], 3);
+    assert_eq!(next_cursor.as_deref(), Some("3"));
+}
+
+#[tokio::test]
+async fn test_cursor_pk_default() {
+    // cursor_column omitted → uses primary key (id) as default
+    let resp = get("/api/test/items?cursor_value=3&limit=3&order=id.asc").await;
+    let body = assert_json(resp, StatusCode::OK).await;
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 3);
+    assert_eq!(arr[0]["id"], 4);
+    assert_eq!(arr[1]["id"], 5);
+    assert_eq!(arr[2]["id"], 6);
+}
+
+#[tokio::test]
+async fn test_cursor_desc_order() {
+    // With DESC order, cursor uses < operator: WHERE id < 8
+    let resp = get("/api/test/items?cursor_column=id&cursor_value=8&order=id.desc&limit=3").await;
+    let next_cursor = resp
+        .headers()
+        .get("x-next-cursor")
+        .map(|v| v.to_str().unwrap().to_string());
+    let body = assert_json(resp, StatusCode::OK).await;
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 3);
+    assert_eq!(arr[0]["id"], 7);
+    assert_eq!(arr[1]["id"], 6);
+    assert_eq!(arr[2]["id"], 5);
+    assert_eq!(next_cursor.as_deref(), Some("5"));
+}
+
+#[tokio::test]
+async fn test_cursor_with_filter() {
+    // Cursor combined with a regular filter: tools with id > 2
+    // Tools: id 3 (Doohickey), 4 (Thingamajig), 6 (Sprocket), 7 (Flanged Bracket)
+    let resp = get("/api/test/items?cursor_column=id&cursor_value=2&category=eq.tools&order=id.asc&limit=5").await;
+    let body = assert_json(resp, StatusCode::OK).await;
+    let arr = body.as_array().unwrap();
+    assert!(!arr.is_empty());
+    for item in arr {
+        assert_eq!(item["category"], "tools");
+        assert!(item["id"].as_i64().unwrap() > 2);
+    }
+}
+
+#[tokio::test]
+async fn test_cursor_invalid_column() {
+    // Invalid cursor_column should return an error
+    let resp = get("/api/test/items?cursor_column=nonexistent&cursor_value=3").await;
+    let status = resp.status();
+    assert!(
+        status.is_client_error(),
+        "invalid cursor_column should return client error, got: {status}"
+    );
+}
+
+#[tokio::test]
+async fn test_cursor_no_pk_no_column_error() {
+    // Table with no PK + no cursor_column specified → error
+    let resp = get("/api/test/no_pk?cursor_value=3").await;
+    let status = resp.status();
+    assert!(
+        status.is_client_error(),
+        "no PK + no cursor_column should error, got: {status}"
+    );
+}
+
+#[tokio::test]
+async fn test_cursor_ignores_offset() {
+    // When cursor is active, offset should be ignored
+    let resp = get("/api/test/items?cursor_column=id&cursor_value=3&offset=5&limit=3&order=id.asc").await;
+    let body = assert_json(resp, StatusCode::OK).await;
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 3);
+    // Should start after cursor_value=3, not at offset=5
+    assert_eq!(arr[0]["id"], 4);
+    assert_eq!(arr[1]["id"], 5);
+    assert_eq!(arr[2]["id"], 6);
+}
+
+#[tokio::test]
+async fn test_cursor_empty_result_no_header() {
+    // Cursor past all data → empty result, no X-Next-Cursor header
+    let resp = get("/api/test/items?cursor_column=id&cursor_value=100&limit=3&order=id.asc").await;
+    let next_cursor = resp.headers().get("x-next-cursor").cloned();
+    let body = assert_json(resp, StatusCode::OK).await;
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 0);
+    assert!(
+        next_cursor.is_none(),
+        "empty result should NOT have X-Next-Cursor header"
+    );
+}
+
+#[tokio::test]
+async fn test_cursor_last_page_partial() {
+    // Cursor near the end: cursor_value=8, only 2 items remain (9, 10)
+    let resp = get("/api/test/items?cursor_column=id&cursor_value=8&limit=5&order=id.asc").await;
+    let next_cursor = resp
+        .headers()
+        .get("x-next-cursor")
+        .map(|v| v.to_str().unwrap().to_string());
+    let body = assert_json(resp, StatusCode::OK).await;
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["id"], 9);
+    assert_eq!(arr[1]["id"], 10);
+    assert_eq!(next_cursor.as_deref(), Some("10"));
+}
+
+#[tokio::test]
+async fn test_cursor_non_pk_column() {
+    // Use price as cursor column (non-PK)
+    // Prices: 2.99, 3.75, 7.50, 9.99, 12.00, 24.50, 42.00, 99.99, 149.95, 999.00
+    let resp = get("/api/test/items?cursor_column=price&cursor_value=12.00&order=price.asc&limit=3").await;
+    let body = assert_json(resp, StatusCode::OK).await;
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 3);
+    // Should be items with price > 12.00: 24.50, 42.00, 99.99
+    for item in arr {
+        assert!(item["price"].as_f64().unwrap() > 12.0);
+    }
+}
+
+// ============================================================================
 // Numeric type coercion
 // ============================================================================
 

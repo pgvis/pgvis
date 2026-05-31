@@ -5,7 +5,11 @@ description: Full configuration reference for pgvis.
 
 # Configuration Reference
 
-pgvis reads configuration from environment variables (prefixed with `PGVIS_`) and optionally from a TOML config file.
+pgvis configuration is layered (later sources override earlier):
+
+1. **Defaults** — sensible production defaults from `Config::default()`
+2. **TOML config file** — specified via `--config` flag or `PGVIS_CONFIG` env var
+3. **Environment variables** — prefixed with `PGVIS_`, lowercase field names
 
 ## Environment Variables
 
@@ -13,54 +17,261 @@ pgvis reads configuration from environment variables (prefixed with `PGVIS_`) an
 |----------|---------|---------|
 | `PGVIS_DSN` | Database connection string | *required* |
 | `PGVIS_BIND` | Server bind address | `0.0.0.0:3000` |
-| `PGVIS_SCHEMAS` | Schemas to expose (comma-separated) | `public` |
 | `PGVIS_CONFIG` | Path to TOML config file | none |
-| `PGVIS_JWT_SECRET` | JWT verification secret | none |
-| `PGVIS_JWT_ALGO` | JWT algorithm (`HS256`, `RS256`, etc.) | `HS256` |
+| `PGVIS_SCHEMAS` | Schemas to expose (comma-separated) | `public` |
+| `PGVIS_JWT_SECRET` | JWT verification secret | none (anonymous only) |
+| `PGVIS_JWT_ALGO` | JWT algorithm | `HS256` |
 | `PGVIS_ANON_ROLE` | Database role for unauthenticated requests | none |
+| `PGVIS_ROLE_CLAIM_KEY` | JWT claim key for role | `role` |
 | `PGVIS_MAX_ROWS` | Maximum rows returned per request | unlimited |
-| `PGVIS_STATEMENT_TIMEOUT` | SQL statement timeout | none |
-| `RUST_LOG` | Log level filter | `info` |
+| `PGVIS_STATEMENT_TIMEOUT_MS` | SQL statement timeout (ms) | `30000` |
+| `PGVIS_POOL_SIZE` | Database connection pool size | `16` |
+| `PGVIS_POOL_TIMEOUT_MS` | Pool checkout timeout (ms) | `5000` |
+| `PGVIS_READ_ONLY` | Reject all mutations | `false` |
+| `PGVIS_AGGREGATES_ENABLED` | Allow aggregate functions in select | `false` |
+| `PGVIS_PLAN_ENABLED` | Allow EXPLAIN plan requests | `false` |
+| `PGVIS_TX_ALLOW_OVERRIDE` | Allow `Prefer: tx=rollback` | `false` |
+| `PGVIS_TX_ROLLBACK_ALL` | Force rollback on all transactions | `false` |
+| `PGVIS_PRE_REQUEST` | Pre-request function name | none |
+| `PGVIS_OPENAPI_TITLE` | OpenAPI document title | none |
+| `PGVIS_OPENAPI_SERVER_URL` | OpenAPI server URL override | none |
+| `RUST_LOG` | Log level filter | `pgvis=info,tower_http=info` |
+
+## TOML Config File
+
+Create a `pgvis.toml` file and reference it with `--config pgvis.toml` or `PGVIS_CONFIG=pgvis.toml`:
+
+```toml
+# Schema selection
+schemas = ["public", "api"]
+extra_search_path = ["extensions"]
+
+# Authentication
+jwt_secret = "your-secret-key-here"
+jwt_algo = "HS256"
+anon_role = "web_anon"
+role_claim_key = "role"
+
+# Feature gates
+aggregates_enabled = true
+plan_enabled = false
+tx_allow_override = true
+tx_rollback_all = false
+read_only = false
+
+# Query limits
+max_rows = 1000
+statement_timeout_ms = 30000
+
+# Connection pool
+pool_size = 16
+pool_timeout_ms = 5000
+
+# Hooks
+pre_request = "auth.check_request"
+
+# OpenAPI
+openapi_title = "My API"
+openapi_server_url = "https://api.example.com"
+openapi_mode = "IgnorePrivileges"
+
+# Routing
+[routing]
+prefix = "api"
+schema_in_path = true
+default_schema = "public"
+mcp_separator = "/"
+```
+
+---
+
+## Configuration Fields
+
+### Schema Selection
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `schemas` | `string[]` | `["public"]` | Which schemas to expose as API endpoints. Tables, views, and functions in these schemas become REST routes and MCP tools. |
+| `extra_search_path` | `string[]` | `[]` | Additional schemas for type/function resolution (not exposed as endpoints). |
+
+### Authentication
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `jwt_secret` | `string?` | `null` | JWT secret for token verification. If absent, JWT verification is disabled. Can be a symmetric secret or path to a public key. |
+| `jwt_algo` | `enum` | `HS256` | JWT signing algorithm. One of: `HS256`, `HS384`, `HS512`, `RS256`, `EdDSA`. |
+| `anon_role` | `string?` | `null` | The database role used for unauthenticated requests. On Postgres, this role's permissions define anonymous access. |
+| `role_claim_key` | `string` | `"role"` | The JWT claim key that specifies the database role. The value of this claim becomes the `SET LOCAL role` value. |
+
+#### How JWT auth works
+
+1. Client sends `Authorization: Bearer <token>` header
+2. pgvis verifies the token against `jwt_secret` using `jwt_algo`
+3. The role from the token's `role_claim_key` claim is used to `SET LOCAL role`
+4. All JWT claims are available as `current_setting('request.jwt.claims')` in SQL
+5. This integrates with PostgreSQL Row-Level Security (RLS)
+
+If no valid JWT is present, the `anon_role` is used (or the connection's default role if `anon_role` is not set).
+
+### Feature Gates
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `aggregates_enabled` | `bool` | `false` | Whether aggregate functions (`sum`, `avg`, `count`, `min`, `max`) are allowed in `select`. Disabled by default because aggregates can be expensive without proper indexes. |
+| `plan_enabled` | `bool` | `false` | Whether clients can request `Accept: application/vnd.pgrst.plan+json` to get the query execution plan. |
+| `tx_allow_override` | `bool` | `false` | Whether `Prefer: tx=rollback` is honoured. When false, the preference is silently ignored. |
+| `tx_rollback_all` | `bool` | `false` | Force rollback of ALL transactions regardless of client preference. Useful for testing/staging environments. |
+| `read_only` | `bool` | `false` | Reject all mutations (POST/PATCH/DELETE on tables, VOLATILE RPC calls). MCP tool catalogues omit write tools entirely. |
+
+### Query Limits
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_rows` | `u64?` | `null` (unlimited) | Maximum number of rows returned per request. Acts as a server-side cap on `limit`. When a client requests more rows than this (or no limit), the response is capped. |
+| `statement_timeout_ms` | `u64?` | `30000` (30s) | SQL statement timeout in milliseconds. Applied to every query. Prevents runaway queries. Set to `null` or `0` to disable. |
+
+### Connection Pool
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `pool_size` | `u32` | `16` | Maximum number of database connections in the pool. Each concurrent request holds one connection for its transaction duration. |
+| `pool_timeout_ms` | `u64` | `5000` (5s) | Pool checkout timeout. If all connections are busy, new requests wait up to this duration before returning 503 Service Unavailable. |
+
+### Hooks
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `pre_request` | `string?` | `null` | Fully-qualified function name to call before every query. Called after JWT verification and role switching. Can raise exceptions to abort the request (e.g., rate limiting, audit logging). |
+
+### OpenAPI
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `openapi_title` | `string?` | `null` | Title in the OpenAPI document's `info` section. |
+| `openapi_server_url` | `string?` | `null` | Server URL override for the OpenAPI spec (for proxied deployments). |
+| `openapi_mode` | `enum` | `IgnorePrivileges` | Controls spec generation. `IgnorePrivileges`: show everything. `FollowPrivileges`: filter based on role. `Disabled`: disable the endpoint entirely. |
+
+### Routing
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `routing.prefix` | `string` | `"api"` | URL prefix for all API routes. Leading/trailing slashes stripped. Set to `""` for PostgREST-compatible flat routes. |
+| `routing.schema_in_path` | `bool` | `true` | Whether the schema name appears in the URL path. When `true`: `/{prefix}/{schema}/{table}`. When `false`: `/{prefix}/{table}` with schema from header. |
+| `routing.default_schema` | `string` | `"public"` | The default schema when `schema_in_path = false` and no profile header is sent. Must be one of the schemas listed in `schemas`. |
+| `routing.mcp_separator` | `char` | `'/'` | Separator in MCP tool names. `/` maps to hierarchical discovery. `.` is an alternative for flat tool lists. |
+
+---
+
+## Routing Mode Examples
+
+### Full path (recommended for multi-schema)
+
+```toml
+[routing]
+prefix = "api"
+schema_in_path = true
+```
+
+Routes:
+```
+GET /api/public/users
+GET /api/analytics/events
+POST /api/public/rpc/search
+```
+
+### Prefixed flat (single schema)
+
+```toml
+[routing]
+prefix = "api"
+schema_in_path = false
+default_schema = "public"
+```
+
+Routes:
+```
+GET /api/users
+POST /api/rpc/search
+```
+
+### PostgREST-compatible (drop-in replacement)
+
+```toml
+[routing]
+prefix = ""
+schema_in_path = false
+default_schema = "public"
+```
+
+Routes:
+```
+GET /users
+POST /rpc/search
+```
+
+---
 
 ## CLI Flags
 
-```text
-pgvis --dsn <DSN> [--config <FILE>] <COMMAND>
+CLI flags override config file and environment variable values.
 
-  serve     Start the HTTP server (REST + optional MCP)
-              --bind <ADDR>     default 0.0.0.0:3000
-              --schema <NAME>   repeatable / comma-separated
-              --mcp-http        also serve MCP at /mcp
-  mcp       Run an MCP server over stdio
-  openapi   Print the OpenAPI 3.0 document and exit
-  inspect   Dump the introspected schema cache as JSON
+### `pgvis serve`
+
+| Flag | Env | Description |
+|------|-----|-------------|
+| `--bind <ADDR>` | `PGVIS_BIND` | Bind address (default: `0.0.0.0:3000`) |
+| `--schema <NAME>` | `PGVIS_SCHEMAS` | Schemas to expose (repeatable or comma-separated) |
+| `--mcp-http` | — | Also serve MCP at `/mcp` via Streamable HTTP |
+
+### `pgvis mcp`
+
+| Flag | Env | Description |
+|------|-----|-------------|
+| `--schema <NAME>` | `PGVIS_SCHEMAS` | Schemas to expose |
+| `--read-only` | — | Expose only read tools (no create/update/delete) |
+
+### Global options
+
+| Flag | Env | Description |
+|------|-----|-------------|
+| `--dsn <DSN>` | `PGVIS_DSN` | Database connection string (required) |
+| `--config <FILE>` | `PGVIS_CONFIG` | Path to TOML config file |
+
+---
+
+## Configuration Priority
+
+When the same setting is specified in multiple places, the highest-priority source wins:
+
+```
+CLI flags  >  Environment variables  >  TOML config file  >  Defaults
 ```
 
-## Routing Configuration
+Example:
 
-| Field | Purpose | Default |
-|-------|---------|---------|
-| `routing.prefix` | URL prefix for all routes | `"api"` |
-| `routing.schema_in_path` | Include schema in URL path | `true` |
-
-With `schema_in_path = true` (default):
-```
-/api/public/users
-/api/analytics/events
+```bash
+# Config file sets max_rows = 1000
+# Env var overrides: PGVIS_MAX_ROWS=500
+# Result: max_rows = 500
+PGVIS_MAX_ROWS=500 pgvis --config pgvis.toml serve
 ```
 
-With `schema_in_path = false` (PostgREST-compatible flat mode):
-```
-/users
-/events
-```
+---
 
-## Security
+## PostgREST Compatibility Reference
 
-| Field | Purpose |
-|-------|---------|
-| `jwt_secret` | Symmetric or asymmetric key for JWT verification |
-| `jwt_algo` | Algorithm (`HS256`, `HS384`, `HS512`, `RS256`, `EdDSA`) |
-| `anon_role` | Role used when no valid JWT is present |
-
-When a valid JWT is provided, pgvis switches to the role specified in the token's claims before executing queries. This integrates with Postgres Row-Level Security (RLS).
+| PostgREST config | pgvis equivalent |
+|-----------------|------------------|
+| `db-schemas` | `schemas` |
+| `db-extra-search-path` | `extra_search_path` |
+| `db-anon-role` | `anon_role` |
+| `jwt-secret` | `jwt_secret` |
+| `jwt-role-claim-key` | `role_claim_key` |
+| `db-aggregates-enabled` | `aggregates_enabled` |
+| `db-plan-enabled` | `plan_enabled` |
+| `db-tx-allow-override` | `tx_allow_override` |
+| `db-tx-rollback-all` | `tx_rollback_all` |
+| `max-rows` | `max_rows` |
+| `db-pre-request` | `pre_request` |
+| `openapi-server-proxy-uri` | `openapi_server_url` |
+| `openapi-mode` | `openapi_mode` |
