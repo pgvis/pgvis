@@ -79,6 +79,13 @@ Some fields are still populated empty
 
 ## Backend and surface gaps
 
+- **Read replica support. `[Closed]`** `PgReplicaBackend`
+  ([replica.rs](../crates/pgvis-postgres/src/replica.rs)) distributes reads
+  across replicas with lag-aware round-robin, falling back to primary when all
+  replicas are unhealthy. Configuration via `Config.replica` (`replica_dsns`,
+  `max_replication_lag_bytes`, `health_check_interval_ms`, `primary_reads`).
+  Failover is delegated to external tools; `deadpool` handles reconnection
+  transparently.
 - **`LISTEN/NOTIFY` hot reload.** `PgBackend::watch_schema` returns `None`; the
   reload pipeline ([05-schema-cache.md](05-schema-cache.md)) needs the push
   signal on a dedicated connection with reconnect/backoff.

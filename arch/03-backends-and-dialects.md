@@ -74,7 +74,9 @@ the database: on Postgres the backend opens a transaction, `SET LOCAL role`,
 sets `request.jwt.claims`, optionally calls the pre-request function, then runs
 the statement. On a backend without `SET LOCAL` these fields are informational.
 
-### The Postgres implementation
+### The Postgres implementations
+
+#### `PgBackend` — single-server
 
 [`PgBackend`](../crates/pgvis-postgres/src/lib.rs) wraps a
 `deadpool-postgres::Pool` (lazy connections; created from a DSN). It:
@@ -92,6 +94,49 @@ the statement. On a backend without `SET LOCAL` these fields are informational.
 - `watch_schema()` — returns `None` today; `LISTEN/NOTIFY` is a TODO
   ([08-future-scope.md](08-future-scope.md)).
 - `dialect()` — returns `&pgvis_core::dialect::POSTGRES`.
+
+#### `PgReplicaBackend` — primary + read replicas `[Implemented]`
+
+[`PgReplicaBackend`](../crates/pgvis-postgres/src/replica.rs) extends the
+single-server model with replica-aware routing:
+
+```mermaid
+flowchart TD
+    EXEC["Backend::execute(ctx, sql, params)"] --> ROUTE{ctx.is_mutation?}
+    ROUTE -->|Yes| PRIMARY[Primary Pool]
+    ROUTE -->|No| LB[Round-Robin Load Balancer]
+    LB --> HC{Lag Check}
+    HC -->|Healthy| R1[Replica Pool 1..N]
+    HC -->|Healthy| PRIMARY
+    HC -->|Lagging/Down| SKIP[Excluded]
+```
+
+**Routing logic:**
+- `is_mutation = true` → always primary pool
+- `is_mutation = false` → round-robin across eligible readers (replicas + optionally primary)
+- All replicas down/lagging → falls back to primary
+
+**Health monitoring:** A background task runs every `health_check_interval_ms`
+(default 5 s). It queries `pg_current_wal_lsn()` on the primary and
+`pg_last_wal_receive_lsn()` on each replica, computes lag in bytes, and
+excludes replicas exceeding `max_replication_lag_bytes` (default 10 MB). State
+is stored in an atomic bitfield for lock-free routing decisions.
+
+**Failover:** pgvis does NOT handle promotion. External tools (Patroni,
+pg_auto_failover, DNS/VIP) handle that. `deadpool-postgres` evicts broken
+connections; when the DSN resolves to a new primary, the next pool checkout
+reconnects automatically.
+
+**Configuration:** See [`ReplicaConfig`](../crates/pgvis-core/src/config.rs)
+in `Config.replica`:
+- `replica_dsns` — list of replica connection strings
+- `max_replication_lag_bytes` — lag threshold (0 disables checking)
+- `health_check_interval_ms` — monitor tick interval
+- `primary_reads` — whether primary participates in read load balancing
+
+**Activation:** Automatic via the Builder. When `config.replica.replica_dsns`
+is non-empty and the DSN is Postgres, `pgvis-lib` constructs
+`PgReplicaBackend` instead of `PgBackend`. No surface-layer changes needed.
 
 ## The `Dialect` struct
 

@@ -22,6 +22,7 @@
 
 pub mod execute;
 pub mod introspect;
+pub mod replica;
 
 use deadpool_postgres::{Config as PoolConfig, Pool, Runtime};
 use futures::future::BoxFuture;
@@ -33,6 +34,8 @@ use pgvis_core::dialect::{self, Dialect};
 use pgvis_core::error::Error;
 use serde_json::Value;
 use tokio_postgres::NoTls;
+
+pub use replica::PgReplicaBackend;
 
 /// The Postgres backend — implements [`Backend`] for PostgreSQL databases.
 ///

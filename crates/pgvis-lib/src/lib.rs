@@ -320,12 +320,22 @@ impl Builder {
             DbKind::Postgres => {
                 #[cfg(feature = "postgres")]
                 {
-                    let pg = pgvis_postgres::PgBackend::new(
-                        &self.dsn,
-                        config.pool_size,
-                        config.pool_timeout_ms,
-                    )?;
-                    Ok(Arc::new(pg))
+                    if config.replica.replica_dsns.is_empty() {
+                        let pg = pgvis_postgres::PgBackend::new(
+                            &self.dsn,
+                            config.pool_size,
+                            config.pool_timeout_ms,
+                        )?;
+                        Ok(Arc::new(pg))
+                    } else {
+                        let pg = pgvis_postgres::PgReplicaBackend::new(
+                            &self.dsn,
+                            config.pool_size,
+                            config.pool_timeout_ms,
+                            &config.replica,
+                        )?;
+                        Ok(Arc::new(pg))
+                    }
                 }
                 #[cfg(not(feature = "postgres"))]
                 {

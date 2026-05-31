@@ -35,6 +35,9 @@ pgvis configuration is layered (later sources override earlier):
 | `PGVIS_PRE_REQUEST` | Pre-request function name | none |
 | `PGVIS_OPENAPI_TITLE` | OpenAPI document title | none |
 | `PGVIS_OPENAPI_SERVER_URL` | OpenAPI server URL override | none |
+| `PGVIS_REPLICA_DSNS` | Read replica DSNs (comma-separated) | none |
+| `PGVIS_MAX_REPLICATION_LAG_BYTES` | Replica lag threshold in bytes | `10485760` (10 MB) |
+| `PGVIS_HEALTH_CHECK_INTERVAL_MS` | Replica health check interval (ms) | `5000` |
 | `RUST_LOG` | Log level filter | `pgvis=info,tower_http=info` |
 
 ## TOML Config File
@@ -81,6 +84,16 @@ prefix = "api"
 schema_in_path = true
 default_schema = "public"
 mcp_separator = "/"
+
+# Read replicas (Postgres only)
+[replica]
+replica_dsns = [
+  "postgres://replica1:5432/mydb",
+  "postgres://replica2:5432/mydb",
+]
+max_replication_lag_bytes = 10485760  # 10 MB
+health_check_interval_ms = 5000
+primary_reads = true
 ```
 
 ---
@@ -136,6 +149,30 @@ If no valid JWT is present, the `anon_role` is used (or the connection's default
 |-------|------|---------|-------------|
 | `pool_size` | `u32` | `16` | Maximum number of database connections in the pool. Each concurrent request holds one connection for its transaction duration. |
 | `pool_timeout_ms` | `u64` | `5000` (5s) | Pool checkout timeout. If all connections are busy, new requests wait up to this duration before returning 503 Service Unavailable. |
+
+### Read Replicas (Postgres only)
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `replica.replica_dsns` | `string[]` | `[]` | DSNs of read replicas. When non-empty, enables lag-aware read routing and load balancing across replicas. |
+| `replica.max_replication_lag_bytes` | `u64` | `10485760` (10 MB) | Maximum acceptable replication lag in bytes. Replicas exceeding this are excluded from the read pool. Set to `0` to disable lag checking. |
+| `replica.health_check_interval_ms` | `u64` | `5000` (5s) | How often the health monitor checks replica lag and connectivity. |
+| `replica.primary_reads` | `bool` | `true` | Whether the primary also serves read queries. When `false`, reads go exclusively to replicas (primary handles only writes). Falls back to primary if all replicas are unhealthy. |
+
+#### How replica routing works
+
+1. **Writes** (`POST`, `PATCH`, `PUT`, `DELETE` on tables) always go to the primary
+2. **Reads** (`GET` on tables/views, read-only RPC) are distributed round-robin across healthy replicas (and the primary if `primary_reads = true`)
+3. A background health monitor checks each replica's replication lag every `health_check_interval_ms`
+4. Replicas whose WAL receive position is more than `max_replication_lag_bytes` behind the primary are temporarily excluded
+5. If all replicas are unhealthy, reads fall back to the primary automatically
+
+#### Failover behaviour
+
+pgvis does **not** handle promotion. External tools (Patroni, pg_auto_failover, DNS/VIP) handle that. When the primary becomes unreachable:
+- Active connections fail with a pool error (503 to the client)
+- Once the external tool updates DNS/VIP, the next pool checkout resolves to the new primary
+- No manual restart required — `deadpool-postgres` evicts broken connections automatically
 
 ### Hooks
 
@@ -221,6 +258,7 @@ CLI flags override config file and environment variable values.
 |------|-----|-------------|
 | `--bind <ADDR>` | `PGVIS_BIND` | Bind address (default: `0.0.0.0:3000`) |
 | `--schema <NAME>` | `PGVIS_SCHEMAS` | Schemas to expose (repeatable or comma-separated) |
+| `--replica-dsn <DSN>` | `PGVIS_REPLICA_DSNS` | Read replica DSNs (repeatable or comma-separated) |
 | `--mcp-http` | — | Also serve MCP at `/mcp` via Streamable HTTP |
 
 ### `pgvis mcp`

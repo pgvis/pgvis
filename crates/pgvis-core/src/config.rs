@@ -324,6 +324,15 @@ pub struct Config {
     /// Controls route URL structure and MCP tool naming.
     #[serde(default)]
     pub routing: RoutingConfig,
+
+    // --- Replicas ---
+    /// Read replica configuration for load balancing and failover.
+    ///
+    /// When `replica.replica_dsns` is non-empty, the Postgres backend creates
+    /// separate connection pools for each replica and distributes read queries
+    /// across them using lag-aware round-robin.
+    #[serde(default)]
+    pub replica: ReplicaConfig,
 }
 
 impl Default for Config {
@@ -349,6 +358,7 @@ impl Default for Config {
             openapi_server_url: None,
             openapi_mode: OpenApiMode::default(),
             routing: RoutingConfig::default(),
+            replica: ReplicaConfig::default(),
         }
     }
 }
@@ -394,6 +404,85 @@ pub enum OpenApiMode {
     Disabled,
 }
 
+/// Configuration for read replicas and load balancing.
+///
+/// When `replica_dsns` is non-empty, pgvis creates a replica-aware backend that:
+/// - Routes mutations (`is_mutation = true`) exclusively to the primary
+/// - Distributes reads across healthy replicas (and optionally the primary)
+/// - Excludes replicas whose replication lag exceeds `max_replication_lag_bytes`
+///
+/// ## Failover Model
+///
+/// pgvis does NOT handle promotion. An external tool (Patroni, pg_auto_failover,
+/// DNS/VIP flip) promotes a replica to primary. pgvis detects connection loss and
+/// reconnects — `deadpool` evicts broken connections and the next checkout resolves
+/// the DSN anew.
+///
+/// ## Example (TOML)
+///
+/// ```toml
+/// [replica]
+/// replica_dsns = [
+///   "postgres://replica1:5432/mydb",
+///   "postgres://replica2:5432/mydb",
+/// ]
+/// max_replication_lag_bytes = 10485760  # 10 MB
+/// health_check_interval_ms = 5000
+/// primary_reads = true
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicaConfig {
+    /// DSNs of read replicas.
+    ///
+    /// When non-empty, enables replica-aware routing. Each DSN gets its own
+    /// connection pool with the same `pool_size` / `pool_timeout_ms` as the primary.
+    ///
+    /// Environment variable: `PGVIS_REPLICA_DSNS` (comma-separated).
+    #[serde(default)]
+    pub replica_dsns: Vec<String>,
+
+    /// Maximum acceptable replication lag in bytes.
+    ///
+    /// Replicas whose WAL receive position is more than this many bytes behind
+    /// the primary's current WAL position are excluded from the read pool.
+    /// Checked by the health monitor on each tick.
+    ///
+    /// Default: 10 MB (10_485_760 bytes). Set to 0 to disable lag checking.
+    #[serde(default = "default_max_replication_lag_bytes")]
+    pub max_replication_lag_bytes: u64,
+
+    /// How often to check replica health and replication lag (milliseconds).
+    ///
+    /// The health monitor queries `pg_current_wal_lsn()` on the primary and
+    /// `pg_last_wal_receive_lsn()` on each replica at this interval.
+    ///
+    /// Default: 5000 (5 seconds).
+    #[serde(default = "default_health_check_interval_ms")]
+    pub health_check_interval_ms: u64,
+
+    /// Whether the primary should also serve read queries.
+    ///
+    /// When `true`, the primary participates in read load balancing alongside
+    /// replicas. When `false`, reads go exclusively to replicas (primary handles
+    /// only writes). If all replicas are unhealthy, reads fall back to the
+    /// primary regardless of this setting.
+    ///
+    /// Default: `true`.
+    #[serde(default = "default_primary_reads")]
+    pub primary_reads: bool,
+}
+
+impl Default for ReplicaConfig {
+    fn default() -> Self {
+        Self {
+            replica_dsns: Vec::new(),
+            max_replication_lag_bytes: default_max_replication_lag_bytes(),
+            health_check_interval_ms: default_health_check_interval_ms(),
+            primary_reads: default_primary_reads(),
+        }
+    }
+}
+
 // --- Default value helpers ---
 
 fn default_schemas() -> Vec<String> {
@@ -434,4 +523,16 @@ fn default_pool_size() -> u32 {
 
 fn default_pool_timeout_ms() -> u64 {
     5_000 // 5 seconds
+}
+
+fn default_max_replication_lag_bytes() -> u64 {
+    10_485_760 // 10 MB
+}
+
+fn default_health_check_interval_ms() -> u64 {
+    5_000 // 5 seconds
+}
+
+fn default_primary_reads() -> bool {
+    true
 }

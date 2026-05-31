@@ -38,6 +38,11 @@ enum Cmd {
         /// Also serve MCP over Streamable HTTP at /mcp endpoint.
         #[arg(long, default_value = "false")]
         mcp_http: bool,
+
+        /// Read replica DSNs for load balancing (repeated or comma-separated).
+        /// Enables lag-aware read routing across replicas.
+        #[arg(long, env = "PGVIS_REPLICA_DSNS", value_delimiter = ',')]
+        replica_dsn: Vec<String>,
     },
     /// Run MCP server over stdio (for Claude Desktop / agent integrations).
     #[cfg(feature = "mcp")]
@@ -83,18 +88,32 @@ async fn main() -> anyhow::Result<()> {
         bind: "0.0.0.0:3000".into(),
         schema: vec![],
         mcp_http: false,
+        replica_dsn: vec![],
     }) {
         Cmd::Serve {
             bind,
             schema,
             mcp_http,
+            replica_dsn,
         } => {
             // Override schemas from CLI if provided
             if !schema.is_empty() {
                 config.schemas = schema;
             }
 
-            tracing::info!(dsn = %cli.dsn, bind = %bind, schemas = ?config.schemas, mcp_http, "starting pgvis server");
+            // Override replica DSNs from CLI if provided
+            if !replica_dsn.is_empty() {
+                config.replica.replica_dsns = replica_dsn;
+            }
+
+            tracing::info!(
+                dsn = %cli.dsn,
+                bind = %bind,
+                schemas = ?config.schemas,
+                replicas = config.replica.replica_dsns.len(),
+                mcp_http,
+                "starting pgvis server",
+            );
 
             let mut builder = pgvis_lib::Builder::new(&cli.dsn).config(config);
 
