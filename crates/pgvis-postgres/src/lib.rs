@@ -24,12 +24,15 @@ pub mod execute;
 pub mod introspect;
 pub mod replica;
 
-use deadpool_postgres::{Config as PoolConfig, Pool, Runtime};
+use std::time::Duration;
+
+use deadpool_postgres::{Config as DeadpoolConfig, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use futures::future::BoxFuture;
 use pgvis_core::backend::{
     Backend, ExecContext, IntrospectConfig, QueryResult, SchemaChangeStream,
 };
 use pgvis_core::cache::SchemaCache;
+use pgvis_core::config::PoolConfig;
 use pgvis_core::dialect::{self, Dialect};
 use pgvis_core::error::Error;
 use serde_json::Value;
@@ -57,8 +60,7 @@ impl PgBackend {
     /// # Arguments
     ///
     /// * `dsn` — A PostgreSQL connection string (e.g. `postgres://user:pass@host/db`)
-    /// * `pool_size` — Maximum number of connections in the pool
-    /// * `pool_timeout_ms` — Checkout timeout in milliseconds (0 = no timeout)
+    /// * `pool_cfg` — Pool settings (size, timeouts, keepalive, recycling)
     ///
     /// # Errors
     ///
@@ -67,31 +69,11 @@ impl PgBackend {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let backend = PgBackend::new("postgres://localhost/mydb", 16, 5000)?;
+    /// use pgvis_core::config::PoolConfig;
+    /// let backend = PgBackend::new("postgres://localhost/mydb", &PoolConfig::default())?;
     /// ```
-    pub fn new(dsn: &str, pool_size: u32, pool_timeout_ms: u64) -> Result<Self, Error> {
-        let mut cfg = PoolConfig::new();
-        cfg.url = Some(dsn.to_string());
-
-        let timeouts = if pool_timeout_ms > 0 {
-            deadpool_postgres::Timeouts {
-                wait: Some(std::time::Duration::from_millis(pool_timeout_ms)),
-                ..Default::default()
-            }
-        } else {
-            Default::default()
-        };
-
-        cfg.pool = Some(deadpool_postgres::PoolConfig {
-            max_size: pool_size as usize,
-            timeouts,
-            ..Default::default()
-        });
-
-        let pool = cfg
-            .create_pool(Some(Runtime::Tokio1), NoTls)
-            .map_err(|e| Error::Introspection(format!("failed to create pool: {e}")))?;
-
+    pub fn new(dsn: &str, pool_cfg: &pgvis_core::config::PoolConfig) -> Result<Self, Error> {
+        let pool = create_pool(dsn, pool_cfg)?;
         Ok(Self { pool })
     }
 
@@ -148,4 +130,63 @@ impl Backend for PgBackend {
     fn dialect(&self) -> &'static Dialect {
         &dialect::POSTGRES
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pool creation — shared by PgBackend and PgReplicaBackend
+// ---------------------------------------------------------------------------
+
+/// Create a `deadpool-postgres` pool from a DSN and pool configuration.
+///
+/// Applies all settings from [`PoolConfig`]: size, checkout/create/recycle
+/// timeouts, TCP keepalive, connect timeout, and recycling method.
+pub(crate) fn create_pool(dsn: &str, pool_cfg: &PoolConfig) -> Result<Pool, Error> {
+    let mut cfg = DeadpoolConfig::new();
+    cfg.url = Some(dsn.to_string());
+
+    // Connection-level settings
+    cfg.keepalives = Some(pool_cfg.keepalives);
+    if pool_cfg.keepalives {
+        cfg.keepalives_idle = Some(Duration::from_secs(pool_cfg.keepalives_idle_secs));
+    }
+    if pool_cfg.connect_timeout_secs > 0 {
+        cfg.connect_timeout = Some(Duration::from_secs(pool_cfg.connect_timeout_secs));
+    }
+
+    // Pool-level timeouts
+    let timeouts = deadpool_postgres::Timeouts {
+        wait: if pool_cfg.timeout_ms > 0 {
+            Some(Duration::from_millis(pool_cfg.timeout_ms))
+        } else {
+            None
+        },
+        create: if pool_cfg.create_timeout_ms > 0 {
+            Some(Duration::from_millis(pool_cfg.create_timeout_ms))
+        } else {
+            None
+        },
+        recycle: if pool_cfg.recycle_timeout_ms > 0 {
+            Some(Duration::from_millis(pool_cfg.recycle_timeout_ms))
+        } else {
+            None
+        },
+    };
+
+    cfg.pool = Some(deadpool_postgres::PoolConfig {
+        max_size: pool_cfg.size as usize,
+        timeouts,
+        ..Default::default()
+    });
+
+    // Recycling method
+    cfg.manager = Some(ManagerConfig {
+        recycling_method: match pool_cfg.recycling_method {
+            pgvis_core::config::RecyclingMethod::Fast => RecyclingMethod::Fast,
+            pgvis_core::config::RecyclingMethod::Verified => RecyclingMethod::Verified,
+            pgvis_core::config::RecyclingMethod::Clean => RecyclingMethod::Clean,
+        },
+    });
+
+    cfg.create_pool(Some(Runtime::Tokio1), NoTls)
+        .map_err(|e| Error::Introspection(format!("failed to create pool: {e}")))
 }

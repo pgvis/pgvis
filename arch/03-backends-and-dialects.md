@@ -95,6 +95,19 @@ the statement. On a backend without `SET LOCAL` these fields are informational.
   ([08-future-scope.md](08-future-scope.md)).
 - `dialect()` — returns `&pgvis_core::dialect::POSTGRES`.
 
+**Pool lifecycle configuration:** Pool creation is centralized in
+[`create_pool()`](../crates/pgvis-postgres/src/lib.rs) which applies all
+settings from [`PoolConfig`](../crates/pgvis-core/src/config.rs):
+
+| Layer | Settings | Purpose |
+|-------|----------|---------|
+| Connection-level | `keepalives`, `keepalives_idle`, `connect_timeout` | TCP health; detect dead sockets through NATs/LBs |
+| Pool-level | `max_size`, `wait`/`create`/`recycle` timeouts | Bound resource usage and prevent unbounded waits |
+| Manager-level | `recycling_method` (Fast/Verified/Clean) | Validate connections on checkout; trade latency for safety |
+
+Both `PgBackend` and `PgReplicaBackend` share the same `create_pool` function,
+so identical pool settings apply uniformly to the primary and all replica pools.
+
 #### `PgReplicaBackend` — primary + read replicas `[Implemented]`
 
 [`PgReplicaBackend`](../crates/pgvis-postgres/src/replica.rs) extends the

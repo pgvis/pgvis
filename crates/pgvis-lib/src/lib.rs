@@ -323,15 +323,13 @@ impl Builder {
                     if config.replica.replica_dsns.is_empty() {
                         let pg = pgvis_postgres::PgBackend::new(
                             &self.dsn,
-                            config.pool_size,
-                            config.pool_timeout_ms,
+                            &config.pool,
                         )?;
                         Ok(Arc::new(pg))
                     } else {
                         let pg = pgvis_postgres::PgReplicaBackend::new(
                             &self.dsn,
-                            config.pool_size,
-                            config.pool_timeout_ms,
+                            &config.pool,
                             &config.replica,
                         )?;
                         Ok(Arc::new(pg))

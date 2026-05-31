@@ -279,20 +279,12 @@ pub struct Config {
     pub read_only: bool,
 
     // --- Connection pool ---
-    /// Maximum number of database connections in the pool.
+    /// Connection pool settings for Postgres.
     ///
-    /// Each concurrent request holds one connection for its transaction duration.
-    /// Defaults to 16.
-    #[serde(default = "default_pool_size")]
-    pub pool_size: u32,
-
-    /// Pool checkout timeout in milliseconds.
-    ///
-    /// If all connections are busy and a new request arrives, it will wait
-    /// up to this duration before returning a 503 Service Unavailable error.
-    /// Defaults to 5000 (5 seconds). Set to 0 for no timeout (not recommended).
-    #[serde(default = "default_pool_timeout_ms")]
-    pub pool_timeout_ms: u64,
+    /// Controls pool size, timeouts, connection keepalive, and recycling behaviour.
+    /// These settings apply to the primary pool and all replica pools.
+    #[serde(default)]
+    pub pool: PoolConfig,
 
     // --- Hooks ---
     /// Pre-request function to call before every query.
@@ -351,8 +343,7 @@ impl Default for Config {
             max_rows: None,
             statement_timeout_ms: default_statement_timeout_ms(),
             read_only: false,
-            pool_size: default_pool_size(),
-            pool_timeout_ms: default_pool_timeout_ms(),
+            pool: PoolConfig::default(),
             pre_request: None,
             openapi_title: None,
             openapi_server_url: None,
@@ -483,6 +474,158 @@ impl Default for ReplicaConfig {
     }
 }
 
+/// Connection pool configuration for Postgres backends.
+///
+/// Controls pool size, checkout/create/recycle timeouts, TCP keepalive, and
+/// connection recycling strategy. These settings apply to both the primary pool
+/// and all replica pools.
+///
+/// ## Example (TOML)
+///
+/// ```toml
+/// [pool]
+/// size = 16
+/// timeout_ms = 5000
+/// create_timeout_ms = 5000
+/// recycle_timeout_ms = 5000
+/// keepalives = true
+/// keepalives_idle_secs = 60
+/// connect_timeout_secs = 10
+/// recycling_method = "Verified"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolConfig {
+    /// Maximum number of database connections in the pool.
+    ///
+    /// Each concurrent request holds one connection for its transaction duration.
+    /// For replicas, each replica pool gets this many connections independently.
+    ///
+    /// Default: 16.
+    #[serde(default = "default_pool_size")]
+    pub size: u32,
+
+    /// Pool checkout timeout in milliseconds.
+    ///
+    /// If all connections are busy and a new request arrives, it will wait
+    /// up to this duration before returning a 503 Service Unavailable error.
+    /// Set to 0 for no timeout (not recommended).
+    ///
+    /// Default: 5000 (5 seconds).
+    #[serde(default = "default_pool_timeout_ms")]
+    pub timeout_ms: u64,
+
+    /// Timeout for creating a new connection in milliseconds.
+    ///
+    /// Bounds how long establishing a new TCP connection + TLS handshake +
+    /// Postgres auth can take before giving up and returning an error.
+    /// Set to 0 for no timeout.
+    ///
+    /// Default: 5000 (5 seconds).
+    #[serde(default = "default_pool_create_timeout_ms")]
+    pub create_timeout_ms: u64,
+
+    /// Timeout for recycling (validating) an existing connection in milliseconds.
+    ///
+    /// When a pooled connection is checked out, the recycling query must
+    /// complete within this time or the connection is discarded.
+    /// Set to 0 for no timeout.
+    ///
+    /// Default: 5000 (5 seconds).
+    #[serde(default = "default_pool_recycle_timeout_ms")]
+    pub recycle_timeout_ms: u64,
+
+    /// Whether TCP keepalive is enabled on connections.
+    ///
+    /// When true, the OS sends periodic TCP keepalive probes to detect dead
+    /// connections (critical for connections through NATs/firewalls/load balancers
+    /// that silently drop idle TCP connections).
+    ///
+    /// Default: true.
+    #[serde(default = "default_keepalives")]
+    pub keepalives: bool,
+
+    /// TCP keepalive idle time in seconds.
+    ///
+    /// How long a connection must be idle before the first keepalive probe is sent.
+    /// Lower values detect dead connections faster but generate more traffic.
+    /// Only effective when `keepalives = true`.
+    ///
+    /// Default: 60 (1 minute).
+    #[serde(default = "default_keepalives_idle_secs")]
+    pub keepalives_idle_secs: u64,
+
+    /// TCP connection timeout in seconds.
+    ///
+    /// Maximum time to wait for a TCP connection to be established with the
+    /// Postgres server. This is independent of the pool checkout timeout —
+    /// it bounds the underlying socket connect.
+    ///
+    /// Default: 10 seconds. Set to 0 for no timeout.
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+
+    /// Connection recycling method.
+    ///
+    /// Controls how connections are validated when returned to the pool:
+    /// - `Fast` — check `is_closed()` only (cheapest, no round-trip)
+    /// - `Verified` — execute an empty query (`""`) to ensure the connection
+    ///   responds (one round-trip, catches stale/dead connections)
+    /// - `Clean` — run DISCARD-like statements (CLOSE ALL, RESET ALL, UNLISTEN *,
+    ///   etc.) to ensure a pristine session state (most thorough, several round-trips)
+    ///
+    /// Default: `Fast`.
+    #[serde(default)]
+    pub recycling_method: RecyclingMethod,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            size: default_pool_size(),
+            timeout_ms: default_pool_timeout_ms(),
+            create_timeout_ms: default_pool_create_timeout_ms(),
+            recycle_timeout_ms: default_pool_recycle_timeout_ms(),
+            keepalives: default_keepalives(),
+            keepalives_idle_secs: default_keepalives_idle_secs(),
+            connect_timeout_secs: default_connect_timeout_secs(),
+            recycling_method: RecyclingMethod::default(),
+        }
+    }
+}
+
+/// Connection recycling method for pooled Postgres connections.
+///
+/// Determines how connections are validated when checked out from the pool.
+/// Trade-off: cheaper methods are faster but may miss stale connections;
+/// thorough methods catch more issues but cost round-trips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum RecyclingMethod {
+    /// Check `is_closed()` only — no database round-trip.
+    ///
+    /// Cheapest option. Works well when connections are short-lived or when
+    /// the network is reliable. May not detect connections silently killed by
+    /// NAT/firewall timeouts.
+    #[default]
+    Fast,
+
+    /// Execute an empty query to verify the connection is alive.
+    ///
+    /// One round-trip per checkout. Catches stale TCP connections that appear
+    /// open but are actually dead. Recommended for production deployments
+    /// behind load balancers.
+    Verified,
+
+    /// Execute DISCARD-like SQL to reset session state.
+    ///
+    /// Runs: `CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL;
+    /// UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES;`
+    ///
+    /// Most thorough — guarantees a pristine connection with no leftover
+    /// cursors, locks, or session variables. Use when connections might be
+    /// shared across contexts with different session settings.
+    Clean,
+}
+
 // --- Default value helpers ---
 
 fn default_schemas() -> Vec<String> {
@@ -523,6 +666,26 @@ fn default_pool_size() -> u32 {
 
 fn default_pool_timeout_ms() -> u64 {
     5_000 // 5 seconds
+}
+
+fn default_pool_create_timeout_ms() -> u64 {
+    5_000 // 5 seconds
+}
+
+fn default_pool_recycle_timeout_ms() -> u64 {
+    5_000 // 5 seconds
+}
+
+fn default_keepalives() -> bool {
+    true
+}
+
+fn default_keepalives_idle_secs() -> u64 {
+    60 // 1 minute
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    10
 }
 
 fn default_max_replication_lag_bytes() -> u64 {

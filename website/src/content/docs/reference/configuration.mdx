@@ -25,8 +25,14 @@ pgvis configuration is layered (later sources override earlier):
 | `PGVIS_ROLE_CLAIM_KEY` | JWT claim key for role | `role` |
 | `PGVIS_MAX_ROWS` | Maximum rows returned per request | unlimited |
 | `PGVIS_STATEMENT_TIMEOUT_MS` | SQL statement timeout (ms) | `30000` |
-| `PGVIS_POOL_SIZE` | Database connection pool size | `16` |
+| `PGVIS_POOL_SIZE` | Pool max connections | `16` |
 | `PGVIS_POOL_TIMEOUT_MS` | Pool checkout timeout (ms) | `5000` |
+| `PGVIS_POOL_CREATE_TIMEOUT_MS` | Pool create connection timeout (ms) | `5000` |
+| `PGVIS_POOL_RECYCLE_TIMEOUT_MS` | Pool recycle/validate timeout (ms) | `5000` |
+| `PGVIS_POOL_KEEPALIVES` | TCP keepalive on connections | `true` |
+| `PGVIS_POOL_KEEPALIVES_IDLE_SECS` | Keepalive idle time (seconds) | `60` |
+| `PGVIS_POOL_CONNECT_TIMEOUT_SECS` | TCP connect timeout (seconds) | `10` |
+| `PGVIS_POOL_RECYCLING_METHOD` | Connection recycling method | `Fast` |
 | `PGVIS_READ_ONLY` | Reject all mutations | `false` |
 | `PGVIS_AGGREGATES_ENABLED` | Allow aggregate functions in select | `false` |
 | `PGVIS_PLAN_ENABLED` | Allow EXPLAIN plan requests | `false` |
@@ -67,8 +73,15 @@ max_rows = 1000
 statement_timeout_ms = 30000
 
 # Connection pool
-pool_size = 16
-pool_timeout_ms = 5000
+[pool]
+size = 16
+timeout_ms = 5000
+create_timeout_ms = 5000
+recycle_timeout_ms = 5000
+keepalives = true
+keepalives_idle_secs = 60
+connect_timeout_secs = 10
+recycling_method = "Fast"
 
 # Hooks
 pre_request = "auth.check_request"
@@ -145,10 +158,33 @@ If no valid JWT is present, the `anon_role` is used (or the connection's default
 
 ### Connection Pool
 
+Pool settings live under the `[pool]` table in TOML (or as flat `PGVIS_POOL_*` env vars).
+These settings apply to both the primary pool and all replica pools.
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `pool_size` | `u32` | `16` | Maximum number of database connections in the pool. Each concurrent request holds one connection for its transaction duration. |
-| `pool_timeout_ms` | `u64` | `5000` (5s) | Pool checkout timeout. If all connections are busy, new requests wait up to this duration before returning 503 Service Unavailable. |
+| `pool.size` | `u32` | `16` | Maximum number of database connections in the pool. Each concurrent request holds one connection for its transaction duration. For replicas, each replica pool gets this many connections independently. |
+| `pool.timeout_ms` | `u64` | `5000` (5s) | Pool checkout timeout. If all connections are busy, new requests wait up to this duration before returning 503 Service Unavailable. Set to `0` for no timeout (not recommended). |
+| `pool.create_timeout_ms` | `u64` | `5000` (5s) | Timeout for creating a new connection. Bounds how long establishing a new TCP connection + TLS handshake + Postgres auth can take. Set to `0` for no timeout. |
+| `pool.recycle_timeout_ms` | `u64` | `5000` (5s) | Timeout for recycling/validating an existing connection. When a pooled connection is checked out, the recycling query must complete within this time or the connection is discarded. Set to `0` for no timeout. |
+| `pool.keepalives` | `bool` | `true` | Whether TCP keepalive is enabled on connections. Critical for connections through NATs, firewalls, or load balancers that silently drop idle TCP connections. |
+| `pool.keepalives_idle_secs` | `u64` | `60` (1 min) | How long a connection must be idle before the first keepalive probe is sent. Lower values detect dead connections faster but generate more traffic. Only effective when `keepalives = true`. |
+| `pool.connect_timeout_secs` | `u64` | `10` | Maximum time (seconds) to wait for a TCP connection to be established with the Postgres server. Independent of the pool checkout timeout. Set to `0` for no timeout. |
+| `pool.recycling_method` | `enum` | `Fast` | How connections are validated when returned to the pool. `Fast`: check `is_closed()` only (cheapest). `Verified`: execute an empty query to ensure the connection responds (one round-trip). `Clean`: run DISCARD-like statements for pristine session state (most thorough). |
+
+#### Recycling methods explained
+
+| Method | Overhead | Use when |
+|--------|----------|----------|
+| `Fast` | None (in-process check) | Low-latency is critical; Postgres/network is stable |
+| `Verified` | 1 round-trip | Connections cross unreliable networks or NATs |
+| `Clean` | Several round-trips | Untrusted extensions or session state leaks between requests |
+
+#### Tuning recommendations
+
+- **Behind a load balancer/NAT**: Set `keepalives = true` and `keepalives_idle_secs` below the LB idle timeout (often 60–300 s).
+- **Serverless/burst traffic**: Lower `create_timeout_ms` (e.g. 3000) so cold-start pool growth doesn't block the first requests too long.
+- **High-availability**: Use `recycling_method = "Verified"` to detect dead connections immediately on checkout rather than failing the first query.
 
 ### Read Replicas (Postgres only)
 

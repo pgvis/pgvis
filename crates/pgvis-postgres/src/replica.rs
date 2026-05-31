@@ -20,15 +20,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use deadpool_postgres::{Config as PoolConfig, Pool, Runtime};
+use deadpool_postgres::Pool;
 use futures::future::BoxFuture;
-use tokio_postgres::NoTls;
 
 use pgvis_core::backend::{
     Backend, ExecContext, IntrospectConfig, QueryResult, SchemaChangeStream,
 };
 use pgvis_core::cache::SchemaCache;
-use pgvis_core::config::ReplicaConfig;
+use pgvis_core::config::{PoolConfig, ReplicaConfig};
 use pgvis_core::dialect::{self, Dialect};
 use pgvis_core::error::Error;
 use serde_json::Value;
@@ -126,8 +125,7 @@ impl PgReplicaBackend {
     /// # Arguments
     ///
     /// * `primary_dsn` — DSN for the primary (read-write) server
-    /// * `pool_size` — Max connections per pool (applied to primary AND each replica)
-    /// * `pool_timeout_ms` — Pool checkout timeout in milliseconds
+    /// * `pool_cfg` — Pool settings (size, timeouts, keepalive, recycling)
     /// * `config` — Replica configuration (DSNs, lag threshold, intervals)
     ///
     /// # Errors
@@ -135,15 +133,14 @@ impl PgReplicaBackend {
     /// Returns [`Error::Introspection`] if any pool fails to initialize.
     pub fn new(
         primary_dsn: &str,
-        pool_size: u32,
-        pool_timeout_ms: u64,
+        pool_cfg: &PoolConfig,
         config: &ReplicaConfig,
     ) -> Result<Self, Error> {
-        let primary = create_pool(primary_dsn, pool_size, pool_timeout_ms)?;
+        let primary = crate::create_pool(primary_dsn, pool_cfg)?;
 
         let mut replica_pools = Vec::with_capacity(config.replica_dsns.len());
         for dsn in &config.replica_dsns {
-            replica_pools.push(create_pool(dsn, pool_size, pool_timeout_ms)?);
+            replica_pools.push(crate::create_pool(dsn, pool_cfg)?);
         }
 
         let replica_count = replica_pools.len();
@@ -407,33 +404,6 @@ async fn check_replica(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Pool creation helper
-// ---------------------------------------------------------------------------
-
-/// Create a `deadpool-postgres` pool from a DSN.
-fn create_pool(dsn: &str, pool_size: u32, pool_timeout_ms: u64) -> Result<Pool, Error> {
-    let mut cfg = PoolConfig::new();
-    cfg.url = Some(dsn.to_string());
-
-    let timeouts = if pool_timeout_ms > 0 {
-        deadpool_postgres::Timeouts {
-            wait: Some(Duration::from_millis(pool_timeout_ms)),
-            ..Default::default()
-        }
-    } else {
-        Default::default()
-    };
-
-    cfg.pool = Some(deadpool_postgres::PoolConfig {
-        max_size: pool_size as usize,
-        timeouts,
-        ..Default::default()
-    });
-
-    cfg.create_pool(Some(Runtime::Tokio1), NoTls)
-        .map_err(|e| Error::Introspection(format!("failed to create pool: {e}")))
-}
 
 // ---------------------------------------------------------------------------
 // Tests
