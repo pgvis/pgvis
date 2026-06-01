@@ -35,6 +35,7 @@ use rmcp::model::{
 use rmcp::service::{RequestContext, RoleServer};
 
 use pgvis_core::backend::Backend;
+use pgvis_core::pubsub::PubSubBackend;
 use pgvis_core::{Config, Dialect, SchemaCache};
 
 use crate::tools::{build_mcp_resources, build_mcp_tools, handle_tool_call};
@@ -62,6 +63,8 @@ pub struct McpServer {
     pub dialect: Arc<Dialect>,
     /// The database backend for query execution.
     pub backend: Arc<dyn Backend>,
+    /// Optional pub/sub backend for publish operations via MCP tools.
+    pub pubsub: Option<Arc<dyn PubSubBackend>>,
 }
 
 impl McpServer {
@@ -80,7 +83,14 @@ impl McpServer {
             config,
             dialect,
             backend,
+            pubsub: None,
         }
+    }
+
+    /// Attach a pub/sub backend to enable `pubsub_publish` and `pubsub_channels` tools.
+    pub fn with_pubsub(mut self, pubsub: Arc<dyn PubSubBackend>) -> Self {
+        self.pubsub = Some(pubsub);
+        self
     }
 }
 
@@ -118,7 +128,7 @@ impl ServerHandler for McpServer {
             let cache = self.cache.load();
             let tools = build_mcp_tools(&cache, &self.config);
 
-            let rmcp_tools: Vec<Tool> = tools
+            let mut rmcp_tools: Vec<Tool> = tools
                 .into_iter()
                 .map(|t| {
                     let input_schema: serde_json::Map<String, serde_json::Value> =
@@ -127,6 +137,37 @@ impl ServerHandler for McpServer {
                     Tool::new(t.name, t.description, input_schema)
                 })
                 .collect();
+
+            // Add pub/sub tools if backend is available
+            if self.pubsub.is_some() && self.config.pubsub.enabled {
+                rmcp_tools.push(Tool::new(
+                    "pubsub_publish",
+                    "Publish a message to a pub/sub channel. The message is delivered to all subscribers on this channel across all connected pgvis instances.",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "channel": {
+                                "type": "string",
+                                "description": "The channel name to publish to (e.g. 'orders.new', 'chat.room1')"
+                            },
+                            "payload": {
+                                "type": "string",
+                                "description": "The message payload (UTF-8, max ~7500 bytes). Can be JSON or plain text."
+                            }
+                        },
+                        "required": ["channel", "payload"]
+                    }).as_object().cloned().unwrap_or_default(),
+                ));
+
+                rmcp_tools.push(Tool::new(
+                    "pubsub_channels",
+                    "List currently active pub/sub channels (channels with at least one subscriber on this instance).",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {}
+                    }).as_object().cloned().unwrap_or_default(),
+                ));
+            }
 
             Ok(ListToolsResult {
                 meta: None,
@@ -143,6 +184,13 @@ impl ServerHandler for McpServer {
     ) -> impl std::future::Future<Output = Result<CallToolResult, rmcp::ErrorData>> + Send + '_
     {
         async move {
+            let tool_name = request.name.to_string();
+
+            // Handle pub/sub tools
+            if tool_name == "pubsub_publish" || tool_name == "pubsub_channels" {
+                return self.handle_pubsub_tool(&tool_name, &request.arguments).await;
+            }
+
             let cache = self.cache.load();
 
             // Convert rmcp arguments to our McpToolCall format
@@ -152,7 +200,7 @@ impl ServerHandler for McpServer {
                 .unwrap_or(serde_json::Value::Null);
 
             let call = McpToolCall {
-                name: request.name.to_string(),
+                name: tool_name,
                 arguments,
             };
 
@@ -293,6 +341,81 @@ impl ServerHandler for McpServer {
             Ok(ReadResourceResult::new(vec![ResourceContents::text(
                 content, uri,
             )]))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pub/sub tool handlers
+// ---------------------------------------------------------------------------
+
+impl McpServer {
+    /// Handle pub/sub-specific tool calls.
+    async fn handle_pubsub_tool(
+        &self,
+        tool_name: &str,
+        arguments: &Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let pubsub = match &self.pubsub {
+            Some(ps) => ps,
+            None => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "Pub/sub is not available on this server",
+                )]));
+            }
+        };
+
+        match tool_name {
+            "pubsub_publish" => {
+                let args = arguments.as_ref();
+                let channel = args
+                    .and_then(|a| a.get("channel"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let payload = args
+                    .and_then(|a| a.get("payload"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                if channel.is_empty() {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        "Missing required parameter: channel",
+                    )]));
+                }
+
+                // Validate channel and payload
+                if let Err(e) = self.config.pubsub.validate_channel(channel) {
+                    return Ok(CallToolResult::error(vec![Content::text(e.to_string())]));
+                }
+                if let Err(e) = self.config.pubsub.validate_payload(payload) {
+                    return Ok(CallToolResult::error(vec![Content::text(e.to_string())]));
+                }
+
+                match pubsub.publish(channel, payload).await {
+                    Ok(()) => Ok(CallToolResult::success(vec![Content::text(
+                        serde_json::json!({
+                            "ok": true,
+                            "channel": channel,
+                            "payload_bytes": payload.len()
+                        })
+                        .to_string(),
+                    )])),
+                    Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+                }
+            }
+            "pubsub_channels" => {
+                let channels = pubsub.active_channels().await;
+                let result = serde_json::json!({
+                    "channels": channels,
+                    "count": channels.len()
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&result).unwrap_or_default(),
+                )]))
+            }
+            _ => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Unknown pub/sub tool: {tool_name}"
+            ))])),
         }
     }
 }

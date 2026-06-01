@@ -1,0 +1,430 @@
+---
+title: Pub/Sub Messaging
+description: Real-time publish/subscribe messaging backed by Postgres LISTEN/NOTIFY.
+---
+
+# Pub/Sub Messaging
+
+pgvis includes a general-purpose publish/subscribe system backed by Postgres `LISTEN/NOTIFY`. It works like Redis pub/sub — any client can publish messages to named channels, and any number of subscribers receive them in real time.
+
+Multiple pgvis instances connected to the same Postgres database automatically form a shared message bus without additional infrastructure.
+
+## Enabling Pub/Sub
+
+Pub/sub is **disabled by default**. Enable it via CLI flag or environment variable:
+
+```bash
+# CLI
+pgvis serve --pubsub-enabled
+
+# Environment variable
+PGVIS_PUBSUB_ENABLED=true pgvis serve
+```
+
+Or in your TOML configuration:
+
+```toml
+[pubsub]
+enabled = true
+channel_prefix = "pgvis:"      # optional, default "pgvis:"
+max_payload_bytes = 7500        # optional, default 7500
+buffer_capacity = 256           # optional, default 256
+allowed_channels = []           # empty = allow all
+```
+
+## REST API (Server-Sent Events)
+
+The REST surface exposes pub/sub at the `/pubsub` path prefix.
+
+### Subscribe to a Channel
+
+```
+GET /pubsub/{channel}
+Accept: text/event-stream
+```
+
+Opens a Server-Sent Events (SSE) stream. Messages arrive as `event: message` frames:
+
+```bash
+curl -N -H "Accept: text/event-stream" \
+  http://localhost:3000/pubsub/chat
+```
+
+Response stream:
+
+```
+: keepalive
+
+event: message
+data: {"channel":"chat","payload":"hello world","timestamp":"2026-06-01T10:00:00.000Z"}
+
+event: message
+data: {"channel":"chat","payload":"{\"user\":\"alice\",\"text\":\"hi\"}","timestamp":"2026-06-01T10:00:01.123Z"}
+```
+
+The connection stays open until the client disconnects. A keepalive comment (`: keepalive`) is sent every 30 seconds to prevent proxy timeouts.
+
+### Publish to a Channel
+
+```
+POST /pubsub/{channel}
+Content-Type: text/plain
+
+your message payload here
+```
+
+The body is sent as-is to all subscribers of that channel.
+
+**Example:**
+
+```bash
+# Publish a plain text message
+curl -X POST http://localhost:3000/pubsub/chat \
+  -H "Content-Type: text/plain" \
+  -d "hello world"
+
+# Publish JSON (just send it as the body)
+curl -X POST http://localhost:3000/pubsub/notifications \
+  -H "Content-Type: text/plain" \
+  -d '{"event":"order_placed","order_id":42}'
+```
+
+**Response:** `204 No Content` on success, or an error JSON body with appropriate status code.
+
+### Channel Status
+
+```
+GET /pubsub
+Accept: application/json
+```
+
+Returns active channels and subscriber counts:
+
+```json
+{
+  "active_channels": [
+    { "name": "chat", "subscribers": 3 },
+    { "name": "notifications", "subscribers": 1 }
+  ],
+  "total_subscribers": 4
+}
+```
+
+## MCP Tools (AI Agents)
+
+When pub/sub is enabled, two additional MCP tools become available:
+
+### `pubsub_publish`
+
+Publish a message to a channel.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `channel` | string | ✓ | Target channel name |
+| `payload` | string | ✓ | Message content (max 7500 bytes) |
+
+**Example tool call:**
+
+```json
+{
+  "name": "pubsub_publish",
+  "arguments": {
+    "channel": "alerts",
+    "payload": "{\"level\":\"warning\",\"message\":\"disk usage 90%\"}"
+  }
+}
+```
+
+**Response:**
+
+```json
+{
+  "content": [
+    { "type": "text", "text": "Published to channel 'alerts'" }
+  ]
+}
+```
+
+### `pubsub_channels`
+
+List active channels and subscriber counts.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| *(none)* | | | |
+
+**Response:**
+
+```json
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"active_channels\":[{\"name\":\"alerts\",\"subscribers\":2}],\"total_subscribers\":2}"
+    }
+  ]
+}
+```
+
+### Agent Use Cases
+
+AI agents can use pub/sub to:
+
+- **Notify external systems** when they complete a task
+- **Coordinate multi-agent workflows** by publishing status updates
+- **Trigger webhooks** by publishing to channels that other services monitor
+- **Stream progress** to a dashboard while processing long-running queries
+
+## Embedding in Rust
+
+When embedding pgvis in your Rust application, the `PubSubHub` is available on the `Components` struct.
+
+### Basic Setup
+
+```rust
+use pgvis_lib::Builder;
+use pgvis_core::pubsub::PubSubConfig;
+use pgvis_core::config::Config;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let config = Config {
+        pubsub: PubSubConfig {
+            enabled: true,
+            channel_prefix: "myapp:".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let components = Builder::new("postgres://localhost/mydb")
+        .config(config)
+        .build_components()
+        .await?;
+
+    // The pub/sub hub is available for direct use
+    if let Some(hub) = &components.pubsub {
+        // Publish a message
+        hub.publish("events", r#"{"type":"startup"}"#).await?;
+
+        // Subscribe to a channel (returns a broadcast::Receiver)
+        let mut rx = hub.subscribe("events").await?;
+
+        // Receive messages
+        tokio::spawn(async move {
+            while let Ok(msg) = rx.recv().await {
+                println!("Got: {} on {}", msg.payload, msg.channel);
+            }
+        });
+
+        // Check status
+        let status = hub.status().await;
+        println!("Active channels: {}", status.active_channels.len());
+    }
+
+    // Serve the router (includes /pubsub endpoints)
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    axum::serve(listener, components.router).await?;
+    Ok(())
+}
+```
+
+### Using the Backend Directly
+
+For lower-level control, use `PgPubSub` directly without the hub:
+
+```rust
+use pgvis_postgres::PgPubSub;
+use pgvis_core::pubsub::{PubSubBackend, PubSubConfig};
+use pgvis_core::config::PoolConfig;
+use std::sync::Arc;
+
+let config = PubSubConfig::default();
+let pool_config = PoolConfig::default();
+
+let backend = PgPubSub::new(
+    "postgres://localhost/mydb",
+    &config,
+    &pool_config,
+)?;
+
+// Listen to a channel at the Postgres level
+backend.listen("my_channel").await?;
+
+// Get a stream of notifications
+let mut stream = backend.notification_stream().await?;
+
+// Publish (sends NOTIFY via a pooled connection)
+backend.publish("my_channel", "hello").await?;
+
+// Clean up
+backend.unlisten("my_channel").await?;
+```
+
+### Combining with Custom axum Routes
+
+```rust
+use pgvis_lib::Builder;
+use pgvis_core::config::Config;
+use pgvis_core::pubsub::PubSubConfig;
+use axum::{Router, routing::post, extract::State, Json};
+use std::sync::Arc;
+
+#[derive(Clone)]
+struct AppState {
+    hub: Arc<pgvis_router::PubSubHub>,
+}
+
+async fn notify_users(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> &'static str {
+    let msg = serde_json::to_string(&payload).unwrap();
+    state.hub.publish("user_updates", &msg).await.ok();
+    "notified"
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let config = Config {
+        pubsub: PubSubConfig { enabled: true, ..Default::default() },
+        ..Default::default()
+    };
+
+    let components = Builder::new("postgres://localhost/mydb")
+        .config(config)
+        .build_components()
+        .await?;
+
+    let hub = components.pubsub.clone().expect("pubsub enabled");
+
+    // Add custom routes that publish to pub/sub
+    let custom_routes = Router::new()
+        .route("/notify", post(notify_users))
+        .with_state(AppState { hub });
+
+    let app = components.router.merge(custom_routes);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+```
+
+## Configuration Reference
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable the pub/sub subsystem |
+| `channel_prefix` | string | `"pgvis:"` | Prefix added to Postgres channel names |
+| `max_payload_bytes` | usize | `7500` | Maximum payload size (Postgres limit is ~8000) |
+| `buffer_capacity` | usize | `256` | In-process broadcast buffer per channel |
+| `allowed_channels` | string[] | `[]` | Channel allowlist (empty = allow all). Supports glob patterns: `chat.*`, `events.*` |
+
+### Environment Variables
+
+| Variable | Maps to |
+|----------|---------|
+| `PGVIS_PUBSUB_ENABLED` | `pubsub.enabled` |
+| `PGVIS_PUBSUB_CHANNEL_PREFIX` | `pubsub.channel_prefix` |
+
+### CLI Flags
+
+```
+--pubsub-enabled             Enable pub/sub (default: false)
+--pubsub-channel-prefix      Postgres channel prefix (default: "pgvis:")
+```
+
+## How It Works
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  REST SSE   │     │  MCP Tool   │     │  Embedded   │
+│  Client     │     │  Agent      │     │  Rust App   │
+└──────┬──────┘     └──────┬──────┘     └──────┬──────┘
+       │                   │                   │
+       ▼                   ▼                   ▼
+┌──────────────────────────────────────────────────────┐
+│                    PubSubHub                          │
+│         (in-process fan-out via broadcast)            │
+└──────────────────────────┬───────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────┐
+│                    PgPubSub                           │
+│         (dedicated LISTEN connection)                 │
+└──────────────────────────┬───────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────┐
+│               PostgreSQL LISTEN/NOTIFY               │
+│     (shared across all pgvis instances on same DB)   │
+└──────────────────────────────────────────────────────┘
+```
+
+1. **Publish:** Any surface calls `hub.publish(channel, payload)` → hub validates → backend sends `NOTIFY` to Postgres
+2. **Delivery:** Postgres broadcasts the notification to ALL connected listeners (including other pgvis instances)
+3. **Fan-out:** The dedicated listener task receives the notification → broadcasts to all local subscribers via `tokio::sync::broadcast`
+4. **Subscribe:** REST returns SSE frames; MCP returns tool results; embedded code receives from the broadcast channel
+
+## Limitations
+
+| Constraint | Value | Reason |
+|------------|-------|--------|
+| Max payload | ~7,500 bytes | Postgres NOTIFY limit is 8,000 bytes including channel name |
+| Delivery guarantee | At-most-once | No persistence; missed during disconnection |
+| Ordering | Per-connection FIFO | Postgres guarantees order within a single session |
+| No history | — | New subscribers only see future messages |
+| Postgres only | — | SQLite backends do not support pub/sub |
+
+## Patterns and Recipes
+
+### Chat Room
+
+```bash
+# Terminal 1: Subscribe
+curl -N http://localhost:3000/pubsub/room.general
+
+# Terminal 2: Publish
+curl -X POST http://localhost:3000/pubsub/room.general \
+  -d '{"user":"bob","text":"hey everyone"}'
+```
+
+### Event Bus Between Microservices
+
+```bash
+# Service A publishes order events
+curl -X POST http://localhost:3000/pubsub/orders.created \
+  -d '{"order_id":123,"total":49.99}'
+
+# Service B subscribes to order events (using EventSource in JS)
+const es = new EventSource("http://localhost:3000/pubsub/orders.created");
+es.addEventListener("message", (e) => {
+  const order = JSON.parse(JSON.parse(e.data).payload);
+  console.log("New order:", order.order_id);
+});
+```
+
+### Channel Allowlist (Security)
+
+Restrict which channels clients can use:
+
+```toml
+[pubsub]
+enabled = true
+allowed_channels = ["chat.*", "notifications", "events.*"]
+```
+
+Only channels matching these patterns will be accepted. Attempts to subscribe or publish to other channels return `403 Forbidden`.
+
+### Cross-Instance Coordination
+
+Since all pgvis instances share the same Postgres database, a message published on one instance is received by subscribers on ALL instances:
+
+```
+Instance A (port 3001): POST /pubsub/sync → "reload config"
+Instance B (port 3002): GET /pubsub/sync → receives "reload config"
+Instance C (port 3003): GET /pubsub/sync → receives "reload config"
+```
+
+This happens automatically — no additional clustering configuration needed.

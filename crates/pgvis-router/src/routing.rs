@@ -220,6 +220,25 @@ impl AppState {
             .map_err(|e| Error::Internal(format!("rpc {schema}.{function} deserialize: {e}")))
     }
 
+    /// Like [`call_rpc_scalar`](Self::call_rpc_scalar) but returns `None` when
+    /// the function yields SQL `NULL` or no row (for nullable-scalar functions).
+    pub async fn call_rpc_scalar_opt<T: DeserializeOwned>(
+        &self,
+        schema: &str,
+        function: &str,
+        args: serde_json::Value,
+        caller: &CallerIdentity,
+    ) -> Result<Option<T>, Error> {
+        let result = self.call_rpc(schema, function, args, caller).await?;
+        let value = unwrap_scalar_body(result.body);
+        if value.is_null() {
+            return Ok(None);
+        }
+        serde_json::from_value(value)
+            .map(Some)
+            .map_err(|e| Error::Internal(format!("rpc {schema}.{function} deserialize: {e}")))
+    }
+
     /// Call a set-returning function (`RETURNS TABLE(...)` / `SETOF`) and
     /// deserialize each row into `T`. The body is a JSON array of row objects.
     pub async fn call_rpc_rows<T: DeserializeOwned>(
@@ -232,6 +251,93 @@ impl AppState {
         let result = self.call_rpc(schema, function, args, caller).await?;
         serde_json::from_value(result.body)
             .map_err(|e| Error::Internal(format!("rpc {schema}.{function} rows deserialize: {e}")))
+    }
+
+    /// Read rows from a table/view in-process — the programmatic equivalent of a
+    /// `GET /{table}?<params>` request against the exposed table API. `params`
+    /// uses the same PostgREST-style query syntax as the HTTP endpoint, e.g.
+    /// `{"id": "eq.123", "select": "id,email", "deleted_at": "is.null", "limit": "1"}`.
+    ///
+    /// Runs the full plan → render → role/GUC-applied execute pipeline (no HTTP
+    /// round-trip) and returns the raw [`QueryResult`] whose `body` is a JSON
+    /// array of row objects. The data cache is bypassed (always a fresh read).
+    pub async fn call_read(
+        &self,
+        schema: &str,
+        table: &str,
+        params: &HashMap<String, String>,
+        caller: &CallerIdentity,
+    ) -> Result<QueryResult, Error> {
+        let cache = self.cache.load();
+
+        let select = params
+            .get("select")
+            .and_then(|s| query_params::parse_select(s).ok())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec![SelectItem::Star]);
+
+        let order = params
+            .get("order")
+            .and_then(|s| query_params::parse_order(s).ok())
+            .map(|items| {
+                items
+                    .into_iter()
+                    .filter_map(|it| match it {
+                        OrderItem::Term(t) => Some(t),
+                        OrderItem::Relation(_) => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let api_request = ApiRequest {
+            schema: schema.to_string(),
+            target: table.to_string(),
+            method: RequestMethod::Get,
+            is_rpc: false,
+            select,
+            filters: parse_filters_from_params(params),
+            order,
+            range: parse_range_from_params(params),
+            preferences: Preferences::default(),
+            body: None,
+            on_conflict: None,
+            columns: None,
+            logic_filters: parse_logic_filters_from_params(params),
+            cursor: parse_cursor_from_params(params),
+        };
+
+        let plan = plan_request(&api_request, &cache, &self.dialect, &self.config)?;
+        let (sql, sql_params) = if self.dialect.supports_set_local {
+            query::render(&plan, &self.dialect)?
+        } else {
+            query::render_inner(&plan, &self.dialect)?
+        };
+
+        let exec_ctx = ExecContext {
+            role: caller.role.clone(),
+            claims: caller.claims.clone(),
+            pre_request: self.config.pre_request.clone(),
+            statement_timeout: self.config.statement_timeout_ms,
+            tx_end: None,
+            is_mutation: false,
+        };
+
+        self.backend.execute(&exec_ctx, &sql, &sql_params).await
+    }
+
+    /// Typed convenience over [`call_read`](Self::call_read): deserialize each
+    /// returned row into `T`.
+    pub async fn call_read_rows<T: DeserializeOwned>(
+        &self,
+        schema: &str,
+        table: &str,
+        params: &HashMap<String, String>,
+        caller: &CallerIdentity,
+    ) -> Result<Vec<T>, Error> {
+        let result = self.call_read(schema, table, params, caller).await?;
+        serde_json::from_value(result.body)
+            .map_err(|e| Error::Internal(format!("read {schema}.{table} rows deserialize: {e}")))
     }
 }
 

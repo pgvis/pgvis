@@ -821,3 +821,35 @@ orders.status=eq.completed&\
 order=name.asc&\
 limit=50"
 ```
+
+---
+
+## Pub/Sub (Real-time Messaging)
+
+pgvis includes a general-purpose pub/sub system backed by Postgres `LISTEN/NOTIFY`. When enabled (`--pubsub-enabled`), the REST surface gains additional endpoints:
+
+### Subscribe (SSE)
+
+```bash
+# Open an SSE stream on a channel
+curl -N -H "Accept: text/event-stream" \
+  http://localhost:3000/pubsub/chat
+```
+
+### Publish
+
+```bash
+# Send a message to all subscribers
+curl -X POST http://localhost:3000/pubsub/chat \
+  -H "Content-Type: text/plain" \
+  -d '{"user":"alice","text":"hello"}'
+```
+
+### Status
+
+```bash
+# List active channels
+curl http://localhost:3000/pubsub
+```
+
+See the full [Pub/Sub guide](/guides/pubsub) for details on configuration, channel allowlists, and cross-instance messaging.

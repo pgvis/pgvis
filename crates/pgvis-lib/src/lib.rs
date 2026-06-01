@@ -125,8 +125,10 @@ pub struct Components {
     pub config: Arc<Config>,
     /// The SQL dialect (Postgres/SQLite).
     pub dialect: Arc<Dialect>,
-    /// The fully-wired axum Router (REST + OpenAPI + optionally MCP HTTP).
+    /// The fully-wired axum Router (REST + OpenAPI + optionally MCP HTTP + pub/sub).
     pub router: axum::Router,
+    /// The pub/sub hub (if enabled). `None` when pub/sub is disabled or unsupported.
+    pub pubsub: Option<Arc<pgvis_router::PubSubHub>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +238,7 @@ impl Builder {
     /// Returns an error if the database connection or introspection fails.
     pub async fn build_components(self) -> Result<Components, pgvis_core::error::Error> {
         let config = Arc::new(self.resolve_config());
+        let db_kind = detect_db_kind(&self.dsn);
         let backend = self.build_backend(&config).await?;
 
         let introspect_config = IntrospectConfig {
@@ -255,15 +258,52 @@ impl Builder {
             backend.clone(),
         );
 
+        // Build pub/sub hub (Postgres only, when enabled)
+        let mut pubsub_backend: Option<Arc<dyn pgvis_core::pubsub::PubSubBackend>> = None;
+        let pubsub = if config.pubsub.enabled && db_kind == DbKind::Postgres {
+            #[cfg(feature = "postgres")]
+            {
+                let pg_pubsub: Arc<dyn pgvis_core::pubsub::PubSubBackend> =
+                    Arc::new(pgvis_postgres::PgPubSub::new(
+                        &self.dsn,
+                        &config.pubsub,
+                        &config.pool,
+                    )?);
+                pubsub_backend = Some(pg_pubsub.clone());
+
+                let hub = pgvis_router::PubSubHub::new(
+                    pg_pubsub,
+                    config.pubsub.clone(),
+                )
+                .await?;
+
+                // Mount pub/sub router
+                let pubsub_router = pgvis_router::build_pubsub_router(hub.clone());
+                app = app.nest("/pubsub", pubsub_router);
+
+                Some(hub)
+            }
+            #[cfg(not(feature = "postgres"))]
+            {
+                tracing::warn!("pub/sub enabled but Postgres feature not compiled in");
+                None
+            }
+        } else {
+            None
+        };
+
         // Optionally merge MCP Streamable HTTP service
         #[cfg(feature = "mcp")]
         if self.mcp_http {
-            let mcp_server = pgvis_mcp::McpServer::new(
+            let mut mcp_server = pgvis_mcp::McpServer::new(
                 cache.clone(),
                 config.clone(),
                 dialect.clone(),
                 backend.clone(),
             );
+            if let Some(ps) = pubsub_backend {
+                mcp_server = mcp_server.with_pubsub(ps);
+            }
             let mcp_service = pgvis_mcp::streamable_http_service(mcp_server);
             app = app.route_service("/mcp", mcp_service);
         }
@@ -274,6 +314,7 @@ impl Builder {
             config,
             dialect,
             router: app,
+            pubsub,
         })
     }
 

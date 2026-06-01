@@ -281,6 +281,17 @@ pub enum Error {
     /// HTTP 500. If this is reached, it indicates a pgvis logic error.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// Pub/sub operation failed.
+    ///
+    /// HTTP status varies by error code (400, 403, 501, 503).
+    #[error("pubsub error: {message}")]
+    PubSub {
+        /// What went wrong.
+        message: String,
+        /// Specific pub/sub error code.
+        code: crate::pubsub::PubSubErrorCode,
+    },
 }
 
 impl Error {
@@ -295,6 +306,7 @@ impl Error {
             Self::Auth { code, .. } => code.clone(),
             Self::Unsupported(_) => ErrorCode::UnsupportedOperation,
             Self::Internal(_) => ErrorCode::Internal,
+            Self::PubSub { .. } => ErrorCode::Internal, // code is in the PubSubErrorCode
         }
     }
 
@@ -313,6 +325,10 @@ impl Error {
                     _ => 500,
                 };
             }
+        }
+        // PubSub errors carry their own HTTP status in PubSubErrorCode
+        if let Self::PubSub { code, .. } = self {
+            return code.http_status();
         }
         self.code().http_status()
     }

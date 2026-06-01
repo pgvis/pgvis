@@ -282,3 +282,26 @@ let router = Builder::new("postgres://localhost/mydb")
 let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
 axum::serve(listener, router).await?;
 ```
+
+## Pub/Sub Tools
+
+When pub/sub is enabled (`pubsub.enabled = true` in config), two additional tools become available:
+
+| Tool | Purpose |
+|------|---------|
+| `pubsub_publish` | Publish a message to a named channel |
+| `pubsub_channels` | List active channels and subscriber counts |
+
+### Example: Publishing from an agent
+
+```json
+{
+  "name": "pubsub_publish",
+  "arguments": {
+    "channel": "alerts",
+    "payload": "{\"level\":\"critical\",\"message\":\"disk full\"}"
+  }
+}
+```
+
+Agents can use pub/sub to notify external systems, coordinate multi-agent workflows, or stream progress updates. See the full [Pub/Sub guide](/guides/pubsub) for all details.

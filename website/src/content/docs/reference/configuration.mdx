@@ -397,6 +397,37 @@ PGVIS_MAX_ROWS=500 pgvis --config pgvis.toml serve
 
 ---
 
+## Pub/Sub
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `pubsub.enabled` | bool | `false` | Enable the pub/sub subsystem |
+| `pubsub.channel_prefix` | string | `"pgvis:"` | Prefix added to Postgres LISTEN/NOTIFY channel names |
+| `pubsub.max_payload_bytes` | integer | `7500` | Maximum message payload size |
+| `pubsub.buffer_capacity` | integer | `256` | In-process broadcast buffer per channel |
+| `pubsub.allowed_channels` | string[] | `[]` | Channel allowlist (empty = allow all). Supports globs: `chat.*` |
+
+TOML example:
+
+```toml
+[pubsub]
+enabled = true
+channel_prefix = "myapp:"
+max_payload_bytes = 7500
+allowed_channels = ["chat.*", "notifications", "events.*"]
+```
+
+Environment variables:
+
+| Variable | Maps to |
+|----------|---------|
+| `PGVIS_PUBSUB_ENABLED` | `pubsub.enabled` |
+| `PGVIS_PUBSUB_CHANNEL_PREFIX` | `pubsub.channel_prefix` |
+
+See the [Pub/Sub guide](/guides/pubsub) for full usage details.
+
+---
+
 ## PostgREST Compatibility Reference
 
 | PostgREST config | pgvis equivalent |

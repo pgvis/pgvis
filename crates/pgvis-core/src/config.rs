@@ -333,6 +333,15 @@ pub struct Config {
     /// with a configurable TTL. Auto-invalidates on mutations to the same table.
     #[serde(default)]
     pub cache: CacheConfig,
+
+    // --- Pub/Sub ---
+    /// General-purpose pub/sub messaging via Postgres LISTEN/NOTIFY.
+    ///
+    /// When enabled, exposes pub/sub endpoints (REST SSE, MCP tools, embedded API)
+    /// backed by Postgres channels. Multiple pgvis instances on the same database
+    /// form a shared message bus automatically.
+    #[serde(default)]
+    pub pubsub: crate::pubsub::PubSubConfig,
 }
 
 impl Default for Config {
@@ -359,6 +368,7 @@ impl Default for Config {
             routing: RoutingConfig::default(),
             replica: ReplicaConfig::default(),
             cache: CacheConfig::default(),
+            pubsub: crate::pubsub::PubSubConfig::default(),
         }
     }
 }

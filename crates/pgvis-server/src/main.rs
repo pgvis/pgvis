@@ -59,6 +59,16 @@ enum Cmd {
         /// Also cache list/collection queries (not just primary key lookups).
         #[arg(long, env = "PGVIS_CACHE_LISTS")]
         cache_lists: bool,
+
+        /// Enable the pub/sub subsystem (Postgres LISTEN/NOTIFY).
+        /// Exposes REST SSE endpoints at /pubsub/{channel} and MCP tools.
+        #[arg(long, env = "PGVIS_PUBSUB_ENABLED")]
+        pubsub_enabled: bool,
+
+        /// Channel name prefix for pub/sub (default: "pgvis:").
+        /// All Postgres LISTEN/NOTIFY channels are prefixed with this value.
+        #[arg(long, env = "PGVIS_PUBSUB_CHANNEL_PREFIX")]
+        pubsub_channel_prefix: Option<String>,
     },
     /// Run MCP server over stdio (for Claude Desktop / agent integrations).
     #[cfg(feature = "mcp")]
@@ -109,6 +119,8 @@ async fn main() -> anyhow::Result<()> {
         cache_ttl: None,
         cache_max_entries: None,
         cache_lists: false,
+        pubsub_enabled: false,
+        pubsub_channel_prefix: None,
     }) {
         Cmd::Serve {
             bind,
@@ -119,6 +131,8 @@ async fn main() -> anyhow::Result<()> {
             cache_ttl,
             cache_max_entries,
             cache_lists,
+            pubsub_enabled,
+            pubsub_channel_prefix,
         } => {
             // Override schemas from CLI if provided
             if !schema.is_empty() {
@@ -144,12 +158,21 @@ async fn main() -> anyhow::Result<()> {
                 config.cache.cache_lists = true;
             }
 
+            // Override pub/sub settings from CLI if provided
+            if pubsub_enabled {
+                config.pubsub.enabled = true;
+            }
+            if let Some(prefix) = pubsub_channel_prefix {
+                config.pubsub.channel_prefix = prefix;
+            }
+
             tracing::info!(
                 dsn = %cli.dsn,
                 bind = %bind,
                 schemas = ?config.schemas,
                 replicas = config.replica.replica_dsns.len(),
                 mcp_http,
+                pubsub = config.pubsub.enabled,
                 "starting pgvis server",
             );
 

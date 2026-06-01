@@ -22,6 +22,7 @@
 
 pub mod execute;
 pub mod introspect;
+pub mod pubsub;
 pub mod replica;
 
 use std::time::Duration;
@@ -38,6 +39,7 @@ use pgvis_core::error::Error;
 use serde_json::Value;
 use tokio_postgres::NoTls;
 
+pub use pubsub::PgPubSub;
 pub use replica::PgReplicaBackend;
 
 /// The Postgres backend — implements [`Backend`] for PostgreSQL databases.

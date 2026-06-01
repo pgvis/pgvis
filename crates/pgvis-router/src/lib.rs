@@ -43,8 +43,10 @@
 
 pub mod data_cache;
 pub mod openapi;
+pub mod pubsub;
 pub mod response;
 pub mod routing;
 
 pub use data_cache::{CacheStats, DataCache};
+pub use pubsub::{PubSubHub, build_pubsub_router};
 pub use routing::{AppState, CallerIdentity, build_app, build_router};

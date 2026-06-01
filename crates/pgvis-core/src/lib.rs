@@ -53,6 +53,7 @@ pub mod dialect;
 pub mod error;
 pub mod plan;
 pub mod preferences;
+pub mod pubsub;
 pub mod query;
 pub mod query_params;
 pub mod select_ast;
@@ -67,6 +68,7 @@ pub use cache::{
 pub use config::{CacheConfig, Config, RoutingConfig};
 pub use dialect::{Dialect, POSTGRES, Placeholder, SQLITE};
 pub use error::{Error, ErrorCode};
+pub use pubsub::{PubSubBackend, PubSubConfig, PubSubMessage, PubSubStream};
 pub use plan::{
     ActionPlan, ApiRequest, CallPlan, MutatePlan, PlanConfig, ReadPlan, RequestMethod, plan_request,
 };

@@ -376,3 +376,38 @@ ApiRequest → plan_request() → ActionPlan → render() → SQL → execute() 
 ```
 
 This pipeline is shared between REST dispatch and MCP tool execution — behaviour is identical regardless of surface.
+
+## Pub/Sub (Real-time Messaging)
+
+When pub/sub is enabled in your config, the `Components` struct exposes a `pubsub` field — an `Arc<PubSubHub>` you can use directly:
+
+```rust
+use pgvis_lib::Builder;
+use pgvis_core::pubsub::PubSubConfig;
+use pgvis_core::config::Config;
+
+let config = Config {
+    pubsub: PubSubConfig { enabled: true, ..Default::default() },
+    ..Default::default()
+};
+
+let components = Builder::new("postgres://localhost/mydb")
+    .config(config)
+    .build_components()
+    .await?;
+
+if let Some(hub) = &components.pubsub {
+    // Publish
+    hub.publish("events", r#"{"type":"user_signup"}"#).await?;
+
+    // Subscribe
+    let mut rx = hub.subscribe("events").await?;
+    tokio::spawn(async move {
+        while let Ok(msg) = rx.recv().await {
+            println!("{}: {}", msg.channel, msg.payload);
+        }
+    });
+}
+```
+
+The REST router already includes `/pubsub/*` endpoints automatically when enabled. See the full [Pub/Sub guide](/guides/pubsub) for configuration, patterns, and limitations.
