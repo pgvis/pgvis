@@ -47,4 +47,4 @@ pub mod response;
 pub mod routing;
 
 pub use data_cache::{CacheStats, DataCache};
-pub use routing::{AppState, build_app};
+pub use routing::{AppState, CallerIdentity, build_app, build_router};

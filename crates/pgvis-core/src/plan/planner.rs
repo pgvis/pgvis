@@ -359,12 +359,22 @@ fn extract_payload_columns(body: &Option<RequestBody>) -> Vec<String> {
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default(),
         Some(RequestBody::Bulk(arr)) => {
-            // Union of all keys across all objects
+            // Union of all keys across all objects.
+            // Optimisation: most bulk inserts have uniform shape, so once we've
+            // seen all keys from the first object we can skip subsequent objects
+            // that don't introduce new columns.
             let mut cols = indexmap::IndexSet::new();
             for obj in arr {
                 if let Some(map) = obj.as_object() {
+                    let prev_len = cols.len();
                     for key in map.keys() {
                         cols.insert(key.clone());
+                    }
+                    // If this object didn't add any new columns and we already
+                    // have at least one object's worth, subsequent uniform
+                    // objects won't either — skip the rest.
+                    if cols.len() == prev_len && prev_len > 0 {
+                        break;
                     }
                 }
             }

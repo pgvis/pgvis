@@ -27,7 +27,8 @@ use pgvis_core::preferences::{PreferTx, Preferences};
 use pgvis_core::query;
 use pgvis_core::query_params::{self, CursorSpec, LogicTree, OrderItem};
 use pgvis_core::select_ast::SelectItem;
-use pgvis_core::{Config, Dialect, SchemaCache};
+use pgvis_core::{Config, Dialect, Error, SchemaCache};
+use serde::de::DeserializeOwned;
 
 use crate::data_cache::DataCache;
 use crate::openapi;
@@ -54,6 +55,204 @@ pub struct AppState {
     pub backend: Arc<dyn Backend>,
     /// In-memory data cache for read responses (None when caching is disabled).
     pub data_cache: Option<Arc<DataCache>>,
+    /// Cached OpenAPI JSON, lazily populated and invalidated on schema reload.
+    /// Tuple: (schema_cache_ptr as usize, serialized Value).
+    openapi_cache: Arc<std::sync::Mutex<(usize, Option<serde_json::Value>)>>,
+}
+
+// ---------------------------------------------------------------------------
+// In-process RPC adapter
+// ---------------------------------------------------------------------------
+
+/// Identity for an in-process RPC call.
+///
+/// Substitutes for JWT verification on the HTTP path: the supplied `role` and
+/// `claims` are applied via `SET LOCAL role` / `request.jwt.claims` GUC inside
+/// the execution transaction, so row-level security and `current_setting(...)`
+/// logic behave exactly as they would for an authenticated HTTP request.
+///
+/// Use [`CallerIdentity::anonymous`] for the default (anon) role.
+#[derive(Debug, Clone, Default)]
+pub struct CallerIdentity {
+    /// Role to `SET LOCAL role` to (e.g. `Some("authenticated")`). `None` keeps
+    /// the connection's default role.
+    pub role: Option<String>,
+    /// Raw JWT claims propagated as the `request.jwt.claims` GUC.
+    pub claims: Option<serde_json::Value>,
+}
+
+impl CallerIdentity {
+    /// An anonymous caller — no role switch, no claims.
+    pub fn anonymous() -> Self {
+        Self::default()
+    }
+
+    /// A caller bound to a specific database role.
+    pub fn with_role(role: impl Into<String>) -> Self {
+        Self {
+            role: Some(role.into()),
+            claims: None,
+        }
+    }
+}
+
+impl AppState {
+    /// Assemble shared application state from its parts.
+    ///
+    /// The in-memory data cache is created when `config.cache.enabled`. Build the
+    /// state once and share it between [`build_router`] (for the HTTP API) and
+    /// [`call_rpc`](Self::call_rpc) (for in-process calls) so both observe the
+    /// same cache and schema snapshot.
+    pub fn new(
+        cache: Arc<ArcSwap<SchemaCache>>,
+        config: Arc<Config>,
+        dialect: Arc<Dialect>,
+        backend: Arc<dyn Backend>,
+    ) -> Self {
+        let data_cache = if config.cache.enabled {
+            Some(Arc::new(DataCache::new(&config.cache)))
+        } else {
+            None
+        };
+
+        Self {
+            cache,
+            config,
+            dialect,
+            backend,
+            data_cache,
+            openapi_cache: Arc::new(std::sync::Mutex::new((0, None))),
+        }
+    }
+
+    /// Invoke a database function in-process through the full pgvis pipeline
+    /// (plan → render → role/GUC-applied execute), returning the raw
+    /// [`QueryResult`]. This is the programmatic equivalent of a
+    /// `POST /rpc/{function}` request — no HTTP round-trip, and unlike a direct
+    /// pool query it honours the auth/RLS context carried by `caller`.
+    ///
+    /// `args` is the function argument object (named arguments); pass
+    /// `serde_json::json!({})` for a no-argument function.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if planning fails (e.g. unknown function/schema) or the
+    /// backend execution fails.
+    pub async fn call_rpc(
+        &self,
+        schema: &str,
+        function: &str,
+        args: serde_json::Value,
+        caller: &CallerIdentity,
+    ) -> Result<QueryResult, Error> {
+        let cache = self.cache.load();
+
+        // Build the adapter-agnostic request for an RPC POST call. Mirrors the
+        // RPC shape produced by `build_api_request` on the HTTP path, minus the
+        // HTTP-only concerns (filters, ordering, range, preferences).
+        let api_request = ApiRequest {
+            schema: schema.to_string(),
+            target: function.to_string(),
+            method: RequestMethod::Post,
+            is_rpc: true,
+            select: vec![SelectItem::Star],
+            filters: Vec::new(),
+            order: Vec::new(),
+            range: None,
+            preferences: Preferences::default(),
+            body: Some(RequestBody::Single(args)),
+            on_conflict: None,
+            columns: None,
+            logic_filters: Vec::new(),
+            cursor: None,
+        };
+
+        let plan = plan_request(&api_request, &cache, &self.dialect, &self.config)?;
+
+        // Postgres: CTE-wrapped single-row JSON result. SQLite: raw SQL (the
+        // backend assembles JSON). Matches the dispatch_request branching.
+        let (sql, params) = if self.dialect.supports_set_local {
+            query::render(&plan, &self.dialect)?
+        } else {
+            query::render_inner(&plan, &self.dialect)?
+        };
+
+        // Build the execution context from the explicit caller identity rather
+        // than from parsed HTTP headers.
+        let exec_ctx = ExecContext {
+            role: caller.role.clone(),
+            claims: caller.claims.clone(),
+            pre_request: self.config.pre_request.clone(),
+            statement_timeout: self.config.statement_timeout_ms,
+            tx_end: None,
+            is_mutation: matches!(plan, ActionPlan::Mutate(_)),
+        };
+
+        self.backend.execute(&exec_ctx, &sql, &params).await
+    }
+
+    /// Call a scalar-returning function and deserialize its single value into `T`.
+    ///
+    /// Scalar and `RETURNS jsonb`/composite functions render as
+    /// `SELECT fn(...) AS result`, so the response body is `[{"result": <value>}]`.
+    /// This unwraps that to `<value>` before deserializing. Use it for functions
+    /// returning a scalar (e.g. `BIGINT`) or a single JSON object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] on call failure, or if the function produced no row or a
+    /// SQL `NULL` (use [`call_rpc`](Self::call_rpc) directly if `NULL` is valid).
+    pub async fn call_rpc_scalar<T: DeserializeOwned>(
+        &self,
+        schema: &str,
+        function: &str,
+        args: serde_json::Value,
+        caller: &CallerIdentity,
+    ) -> Result<T, Error> {
+        let result = self.call_rpc(schema, function, args, caller).await?;
+        let value = unwrap_scalar_body(result.body);
+        if value.is_null() {
+            return Err(Error::Internal(format!(
+                "rpc {schema}.{function} returned no scalar value"
+            )));
+        }
+        serde_json::from_value(value)
+            .map_err(|e| Error::Internal(format!("rpc {schema}.{function} deserialize: {e}")))
+    }
+
+    /// Call a set-returning function (`RETURNS TABLE(...)` / `SETOF`) and
+    /// deserialize each row into `T`. The body is a JSON array of row objects.
+    pub async fn call_rpc_rows<T: DeserializeOwned>(
+        &self,
+        schema: &str,
+        function: &str,
+        args: serde_json::Value,
+        caller: &CallerIdentity,
+    ) -> Result<Vec<T>, Error> {
+        let result = self.call_rpc(schema, function, args, caller).await?;
+        serde_json::from_value(result.body)
+            .map_err(|e| Error::Internal(format!("rpc {schema}.{function} rows deserialize: {e}")))
+    }
+}
+
+/// Unwrap a scalar/single-object RPC response body to its inner value.
+///
+/// Scalar functions render as `SELECT fn(...) AS result`, producing a body of
+/// `[{"result": <value>}]`. This returns `<value>`, tolerating the bare-object
+/// and bare-value shapes too. Returns `Value::Null` for an empty result.
+fn unwrap_scalar_body(body: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    let row = match body {
+        Value::Array(arr) => match arr.into_iter().next() {
+            Some(row) => row,
+            None => return Value::Null,
+        },
+        other => other,
+    };
+    match row {
+        Value::Object(mut obj) => obj.remove("result").unwrap_or(Value::Null),
+        other => other,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -83,22 +282,17 @@ pub fn build_app(
     dialect: Arc<Dialect>,
     backend: Arc<dyn Backend>,
 ) -> Router {
-    // Create data cache if enabled in config
-    let data_cache = if config.cache.enabled {
-        Some(Arc::new(DataCache::new(&config.cache)))
-    } else {
-        None
-    };
+    build_router(AppState::new(cache, config, dialect, backend))
+}
 
-    let state = AppState {
-        cache,
-        config: config.clone(),
-        dialect,
-        backend,
-        data_cache,
-    };
-
-    let routing = &config.routing;
+/// Build the axum Router from a pre-assembled [`AppState`].
+///
+/// Use this (instead of [`build_app`]) when you also need to keep the
+/// [`AppState`] for in-process [`call_rpc`](AppState::call_rpc) calls — build
+/// the state once via [`AppState::new`], clone it for the router, and retain a
+/// clone for RPC, so both share one data cache and schema snapshot.
+pub fn build_router(state: AppState) -> Router {
+    let routing = &state.config.routing;
     let prefix = routing.normalized_prefix();
 
     let mut router = Router::new();
@@ -332,11 +526,32 @@ async fn handle_root(State(state): State<AppState>, headers: HeaderMap) -> Respo
                 .into_response();
         }
 
-        // Generate OpenAPI spec
+        // Use cached OpenAPI spec, regenerating only when schema cache changes.
         let cache = state.cache.load();
+        let cache_ptr = Arc::as_ptr(&cache) as usize;
+
+        // Fast path: check if we already have a cached spec for this schema version.
+        let cached_val = {
+            let guard = state.openapi_cache.lock().unwrap();
+            if guard.0 == cache_ptr {
+                guard.1.clone()
+            } else {
+                None
+            }
+        };
+
+        if let Some(val) = cached_val {
+            return (StatusCode::OK, Json(val)).into_response();
+        }
+
+        // Slow path: generate and cache.
         let spec = openapi::generate_spec(&cache, &state.config);
         match serde_json::to_value(&spec) {
-            Ok(val) => (StatusCode::OK, Json(val)).into_response(),
+            Ok(val) => {
+                let mut guard = state.openapi_cache.lock().unwrap();
+                *guard = (cache_ptr, Some(val.clone()));
+                (StatusCode::OK, Json(val)).into_response()
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({

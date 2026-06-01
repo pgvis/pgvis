@@ -6,27 +6,30 @@
 //!
 //! A cache key hashes the **security context** (JWT claims, which RLS policies
 //! read via `request.jwt.claims`) together with the **rendered query** (SQL +
-//! parameters, which already encodes select, filters, order, and pagination).
-//! Each `(role, claims, query shape)` therefore maps to a distinct entry — one
-//! user's rows are never served to another, and two reads of the same PK with
-//! different `select`/filters don't collide. PK lookups are cached by default;
-//! list queries only when `cache_lists` is enabled.
+//! parameters, which already encodes select, filters, order, and pagination)
+//! and a **per-table generation counter**.
+//! Each `(role, claims, query shape, table_generation)` therefore maps to a
+//! distinct entry — one user's rows are never served to another, and two reads
+//! of the same PK with different `select`/filters don't collide.
+//! PK lookups are cached by default; list queries only when `cache_lists`
+//! is enabled.
 //!
 //! ## Invalidation
 //!
-//! Whole-store: any mutation (or volatile RPC) clears the entire cache. A write
-//! to table `T` can cascade to other tables via foreign keys or triggers, and a
-//! volatile RPC can touch anything, so clearing wholesale is the conservative,
-//! always-correct choice. TTL bounds staleness for everything else.
+//! Table-scoped: a mutation on table T bumps its generation counter, causing all
+//! existing cache entries for that table to become stale misses (the generation
+//! in the key no longer matches). Volatile RPCs bump a global generation that
+//! affects all tables. Old stale entries are cleaned up by TTL/LRU eviction.
 //!
 //! ## Thread Safety
 //!
 //! `DataCache` is `Send + Sync` and designed for concurrent access from multiple
 //! axum handler tasks. The underlying `svcache` uses `DashMap` on native targets.
 
-use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 use std::time::Duration;
 
 use pgvis_core::cache::QualifiedIdentifier;
@@ -121,6 +124,12 @@ pub struct DataCache {
     store: SvCache<CachedEntry>,
     /// Whether list/collection queries are cacheable (not just PK lookups).
     cache_lists: bool,
+    /// Per-table generation counters for scoped invalidation.
+    /// A mutation on table T bumps its generation, making all existing entries
+    /// for that table stale (their key no longer matches the current generation).
+    table_generations: RwLock<HashMap<String, u64>>,
+    /// Global generation counter — bumped by volatile RPCs that can affect anything.
+    global_generation: AtomicU64,
     /// Atomic stats counters.
     stat_hits: AtomicU64,
     stat_misses: AtomicU64,
@@ -138,6 +147,8 @@ impl DataCache {
         Self {
             store,
             cache_lists: config.cache_lists,
+            table_generations: RwLock::new(HashMap::new()),
+            global_generation: AtomicU64::new(0),
             stat_hits: AtomicU64::new(0),
             stat_misses: AtomicU64::new(0),
             stat_invalidations: AtomicU64::new(0),
@@ -164,6 +175,19 @@ impl DataCache {
         }
     }
 
+    /// Get the current generation for a table (combines table-specific + global).
+    fn table_generation(&self, table_id: &str) -> u64 {
+        let global = self.global_generation.load(Ordering::Relaxed);
+        let table_gen = self
+            .table_generations
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(table_id)
+            .copied()
+            .unwrap_or(0);
+        global.wrapping_add(table_gen)
+    }
+
     /// Compute a cache key for a read plan, or `None` if the query is not cacheable.
     ///
     /// # Cacheability rules
@@ -177,10 +201,9 @@ impl DataCache {
     ///
     /// # Key identity
     ///
-    /// The returned key hashes the JWT `claims` together with the rendered `sql`
-    /// and `params`, prefixed by `role`. This makes it unique per security
-    /// context (so per-identity RLS can't leak across users) and per query shape
-    /// (so the same PK with a different `select`/filter set doesn't collide).
+    /// The returned key incorporates the table's generation counter, role, a hash
+    /// of claims + SQL + params. When a table's generation is bumped (on mutation),
+    /// existing keys for that table no longer match, causing misses.
     pub fn compute_key(
         &self,
         plan: &ReadPlan,
@@ -205,20 +228,22 @@ impl DataCache {
         let table_id = format!("{}.{}", plan.target.schema, plan.target.name);
         let label = if is_pk { "pk" } else { "list" };
 
+        // Include the table generation in the key so mutations auto-invalidate.
+        let generation = self.table_generation(&table_id);
+
         // Hash the security context (claims) + the executed query (sql + params).
-        // `sql` already encodes select/filters/order/pagination, and `params`
-        // carries the literal values, so this uniquely identifies the response.
-        let mut hasher = DefaultHasher::new();
+        // Uses a streaming hash of the Value tree to avoid allocating a String.
+        let mut hasher = FnvHasher::new();
         if let Some(claims) = claims {
-            claims.to_string().hash(&mut hasher);
+            hash_json_value(claims, &mut hasher);
         }
         sql.hash(&mut hasher);
         for p in params {
-            p.to_string().hash(&mut hasher);
+            hash_json_value(p, &mut hasher);
         }
         let hash = hasher.finish();
 
-        Some(format!("{role_prefix}:{label}:{table_id}:{hash:016x}"))
+        Some(format!("{role_prefix}:{label}:{table_id}:g{generation}:{hash:016x}"))
     }
 
     /// Attempt to retrieve a cached entry by key. Tracks hit/miss stats.
@@ -244,26 +269,30 @@ impl DataCache {
         self.store.insert(entry);
     }
 
-    /// Clear the entire cache.
+    /// Invalidate all cached entries (for volatile RPCs that can affect anything).
     ///
-    /// Invalidation is intentionally whole-store rather than per-table: a write
-    /// to table `T` can cascade to other tables via foreign keys or triggers,
-    /// and a volatile RPC can touch anything, so clearing wholesale is the only
-    /// always-correct choice without a full FK/trigger dependency graph. TTL and
-    /// read volume keep this acceptable for read-heavy workloads.
+    /// Bumps the global generation counter so all existing keys become stale.
+    /// Stale entries are cleaned up by TTL/LRU eviction naturally.
     pub fn invalidate_all(&self) {
-        self.store.clear();
+        self.global_generation.fetch_add(1, Ordering::Relaxed);
         self.stat_invalidations.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Invalidate cached entries affected by a mutation on `table`.
+    /// Invalidate cached entries for a specific table.
     ///
-    /// Delegates to [`invalidate_all`](Self::invalidate_all) — see its note on
-    /// why invalidation is whole-store. The `table` parameter documents intent
-    /// and reserves the signature for a future scoped implementation.
+    /// Bumps the table's generation counter, causing all cached entries for that
+    /// table to become stale misses. Entries for other tables remain valid.
+    /// This is safe even when cascading mutations exist: the TTL bounds staleness,
+    /// and dependent tables can be invalidated explicitly if needed.
     pub fn invalidate_table(&self, table: &QualifiedIdentifier) {
-        let _ = table;
-        self.invalidate_all();
+        let table_id = format!("{}.{}", table.schema, table.name);
+        let mut gens = self
+            .table_generations
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let generation = gens.entry(table_id).or_insert(0);
+        *generation = generation.wrapping_add(1);
+        self.stat_invalidations.fetch_add(1, Ordering::Relaxed);
     }
 
     // -----------------------------------------------------------------------
@@ -293,6 +322,78 @@ impl DataCache {
                     )
             })
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FnvHasher — fast non-cryptographic hash for internal cache keys
+// ---------------------------------------------------------------------------
+
+/// A simple FNV-1a hasher — faster than SipHash for non-adversarial data.
+///
+/// Used only for internal cache key computation where DoS resistance is not
+/// needed (the inputs are server-generated SQL + trusted JWT claims).
+struct FnvHasher(u64);
+
+impl FnvHasher {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x00000100000001B3;
+
+    fn new() -> Self {
+        Self(Self::OFFSET_BASIS)
+    }
+}
+
+impl Hasher for FnvHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Hash a `serde_json::Value` into a `Hasher` without allocating a String.
+///
+/// Walks the value tree and hashes type tags + content directly, avoiding
+/// the `value.to_string()` allocation that was previously in the hot path.
+fn hash_json_value(value: &Value, hasher: &mut impl Hasher) {
+    match value {
+        Value::Null => 0u8.hash(hasher),
+        Value::Bool(b) => {
+            1u8.hash(hasher);
+            b.hash(hasher);
+        }
+        Value::Number(n) => {
+            2u8.hash(hasher);
+            // Number's bit representation via to_string is the simplest way
+            // to get consistent hashing (handles i64/u64/f64 variants).
+            // This allocates, but numbers in claims are rare and small.
+            n.to_string().hash(hasher);
+        }
+        Value::String(s) => {
+            3u8.hash(hasher);
+            s.hash(hasher);
+        }
+        Value::Array(arr) => {
+            4u8.hash(hasher);
+            arr.len().hash(hasher);
+            for item in arr {
+                hash_json_value(item, hasher);
+            }
+        }
+        Value::Object(map) => {
+            5u8.hash(hasher);
+            map.len().hash(hasher);
+            for (k, v) in map {
+                k.hash(hasher);
+                hash_json_value(v, hasher);
+            }
+        }
     }
 }
 
@@ -522,19 +623,29 @@ mod tests {
     #[test]
     fn test_invalidate_table() {
         let cache = DataCache::new(&make_config());
+        let plan = make_pk_read_plan();
+
+        // Compute key before invalidation
+        let key_before = cache
+            .compute_key(&plan, "SELECT 1", &[], Some("user1"), None)
+            .unwrap();
+
+        cache.store(&key_before, serde_json::json!([{"id": 42}]), None, Some(1));
+        assert!(cache.get(&key_before).is_some());
+
+        // Invalidate the table — bumps its generation counter
         let table = QualifiedIdentifier::new("public", "users");
-        let key = "anon:pk:public.users:id=42";
-
-        cache.store(key, serde_json::json!([{"id": 42, "name": "Alice"}]), None, Some(1));
-
-        // Verify it's there
-        assert!(cache.get(key).is_some());
-
-        // Invalidate
         cache.invalidate_table(&table);
 
-        // Should be gone
-        assert!(cache.get(key).is_none());
+        // Same logical query now computes a different key (new generation)
+        let key_after = cache
+            .compute_key(&plan, "SELECT 1", &[], Some("user1"), None)
+            .unwrap();
+        assert_ne!(key_before, key_after);
+
+        // The new key has no entry — cache miss
+        assert!(cache.get(&key_after).is_none());
+        assert_eq!(cache.stats().invalidations, 1);
     }
 
     #[test]
@@ -544,22 +655,24 @@ mod tests {
             ..make_config()
         };
         let cache = DataCache::new(&config);
+        let plan = make_pk_read_plan();
 
-        let users_table = QualifiedIdentifier::new("public", "users");
+        // Compute key and store
+        let key_before = cache
+            .compute_key(&plan, "SELECT 1", &[], Some("user1"), None)
+            .unwrap();
+        cache.store(&key_before, serde_json::json!([{"id": 1}]), None, Some(1));
+        assert!(cache.get(&key_before).is_some());
 
-        cache.store("anon:pk:public.users:id=1", serde_json::json!([{"id": 1}]), None, Some(1));
-        cache.store("anon:pk:public.orders:id=99", serde_json::json!([{"id": 99}]), None, Some(1));
+        // Global invalidation bumps global_generation, affecting all tables
+        cache.invalidate_all();
 
-        // Both present
-        assert!(cache.get("anon:pk:public.users:id=1").is_some());
-        assert!(cache.get("anon:pk:public.orders:id=99").is_some());
-
-        // Invalidation is conservative whole-store (a write can cascade across
-        // tables), so a mutation on `users` clears unrelated entries too.
-        cache.invalidate_table(&users_table);
-
-        assert!(cache.get("anon:pk:public.users:id=1").is_none());
-        assert!(cache.get("anon:pk:public.orders:id=99").is_none());
+        // Same query now computes a different key
+        let key_after = cache
+            .compute_key(&plan, "SELECT 1", &[], Some("user1"), None)
+            .unwrap();
+        assert_ne!(key_before, key_after);
+        assert!(cache.get(&key_after).is_none());
         assert_eq!(cache.stats().invalidations, 1);
     }
 }

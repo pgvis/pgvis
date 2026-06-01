@@ -154,6 +154,16 @@ pub struct SchemaCache {
     /// `MediaHandlerMap` populated by `mediaHandlers` SQL query.
     /// Postgres only — SQLite has no aggregate function discovery.
     pub media_handlers: HashMap<(String, String), MediaHandler>,
+
+    /// Pre-built index mapping each table to the indices of its relationships.
+    ///
+    /// Built by [`crate::cache_post_process::build_relationship_index`] after all
+    /// relationships (including inverse and M2M) have been added. Converts the
+    /// O(n) linear scan in `find_relationships` to O(1) lookup.
+    ///
+    /// Skipped during serialisation — rebuilt on cache load.
+    #[serde(skip)]
+    pub relationship_index: HashMap<QualifiedIdentifier, Vec<usize>>,
 }
 
 impl SchemaCache {
@@ -164,11 +174,14 @@ impl SchemaCache {
     }
 
     /// Find all relationships where `table` is either the source or target.
+    ///
+    /// Uses the pre-built `relationship_index` for O(1) lookup instead of
+    /// scanning all relationships. Returns an empty slice if no relationships exist.
     pub fn find_relationships(&self, table: &QualifiedIdentifier) -> Vec<&Relationship> {
-        self.relationships
-            .iter()
-            .filter(|r| r.source_table == *table || r.target_table == *table)
-            .collect()
+        match self.relationship_index.get(table) {
+            Some(indices) => indices.iter().map(|&i| &self.relationships[i]).collect(),
+            None => Vec::new(),
+        }
     }
 
     /// Find routines by name (across all schemas).

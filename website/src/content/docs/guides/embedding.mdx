@@ -169,6 +169,153 @@ axum::serve(listener, components.router).await?;
 | `dialect` | `Arc<Dialect>` | SQL dialect (Postgres/SQLite) |
 | `router` | `axum::Router` | The fully-wired REST + OpenAPI router |
 
+## Calling Functions (RPC) In-Process
+
+Beyond serving REST endpoints, pgvis lets you call database functions **directly from Rust** — no HTTP round-trip required. This is the programmatic equivalent of `POST /rpc/{function}`, but runs in-process through the same pipeline (plan → render → execute) with full Row-Level Security support.
+
+### Setup: Shared `AppState`
+
+To use in-process RPC alongside HTTP serving, construct an `AppState` once and share it between the router and your application code:
+
+```rust
+use pgvis_lib::Builder;
+use pgvis_lib::pgvis_router::{AppState, CallerIdentity, build_router};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let components = Builder::new("postgres://localhost/mydb")
+        .schemas(vec!["public"])
+        .build_components()
+        .await?;
+
+    // Build shared state — used by both the router and in-process calls
+    let state = AppState::new(
+        components.cache,
+        components.config,
+        components.dialect,
+        components.backend,
+    );
+
+    // Wire the HTTP router from the shared state
+    let router = build_router(state.clone());
+
+    // Spawn the HTTP server
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    tokio::spawn(async move { axum::serve(listener, router).await.ok(); });
+
+    // Call a function in-process (same pipeline, no HTTP)
+    let result = state
+        .call_rpc("public", "add", serde_json::json!({"a": 3, "b": 5}), &CallerIdentity::anonymous())
+        .await?;
+    println!("3 + 5 = {}", result.body); // 3 + 5 = [{"result":8}]
+
+    Ok(())
+}
+```
+
+> **`build_router(state)` vs `build_app(...)`** — Use `build_router` when you need to keep a reference to the `AppState` for in-process RPC. `build_app` is a convenience that constructs the state internally and returns only the router.
+
+### `call_rpc` — Raw Result
+
+```rust
+let result = state.call_rpc(
+    "public",           // schema
+    "search_items",     // function name
+    serde_json::json!({"query": "widget"}), // named arguments
+    &CallerIdentity::anonymous(),
+).await?;
+
+// result.body is a serde_json::Value (array for set-returning, object for scalar)
+let items: Vec<serde_json::Value> = serde_json::from_value(result.body)?;
+println!("Found {} items", items.len());
+```
+
+### `call_rpc_as<T>` — Typed Convenience
+
+Deserializes the result body directly into your struct:
+
+```rust
+#[derive(serde::Deserialize)]
+struct Item {
+    id: i64,
+    name: String,
+    price: f64,
+}
+
+// Set-returning function → Vec<Item>
+let items: Vec<Item> = state
+    .call_rpc_as("public", "get_items", serde_json::json!({}), &CallerIdentity::anonymous())
+    .await?;
+
+// Scalar function → Vec with one element containing "result" key
+#[derive(serde::Deserialize)]
+struct ScalarResult { result: i64 }
+
+let rows: Vec<ScalarResult> = state
+    .call_rpc_as("public", "add", serde_json::json!({"a": 10, "b": 20}), &CallerIdentity::anonymous())
+    .await?;
+assert_eq!(rows[0].result, 30);
+```
+
+### `CallerIdentity` — Row-Level Security
+
+`CallerIdentity` controls the database role and JWT claims applied inside the transaction, exactly as if the call came from an authenticated HTTP request:
+
+```rust
+use pgvis_lib::pgvis_router::CallerIdentity;
+
+// Anonymous — no role switch, no claims
+let anon = CallerIdentity::anonymous();
+
+// Role-only — SET LOCAL role = 'authenticated'
+let user = CallerIdentity::with_role("authenticated");
+
+// Full identity — role + JWT claims propagated as GUC
+let admin = CallerIdentity {
+    role: Some("admin".into()),
+    claims: Some(serde_json::json!({
+        "sub": "user-123",
+        "role": "admin",
+        "org_id": "org-456",
+    })),
+};
+
+// RLS policies using current_setting('request.jwt.claims') will see these claims
+let result = state
+    .call_rpc("public", "get_my_data", serde_json::json!({}), &admin)
+    .await?;
+```
+
+### API Reference
+
+| Method | Signature | Returns |
+|--------|-----------|---------|
+| `call_rpc` | `(&self, schema, function, args, caller) → Result<QueryResult, Error>` | Raw result with body, total_count, page_total |
+| `call_rpc_as<T>` | `(&self, schema, function, args, caller) → Result<T, Error>` | Deserialized `T` from the JSON body |
+
+| `CallerIdentity` | Description |
+|------------------|-------------|
+| `::anonymous()` | No role switch, no claims |
+| `::with_role("name")` | SET LOCAL role, no claims |
+| `{ role, claims }` | Full identity with GUC propagation |
+
+### Error Handling
+
+`call_rpc` returns `pgvis_core::error::Error`:
+
+```rust
+use pgvis_core::error::Error;
+
+match state.call_rpc("public", "nonexistent_fn", serde_json::json!({}), &CallerIdentity::anonymous()).await {
+    Ok(result) => { /* use result.body */ },
+    Err(Error::NotFound { .. }) => eprintln!("Function not found"),
+    Err(Error::DatabaseError(msg)) => eprintln!("DB error: {msg}"),
+    Err(e) => eprintln!("Other error: {e}"),
+}
+```
+
+---
+
 ## Composing with Your Own Routes
 
 Since pgvis returns a standard `axum::Router`, you can compose it with your own routes:

@@ -42,11 +42,13 @@ pub async fn load_schema_cache(
         routines: indexmap::IndexMap::new(), // SQLite has no stored functions
         representations: std::collections::HashMap::new(),
         media_handlers: std::collections::HashMap::new(),
+        relationship_index: std::collections::HashMap::new(),
     };
 
     // Post-processing: infer M2M relationships and mark FK columns
     pgvis_core::cache_post_process::infer_m2m_relationships(&mut cache);
     pgvis_core::cache_post_process::add_inverse_relationships(&mut cache);
+    pgvis_core::cache_post_process::build_relationship_index(&mut cache);
     pgvis_core::cache_post_process::mark_fk_columns(&mut cache);
 
     let table_count = cache.tables.len();

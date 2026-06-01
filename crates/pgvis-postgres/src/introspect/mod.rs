@@ -116,12 +116,14 @@ async fn run_introspection(client: &Client, cfg: &IntrospectConfig) -> Result<Sc
         routines,
         representations,
         media_handlers: std::collections::HashMap::new(), // TODO: mediaHandlers
+        relationship_index: std::collections::HashMap::new(),
     };
 
     // Post-processing order matches PostgREST: M2M inference first, then inverse rels.
     // In Haskell: `addInverseRels $ addM2MRels` — right-to-left application.
     cache_post_process::infer_m2m_relationships(&mut cache);
     cache_post_process::add_inverse_relationships(&mut cache);
+    cache_post_process::build_relationship_index(&mut cache);
     cache_post_process::mark_fk_columns(&mut cache);
 
     let table_count = cache.tables.len();

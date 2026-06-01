@@ -145,6 +145,23 @@ pub fn infer_m2m_relationships(cache: &mut SchemaCache) {
     cache.relationships.extend(m2m_rels);
 }
 
+/// Build the relationship index for O(1) lookup by table.
+///
+/// Maps each table identifier to the indices of all relationships where that
+/// table appears as either source or target. Must be called **after** all
+/// relationships have been finalised (after `infer_m2m_relationships` and
+/// `add_inverse_relationships`).
+pub fn build_relationship_index(cache: &mut SchemaCache) {
+    let mut index: HashMap<QualifiedIdentifier, Vec<usize>> = HashMap::new();
+
+    for (i, rel) in cache.relationships.iter().enumerate() {
+        index.entry(rel.source_table.clone()).or_default().push(i);
+        index.entry(rel.target_table.clone()).or_default().push(i);
+    }
+
+    cache.relationship_index = index;
+}
+
 /// Mark columns that participate in foreign keys.
 ///
 /// Sets `column.is_fk = true` for all columns that appear as source columns

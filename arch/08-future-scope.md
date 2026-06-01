@@ -13,28 +13,38 @@ honest map of the road ahead, grounded in the current code.
 | 0.4 | MCP over SSE | both | Hosted-agent transport |
 | 1.0 | stable API | both | Semver-pin `build_app` + `Config` + `Backend` |
 
-## The critical seam: query execution `[Closed for Postgres/REST]`
+## Closed seams (previously gaps, now implemented)
 
-This was 0.1's defining gap and is now **closed for Postgres**.
-`PgBackend::execute` ([lib.rs](../crates/pgvis-postgres/src/lib.rs)) calls
-`execute::execute_query`
-([execute.rs](../crates/pgvis-postgres/src/execute.rs)), which:
+These were previously listed as future work but are now fully operational:
 
-- binds `serde_json::Value` parameters via a `TextParam` `ToSql` wrapper
-  (text protocol; Postgres coerces by the inferred parameter type),
-- applies `ExecContext` (BEGIN, `SET LOCAL role`, `request.jwt.claims` +
-  per-claim GUCs, `statement_timeout`, `pre_request`, `tx_end`
-  COMMIT/ROLLBACK),
-- decodes the CTE result row into `QueryResult`
-  (`body`/`page_total`/`total_count`/`response_status`/`response_headers`).
-
-`pgvis-router` (REST) now runs the full `plan_request → render → execute` path
-and is covered by the integration suite in
-[crates/pgvis-server/tests](../crates/pgvis-server/tests). **Still open:**
-`pgvis-mcp` returns a *plan summary* because `pgvis-lib` builds `McpServer`
-without a backend, so MCP never reaches `render`/`execute`
-([04-surfaces.md](04-surfaces.md)); and JWT verification + threading claims
-into `ExecContext` is not yet wired on either surface.
+- **Query execution `[Closed]`** — `PgBackend::execute` and `SqliteBackend::execute`
+  both run the full plan→render→execute path with session setup (role, claims, GUCs,
+  timeout, pre_request, tx semantics).
+- **JWT/Auth enforcement `[Closed]`** — `verify_jwt()` in
+  [routing.rs](../crates/pgvis-router/src/routing.rs) decodes the JWT, extracts
+  role + claims, and threads them into `ExecContext` via `build_exec_context()`.
+  Both REST and MCP (via `CallerIdentity`) apply role switching.
+- **Logic-tree query parsing `[Closed]`** — `and=`/`or=`/`not.and=`/`not.or=`
+  parameters are parsed by `parse_logic_filters_from_params` in routing.rs and
+  passed through to the planner and SQL builder.
+- **MCP execution `[Closed]`** — `McpServer` holds `Arc<dyn Backend>` and
+  `handle_tool_call` renders SQL, executes, and returns real rows.
+- **MCP select/order `[Closed]`** — `parse_mcp_order()` and select-string parsing
+  are implemented in [tools.rs](../crates/pgvis-mcp/src/tools.rs).
+- **Exact count `[Closed]`** — A separate `render_read_count_source` CTE counts
+  all matching rows pre-LIMIT when `Prefer: count=exact` is set.
+- **M2M embedding SQL `[Closed]`** — Junction-table two-hop joins are fully
+  emitted in [read.rs](../crates/pgvis-core/src/query/read.rs).
+- **SQLite backend `[Closed]`** — `pgvis-sqlite` provides full `Backend`
+  implementation (introspection + execution).
+- **Read replica support `[Closed]`** — `PgReplicaBackend` in
+  [replica.rs](../crates/pgvis-postgres/src/replica.rs) distributes reads with
+  lag-aware round-robin and primary fallback.
+- **Config layering `[Closed]`** — `load_config` in
+  [main.rs](../crates/pgvis-server/src/main.rs) uses figment with
+  TOML file + `PGVIS_*` env vars + CLI flag overrides.
+- **Data cache `[Closed]`** — Table-scoped generation-based invalidation with
+  FNV-1a streaming hash for cache keys. See [09-data-cache.md](09-data-cache.md).
 
 ## Core engine gaps
 
@@ -43,21 +53,14 @@ into `ExecContext` is not yet wired on either surface.
   routine under a name. PostgreSQL allows overloading; a scoring algorithm over
   `Routine.params` vs supplied argument names/types is needed
   (`PGRST203 AmbiguousFunction` already exists for the unresolved case).
-- **Logic-tree query parsing in adapters.** `parse_logic_tree` exists in core
-  ([query_params/logic.rs](../crates/pgvis-core/src/query_params/logic.rs)) but
-  the REST `build_api_request` leaves `logic_filters` empty and MCP likewise —
-  `and=`/`or=` query parameters are not yet wired through the adapters.
-- **Relation ordering / select-string in MCP.** REST drops `order` relation
-  terms; MCP's `select` argument is stubbed to `Star`
-  ([tools.rs](../crates/pgvis-mcp/src/tools.rs)).
-- **Exact count.** `wrap_cte`
-  ([query/cte.rs](../crates/pgvis-core/src/query/cte.rs)) reuses the page count
-  as `total_count`; a true pre-LIMIT exact count needs a separate counting CTE.
-  `planned`/`estimated` need `EXPLAIN` parsing (Postgres).
-- **Embedding SQL breadth.** `Direct`/`Junction`/`Computed` joins are modelled in
-  the plan; full SQL emission for M2M two-hop and computed-relationship
-  subqueries in [query/read.rs](../crates/pgvis-core/src/query/read.rs) is still
-  being filled in.
+- **`planned`/`estimated` count.** Exact count is implemented, but
+  `Prefer: count=planned` and `count=estimated` need `EXPLAIN` parsing
+  (Postgres-only) to extract the planner's row estimate without a full count.
+- **Computed relationship embedding.** `ResolvedJoin::Computed` exists in the plan
+  layer but the SQL builder emits a placeholder (`TRUE /* computed via fn */`).
+  Requires subquery wrapping: `LATERAL (SELECT fn(parent.*)) AS alias`.
+- **Relation-scoped ordering.** REST `order` does not yet support
+  `order=embed.column.asc` for ordering the parent by a child relation aggregate.
 
 ## Introspection gaps
 
@@ -79,33 +82,31 @@ Some fields are still populated empty
 
 ## Backend and surface gaps
 
-- **Read replica support. `[Closed]`** `PgReplicaBackend`
-  ([replica.rs](../crates/pgvis-postgres/src/replica.rs)) distributes reads
-  across replicas with lag-aware round-robin, falling back to primary when all
-  replicas are unhealthy. Configuration via `Config.replica` (`replica_dsns`,
-  `max_replication_lag_bytes`, `health_check_interval_ms`, `primary_reads`).
-  Failover is delegated to external tools; `deadpool` handles reconnection
-  transparently.
 - **`LISTEN/NOTIFY` hot reload.** `PgBackend::watch_schema` returns `None`; the
   reload pipeline ([05-schema-cache.md](05-schema-cache.md)) needs the push
   signal on a dedicated connection with reconnect/backoff.
-- **SQLite backend. `[Closed]`** The `pgvis-sqlite` crate now provides
-  `SqliteBackend` implementing `Backend` (introspection + execution). DSN
-  detection in `pgvis-lib` auto-selects it for `sqlite:` URIs or `.db`/`.sqlite3`
-  file paths.
-- **MCP execution. `[Closed]`** `McpServer` now holds an `Arc<dyn Backend>` and
-  `handle_tool_call` renders SQL, calls `backend.execute()`, and returns real
-  rows (or error) as MCP tool results.
-- **`pgvis-server` config layering.** `serve`/`mcp`/`openapi`/`inspect` are
-  wired through `pgvis-lib`, but `load_config` still returns `Config::default()`
-  — figment TOML/`PGVIS_*` layering is stubbed
-  ([pgvis-server/src/main.rs](../crates/pgvis-server/src/main.rs)).
 - **OpenAPI richness.** Request/response JSON Schemas, per-column filter
   parameters, RPC bodies, and `openapi_mode = FollowPrivileges` filtering remain
   ([openapi.rs](../crates/pgvis-router/src/openapi.rs)).
-- **Auth enforcement.** `Config` carries JWT/role settings; the execute path
-  already applies `ExecContext.role`/`claims`, but verifying the JWT and
-  populating those fields from it is not yet wired (REST passes `claims: None`).
+- **MCP over SSE transport.** The MCP server currently runs only over stdio;
+  an SSE/WebSocket transport for hosted deployments is planned.
+
+## Performance — remaining opportunities
+
+These are lower-priority items from the [performance audit](../plans/performance-audit.md)
+that were not implemented:
+
+- **Pass-through JSON bytes.** For simple reads without GUC overrides or singular
+  unwrap, skip `serde_json::Value` deserialization and pass raw Postgres wire
+  bytes directly to the HTTP response body. This eliminates the double
+  serialize/deserialize in the response path (largest potential throughput win,
+  highest effort).
+- **SQL builder string allocations.** `quote_ident` and `format!` calls allocate
+  ~50-100 small `String`s per complex query. An append-to-buffer API would
+  reduce this but requires significant API changes.
+- **HashMap query parameters.** `Query<HashMap<String, String>>` allocates
+  per-parameter. A zero-copy extractor borrowing from the URI would eliminate
+  these, but fights axum's extraction model.
 
 ## Extensibility notes
 
@@ -127,9 +128,8 @@ Some fields are still populated empty
 
 ## Verification path as features land
 
-The intended end-to-end check once the execute seam closes: run the `pgvis`
-binary against a known schema and exercise it with PostgREST's own
-HTTP-level expectations, asserting parity on query DSL, `Prefer` semantics, and
-`PGRST*` error codes. The parser, plan layer, and SQL builder remain
-independently testable without a database
+The intended end-to-end check: run the `pgvis` binary against a known schema and
+exercise it with PostgREST's own HTTP-level expectations, asserting parity on
+query DSL, `Prefer` semantics, and `PGRST*` error codes. The parser, plan layer,
+and SQL builder remain independently testable without a database
 ([02-core-pipeline.md](02-core-pipeline.md)).

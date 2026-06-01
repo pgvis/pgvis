@@ -14,7 +14,7 @@ flowchart LR
     START[startup or reload] --> INTRO["Backend::introspect&#40;cfg&#41;"]
     INTRO --> CAT[(database catalog)]
     CAT --> ASM[assemble SchemaCache]
-    ASM --> PP[post-process:<br/>M2M + inverse rels + FK marking]
+    ASM --> PP[post-process:<br/>M2M + inverse rels + FK marking + relationship index]
     PP --> SWAP["ArcSwap&lt;SchemaCache&gt;.store"]
     SWAP --> USE[plan layer, routes, OpenAPI, MCP tools<br/>read latest snapshot per request]
     NOTIFY[schema change signal] --> START
@@ -34,6 +34,7 @@ Postgres (`int4`, `jsonb`) and SQLite (`INTEGER`, `TEXT`).
 flowchart TD
     SCC[SchemaCache] --> T["tables: IndexMap&lt;QualifiedIdentifier, Table&gt;"]
     SCC --> R["relationships: Vec&lt;Relationship&gt;"]
+    SCC --> RI["relationship_index: HashMap&lt;QI, Vec&lt;usize&gt;&gt;"]
     SCC --> CR["computed_relationships: Vec&lt;ComputedRelationship&gt;"]
     SCC --> RT["routines: IndexMap&lt;QI, Vec&lt;Routine&gt;&gt;"]
     SCC --> RP["representations: map (DataRepresentation)"]
@@ -41,6 +42,7 @@ flowchart TD
     T --> C["columns: IndexMap&lt;String, Column&gt;"]
     T --> UC["unique_constraints: Vec&lt;UniqueConstraint&gt;"]
     R --> CARD{Cardinality:<br/>M2O / O2M / O2O / M2M}
+    RI -.->|"O(1) lookup into"| R
     RT --> RPm[params + return_type + volatility]
 ```
 
@@ -59,10 +61,10 @@ flowchart TD
 | `MediaHandler` | custom `Accept` type → aggregate fn | **`[Planned]` data only** — Postgres-only; TODO |
 
 `SchemaCache` exposes lookup helpers used by the planner: `find_table`,
-`find_relationships` (all edges touching a table — direction filtering happens in
-the planner), and `find_routines` (returns *all* overloads under a name; the
-planner narrows by arguments — see the overload TODO in
-[02-core-pipeline.md](02-core-pipeline.md)).
+`find_relationships` (O(1) HashMap lookup via the pre-built `relationship_index`
+— direction filtering happens in the planner), and `find_routines` (returns *all*
+overloads under a name; the planner narrows by arguments — see the overload TODO
+in [02-core-pipeline.md](02-core-pipeline.md)).
 
 `Column` and `Table` carry rich metadata specifically so the SQL builder and
 OpenAPI generator never need to re-introspect: e.g. `is_generated` excludes a
@@ -92,16 +94,19 @@ Query modules:
 
 ### Post-processing
 
-After the raw queries, three passes run in an order that mirrors PostgREST's
-(`addInverseRels $ addM2MRels`), in
-[post_process.rs](../crates/pgvis-postgres/src/introspect/post_process.rs):
+After the raw queries, four passes run in
+[cache_post_process.rs](../crates/pgvis-core/src/cache_post_process.rs):
 
 1. `infer_m2m_relationships` — detect junction tables (a table whose PK columns
    are a superset of its FK columns to two other tables) and synthesize `M2M`
    relationships.
 2. `add_inverse_relationships` — for every discovered M2O, add the reverse O2M
    edge so embedding works in both directions.
-3. `mark_fk_columns` — set `Column.is_fk` for columns participating in any FK.
+3. `build_relationship_index` — build a `HashMap<QualifiedIdentifier, Vec<usize>>`
+   mapping each table to the indices of its relationships in the `relationships`
+   vec. This gives `find_relationships()` O(1) lookup instead of scanning the
+   entire relationships list.
+4. `mark_fk_columns` — set `Column.is_fk` for columns participating in any FK.
 
 `[Planned]` introspection gaps (the fields exist on the types but are populated
 empty today): computed relationships (`allComputedRels`), media handlers,
