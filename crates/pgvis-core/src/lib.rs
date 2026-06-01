@@ -64,7 +64,7 @@ pub use cache::{
     QualifiedIdentifier, Relationship, Routine, RoutineParam, SchemaCache, Table, UniqueConstraint,
     Volatility,
 };
-pub use config::{Config, RoutingConfig};
+pub use config::{CacheConfig, Config, RoutingConfig};
 pub use dialect::{Dialect, POSTGRES, Placeholder, SQLITE};
 pub use error::{Error, ErrorCode};
 pub use plan::{

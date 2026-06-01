@@ -63,12 +63,17 @@ HTTP Request (axum handler)
     │    ├─ Parameterized ($1, $2, ...) — never string interpolation
     │    └─ → (sql: String, params: Vec<Value>)
     │
+    ├─ Data cache lookup (reads only, when enabled)
+    │    ├─ Hit → serve cached QueryResult, skip Backend::execute
+    │    └─ Miss → continue (store after execution)
+    │
     ├─ Backend::execute(ExecContext, sql, params)
     │    ├─ SET LOCAL role (JWT role)
     │    ├─ SET LOCAL statement_timeout
     │    ├─ Run pre_request hook
     │    ├─ Execute query
     │    └─ → QueryResult { body, total_count }
+    │    (read → store in cache; write → clear cache)
     │
     └─ format_response(QueryResult, preferences)
          ├─ JSON body
@@ -200,3 +205,4 @@ For the detailed architecture documents, see the [`arch/`](https://github.com/pg
 - [06 — Errors and Config](https://github.com/pgvis/pgvis/blob/main/arch/06-errors-and-config.md)
 - [07 — Design Decisions](https://github.com/pgvis/pgvis/blob/main/arch/07-design-decisions.md)
 - [08 — Future Scope](https://github.com/pgvis/pgvis/blob/main/arch/08-future-scope.md)
+- [09 — Data Cache](https://github.com/pgvis/pgvis/blob/main/arch/09-data-cache.md)

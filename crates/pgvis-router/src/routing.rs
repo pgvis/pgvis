@@ -20,7 +20,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use pgvis_core::backend::{Backend, ExecContext, TxEnd};
+use pgvis_core::backend::{Backend, ExecContext, QueryResult, TxEnd};
 use pgvis_core::config::OpenApiMode;
 use pgvis_core::plan::{ActionPlan, ApiRequest, RequestBody, RequestMethod, plan_request};
 use pgvis_core::preferences::{PreferTx, Preferences};
@@ -29,6 +29,7 @@ use pgvis_core::query_params::{self, CursorSpec, LogicTree, OrderItem};
 use pgvis_core::select_ast::SelectItem;
 use pgvis_core::{Config, Dialect, SchemaCache};
 
+use crate::data_cache::DataCache;
 use crate::openapi;
 use crate::response;
 
@@ -51,6 +52,8 @@ pub struct AppState {
     pub dialect: Arc<Dialect>,
     /// The database backend for query execution.
     pub backend: Arc<dyn Backend>,
+    /// In-memory data cache for read responses (None when caching is disabled).
+    pub data_cache: Option<Arc<DataCache>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -80,11 +83,19 @@ pub fn build_app(
     dialect: Arc<Dialect>,
     backend: Arc<dyn Backend>,
 ) -> Router {
+    // Create data cache if enabled in config
+    let data_cache = if config.cache.enabled {
+        Some(Arc::new(DataCache::new(&config.cache)))
+    } else {
+        None
+    };
+
     let state = AppState {
         cache,
         config: config.clone(),
         dialect,
         backend,
+        data_cache,
     };
 
     let routing = &config.routing;
@@ -171,6 +182,9 @@ pub fn build_app(
                 .route(&root_path, get(handle_root));
         }
     }
+
+    // Admin/diagnostic endpoint: cache stats and settings
+    router = router.route("/pgvis/cache", get(handle_cache_info));
 
     router.with_state(state)
 }
@@ -341,6 +355,28 @@ async fn handle_root(State(state): State<AppState>, headers: HeaderMap) -> Respo
     }
 }
 
+/// Cache info endpoint — returns cache stats and current settings.
+///
+/// `GET /pgvis/cache` → JSON with stats (hits, misses, hit_rate, entries, invalidations)
+/// and current settings (enabled, ttl_seconds, max_entries, cache_lists).
+async fn handle_cache_info(State(state): State<AppState>) -> Response {
+    let settings = serde_json::json!({
+        "enabled": state.config.cache.enabled,
+        "ttl_seconds": state.config.cache.ttl_seconds,
+        "max_entries": state.config.cache.max_entries,
+        "cache_lists": state.config.cache.cache_lists,
+    });
+
+    let stats = state.data_cache.as_ref().map(|dc| dc.stats());
+
+    let body = serde_json::json!({
+        "settings": settings,
+        "stats": stats,
+    });
+
+    (StatusCode::OK, Json(body)).into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Core dispatch logic — the full pipeline
 // ---------------------------------------------------------------------------
@@ -423,11 +459,94 @@ async fn dispatch_request(
     let is_mutation = matches!(&plan, ActionPlan::Mutate(_));
     let exec_ctx = build_exec_context(&state.config, &auth, &preferences, is_mutation);
 
+    // 4b. Data cache: compute key and check for cache hit (reads only)
+    let cache_key = if let ActionPlan::Read(ref read_plan) = plan {
+        state.data_cache.as_ref().and_then(|dc| {
+            dc.compute_key(
+                read_plan,
+                &sql,
+                &params_vec,
+                auth.role.as_deref(),
+                auth.claims.as_ref(),
+            )
+        })
+    } else {
+        None
+    };
+
+    // Try cache hit — if found, skip backend execution entirely
+    if let Some(ref key) = cache_key {
+        if let Some(dc) = &state.data_cache {
+            if let Some(cached) = dc.get(key) {
+                tracing::debug!(cache_key = %key, "data cache hit");
+
+                let cached_result = QueryResult {
+                    body: cached.body,
+                    total_count: cached.total_count,
+                    page_total: cached.page_total,
+                    response_status: None,
+                    response_headers: None,
+                    was_insert: None,
+                };
+
+                let cursor_column = if let ActionPlan::Read(ref read_plan) = plan {
+                    read_plan.range.cursor_column.clone()
+                } else {
+                    None
+                };
+
+                let is_singular = headers
+                    .get("accept")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.contains("application/vnd.pgrst.object"))
+                    .unwrap_or(false);
+
+                let request_offset =
+                    params.get("offset").and_then(|s| s.parse::<u64>().ok());
+
+                return response::format_response(
+                    &cached_result,
+                    &method,
+                    &preferences,
+                    is_singular,
+                    request_offset,
+                    cursor_column.as_deref(),
+                );
+            }
+        }
+    }
+
     // 5. Execute via backend
     let result = match state.backend.execute(&exec_ctx, &sql, &params_vec).await {
         Ok(result) => result,
         Err(err) => return response::format_error(&err),
     };
+
+    // 5b. Data cache: store result on cache miss. `cache_key` is `Some` only for
+    // cacheable reads, so no need to re-match the plan here.
+    if let (Some(key), Some(dc)) = (&cache_key, &state.data_cache) {
+        dc.store(key, result.body.clone(), result.total_count, result.page_total);
+        tracing::debug!(cache_key = %key, "data cache store");
+    }
+
+    // 5c. Data cache: invalidate on writes. Mutations target a known table;
+    // volatile RPCs can modify anything, so they clear the whole cache.
+    if let Some(dc) = &state.data_cache {
+        match &plan {
+            ActionPlan::Mutate(mutate_plan) => {
+                dc.invalidate_table(&mutate_plan.target);
+                tracing::debug!(table = %mutate_plan.target, "data cache invalidated for table");
+            }
+            ActionPlan::Call(call_plan)
+                if call_plan.function_info.volatility
+                    == pgvis_core::cache::Volatility::Volatile =>
+            {
+                dc.invalidate_all();
+                tracing::debug!(function = %call_plan.function, "data cache invalidated (volatile RPC)");
+            }
+            _ => {}
+        }
+    }
 
     // 6. Extract cursor column from the plan (for X-Next-Cursor header)
     let cursor_column = match &plan {

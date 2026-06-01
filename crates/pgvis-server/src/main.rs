@@ -43,6 +43,22 @@ enum Cmd {
         /// Enables lag-aware read routing across replicas.
         #[arg(long, env = "PGVIS_REPLICA_DSNS", value_delimiter = ',')]
         replica_dsn: Vec<String>,
+
+        /// Enable the in-memory data cache for read queries.
+        #[arg(long, env = "PGVIS_CACHE_ENABLED")]
+        cache_enabled: bool,
+
+        /// Cache TTL in seconds (how long entries live before expiring).
+        #[arg(long, env = "PGVIS_CACHE_TTL")]
+        cache_ttl: Option<u64>,
+
+        /// Maximum number of entries the cache can hold.
+        #[arg(long, env = "PGVIS_CACHE_MAX_ENTRIES")]
+        cache_max_entries: Option<u64>,
+
+        /// Also cache list/collection queries (not just primary key lookups).
+        #[arg(long, env = "PGVIS_CACHE_LISTS")]
+        cache_lists: bool,
     },
     /// Run MCP server over stdio (for Claude Desktop / agent integrations).
     #[cfg(feature = "mcp")]
@@ -89,12 +105,20 @@ async fn main() -> anyhow::Result<()> {
         schema: vec![],
         mcp_http: false,
         replica_dsn: vec![],
+        cache_enabled: false,
+        cache_ttl: None,
+        cache_max_entries: None,
+        cache_lists: false,
     }) {
         Cmd::Serve {
             bind,
             schema,
             mcp_http,
             replica_dsn,
+            cache_enabled,
+            cache_ttl,
+            cache_max_entries,
+            cache_lists,
         } => {
             // Override schemas from CLI if provided
             if !schema.is_empty() {
@@ -104,6 +128,20 @@ async fn main() -> anyhow::Result<()> {
             // Override replica DSNs from CLI if provided
             if !replica_dsn.is_empty() {
                 config.replica.replica_dsns = replica_dsn;
+            }
+
+            // Override cache settings from CLI if provided
+            if cache_enabled {
+                config.cache.enabled = true;
+            }
+            if let Some(ttl) = cache_ttl {
+                config.cache.ttl_seconds = ttl;
+            }
+            if let Some(max) = cache_max_entries {
+                config.cache.max_entries = max;
+            }
+            if cache_lists {
+                config.cache.cache_lists = true;
             }
 
             tracing::info!(

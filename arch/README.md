@@ -103,6 +103,7 @@ Each subsystem section in these docs carries one of:
 | OpenAPI generation | `[In progress]` | paths/operations emitted; schemas/parameters minimal |
 | MCP tools/resources | `[In progress]` | tools + dispatch + discovery wired, but no backend is passed to `McpServer`, so a tool call still returns a plan summary ([tools.rs](../crates/pgvis-mcp/src/tools.rs) TODO) |
 | SQLite backend | `[Planned]` | `SQLITE` dialect defined; no driver crate yet |
+| Data cache | `[Implemented]` | opt-in in-memory read cache; PK lookups cached by default, lists opt-in; keyed by role + claims + rendered query; whole-store invalidation on any write + TTL. See [09-data-cache.md](09-data-cache.md) |
 
 ## Table of contents
 
@@ -114,3 +115,4 @@ Each subsystem section in these docs carries one of:
 6. [Errors, configuration, preferences](06-errors-and-config.md)
 7. [Design decisions](07-design-decisions.md)
 8. [Future scope and known gaps](08-future-scope.md)
+9. [Data cache — in-memory read caching](09-data-cache.md)

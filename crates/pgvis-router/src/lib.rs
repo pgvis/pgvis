@@ -5,41 +5,46 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use std::sync::Arc;
 //! use arc_swap::ArcSwap;
-//! use pgvis_core::{Config, SchemaCache, dialect::POSTGRES};
+//! use pgvis_core::{Backend, Config, SchemaCache, dialect::POSTGRES};
 //! use pgvis_router::build_app;
 //!
 //! let cache = Arc::new(ArcSwap::new(Arc::new(SchemaCache::default())));
 //! let config = Arc::new(Config::default());
 //! let dialect = Arc::new(POSTGRES.clone());
+//! let backend: Arc<dyn Backend> = /* your backend here */;
 //!
-//! let app = build_app(cache, config, dialect);
+//! let app = build_app(cache, config, dialect, backend);
 //! // app is ready to serve with axum::serve(...)
 //! ```
 //!
 //! ## Embedding in an existing app
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use axum::Router;
 //! use axum::routing::get;
-//! # use std::sync::Arc;
-//! # use arc_swap::ArcSwap;
-//! # use pgvis_core::{Config, SchemaCache, dialect::POSTGRES};
-//! # use pgvis_router::build_app;
-//! # let cache = Arc::new(ArcSwap::new(Arc::new(SchemaCache::default())));
-//! # let config = Arc::new(Config::default());
-//! # let dialect = Arc::new(POSTGRES.clone());
+//! use std::sync::Arc;
+//! use arc_swap::ArcSwap;
+//! use pgvis_core::{Backend, Config, SchemaCache, dialect::POSTGRES};
+//! use pgvis_router::build_app;
 //!
-//! let pgvis_api = build_app(cache, config, dialect);
+//! let cache = Arc::new(ArcSwap::new(Arc::new(SchemaCache::default())));
+//! let config = Arc::new(Config::default());
+//! let dialect = Arc::new(POSTGRES.clone());
+//! let backend: Arc<dyn Backend> = /* your backend here */;
+//!
+//! let pgvis_api = build_app(cache, config, dialect, backend);
 //! let my_app = Router::new()
 //!     .nest("/db", pgvis_api)
 //!     .route("/health", get(|| async { "ok" }));
 //! ```
 
+pub mod data_cache;
 pub mod openapi;
 pub mod response;
 pub mod routing;
 
+pub use data_cache::{CacheStats, DataCache};
 pub use routing::{AppState, build_app};

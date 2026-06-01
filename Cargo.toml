@@ -68,6 +68,9 @@ anyhow = "1"
 futures = "0.3"
 bytes = "1"
 
+# caching
+svcache = "0.1"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

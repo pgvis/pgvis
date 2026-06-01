@@ -325,6 +325,14 @@ pub struct Config {
     /// across them using lag-aware round-robin.
     #[serde(default)]
     pub replica: ReplicaConfig,
+
+    // --- Data Cache ---
+    /// In-memory response cache for read queries.
+    ///
+    /// When enabled, caches responses for PK lookups (and optionally list queries)
+    /// with a configurable TTL. Auto-invalidates on mutations to the same table.
+    #[serde(default)]
+    pub cache: CacheConfig,
 }
 
 impl Default for Config {
@@ -350,6 +358,7 @@ impl Default for Config {
             openapi_mode: OpenApiMode::default(),
             routing: RoutingConfig::default(),
             replica: ReplicaConfig::default(),
+            cache: CacheConfig::default(),
         }
     }
 }
@@ -698,4 +707,90 @@ fn default_health_check_interval_ms() -> u64 {
 
 fn default_primary_reads() -> bool {
     true
+}
+
+fn default_cache_ttl_seconds() -> u64 {
+    60 // 1 minute
+}
+
+fn default_cache_max_entries() -> u64 {
+    10_000
+}
+
+// ---------------------------------------------------------------------------
+// Data Cache Configuration
+// ---------------------------------------------------------------------------
+
+/// In-memory response cache configuration for read queries.
+///
+/// When enabled, pgvis caches responses for primary-key lookups (and optionally
+/// list/collection queries) with a configurable TTL. Cache entries are automatically
+/// invalidated when any mutation (INSERT/UPDATE/DELETE) targets the same table.
+///
+/// ## Example (TOML)
+///
+/// ```toml
+/// [cache]
+/// enabled = true
+/// ttl_seconds = 60
+/// max_entries = 10000
+/// cache_lists = true
+/// ```
+///
+/// ## Interaction with Embedded Library
+///
+/// The cache is created internally by the router's `build_app()` when `enabled = true`.
+/// No extra setup is required by `pgvis-lib` consumers — just pass `CacheConfig` in `Config`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheConfig {
+    /// Whether response caching is enabled.
+    ///
+    /// When `false` (default), no caching occurs and no memory is allocated.
+    /// When `true`, an in-memory cache is created with the configured capacity/TTL.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Time-to-live in seconds for cached entries.
+    ///
+    /// After this duration, cached entries expire and the next read re-queries
+    /// the database. A lower TTL gives fresher data; a higher TTL reduces DB load.
+    ///
+    /// Default: 60 seconds.
+    #[serde(default = "default_cache_ttl_seconds")]
+    pub ttl_seconds: u64,
+
+    /// Maximum number of entries the cache can hold.
+    ///
+    /// When the cache is full, least-recently-used entries are evicted.
+    /// Set this based on expected working set size.
+    ///
+    /// Default: 10000.
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: u64,
+
+    /// Whether to cache list/collection queries (not just PK lookups).
+    ///
+    /// PK lookups are safe to cache because the cache key is deterministic
+    /// (table + PK values). List queries use a SQL+params hash as the key,
+    /// which means different filter/order/pagination combos get distinct entries.
+    ///
+    /// Disabled by default because:
+    /// - List queries can have many variations (high cardinality → low hit rate)
+    /// - Invalidation is coarse (any mutation clears ALL list entries for the table)
+    /// - List responses can be large (memory pressure)
+    ///
+    /// Default: false (PK-only caching).
+    #[serde(default)]
+    pub cache_lists: bool,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl_seconds: default_cache_ttl_seconds(),
+            max_entries: default_cache_max_entries(),
+            cache_lists: false,
+        }
+    }
 }
