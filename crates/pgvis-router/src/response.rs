@@ -18,6 +18,20 @@ use pgvis_core::plan::types::RequestMethod;
 use pgvis_core::preferences::{PreferReturn, Preferences};
 use serde_json::Value;
 
+/// Mutation-specific context for response formatting.
+///
+/// Threaded from the plan (not from the dead `QueryResult.was_insert` field) so
+/// the formatter can pick 201 vs 200/204 and emit a `Location` header.
+#[derive(Debug, Clone, Default)]
+pub struct MutationInfo {
+    /// True when this response is for an `INSERT` (POST on a table).
+    pub was_insert: bool,
+    /// Primary-key column names of the target table (for the `Location` header).
+    pub primary_key_columns: Vec<String>,
+    /// The request path of the target table (for building the `Location` header).
+    pub table_path: Option<String>,
+}
+
 /// Format a [`QueryResult`] into an HTTP response.
 ///
 /// This handles:
@@ -33,11 +47,26 @@ pub fn format_response(
     is_singular: bool,
     request_offset: Option<u64>,
     cursor_column: Option<&str>,
+    mutation: Option<&MutationInfo>,
 ) -> Response {
     let mut headers = HeaderMap::new();
 
+    // Whether the client asked to receive the mutated rows back.
+    let return_representation = preferences.return_repr == Some(PreferReturn::Representation);
+
     // Determine base status code
-    let mut status = determine_status(result, method);
+    let mut status = determine_status(method, mutation);
+
+    // Location header for a single-row INSERT with a primary key.
+    if let Some(m) = mutation {
+        if m.was_insert {
+            if let Some(loc) = build_location_header(&result.body, m) {
+                if let Ok(val) = HeaderValue::from_str(&loc) {
+                    headers.insert("location", val);
+                }
+            }
+        }
+    }
 
     // Content-Range header
     let content_range = build_content_range(result, request_offset);
@@ -54,11 +83,15 @@ pub fn format_response(
         }
     }
 
-    // If partial content (has pagination), set 206
+    // If partial content (this page does not cover the full set), set 206.
+    // The returned range is `[offset, offset + page)`; it's partial only when
+    // there are rows beyond this page (`offset + page < total`). Reaching the
+    // end (last/only page) stays 200. Matches PostgREST Content-Range semantics.
     if result.page_total.is_some() && result.total_count.is_some() {
-        let page = result.page_total.unwrap_or(0);
+        let page = result.page_total.unwrap_or(0) as i64;
         let total = result.total_count.unwrap_or(0);
-        if page < total && page > 0 {
+        let offset = request_offset.unwrap_or(0) as i64;
+        if page > 0 && offset + page < total {
             status = StatusCode::PARTIAL_CONTENT;
         }
     }
@@ -101,6 +134,21 @@ pub fn format_response(
         return (status, headers).into_response();
     }
 
+    // Mutations without `Prefer: return=representation`/`headers-only` return
+    // 204 No Content with an empty body (PostgREST semantics). Inserts keep
+    // their 201 status; other mutations return 204.
+    if let Some(m) = mutation {
+        let headers_only = preferences.return_repr == Some(PreferReturn::HeadersOnly);
+        if !return_representation && !headers_only {
+            let no_content = if m.was_insert {
+                status // 201 Created, empty body
+            } else {
+                StatusCode::NO_CONTENT
+            };
+            return (no_content, headers).into_response();
+        }
+    }
+
     // Handle HEAD → headers only
     if matches!(method, RequestMethod::Head) {
         return (status, headers).into_response();
@@ -138,23 +186,56 @@ pub fn format_response(
     (status, headers, body).into_response()
 }
 
-/// Determine the appropriate status code based on the request method and result.
-fn determine_status(result: &QueryResult, method: &RequestMethod) -> StatusCode {
+/// Determine the appropriate status code based on the request method and plan.
+///
+/// Insert-ness is derived from the plan (via [`MutationInfo`]) rather than the
+/// dead `QueryResult.was_insert` field: POST on a table INSERT → 201 Created,
+/// POST on an RPC (no `MutationInfo`) → 200 OK.
+fn determine_status(method: &RequestMethod, mutation: Option<&MutationInfo>) -> StatusCode {
     match method {
         RequestMethod::Post => {
-            // POST on table = INSERT → 201 Created
-            // POST on RPC = function call → 200 OK (unless overridden by GUC)
-            if result.was_insert == Some(true) {
+            if mutation.map(|m| m.was_insert).unwrap_or(false) {
                 StatusCode::CREATED
             } else {
                 StatusCode::OK
             }
         }
-        RequestMethod::Put => StatusCode::OK,
-        RequestMethod::Patch => StatusCode::OK,
-        RequestMethod::Delete => StatusCode::OK,
         _ => StatusCode::OK,
     }
+}
+
+/// Build a `Location` header for a single-row INSERT with a primary key.
+///
+/// Format: `<table_path>?<pk>=eq.<value>` (compound PKs joined with `&`), per
+/// PostgREST. Returns `None` if the result is not a single row, the table has no
+/// PK, or a PK value is missing from the returned row.
+fn build_location_header(body: &Value, mutation: &MutationInfo) -> Option<String> {
+    if mutation.primary_key_columns.is_empty() {
+        return None;
+    }
+    let table_path = mutation.table_path.as_ref()?;
+
+    // Find the single returned row.
+    let row = match body {
+        Value::Array(arr) if arr.len() == 1 => &arr[0],
+        Value::Object(_) => body,
+        _ => return None,
+    };
+    let obj = row.as_object()?;
+
+    let mut parts = Vec::with_capacity(mutation.primary_key_columns.len());
+    for pk in &mutation.primary_key_columns {
+        let val = obj.get(pk)?;
+        let rendered = match val {
+            Value::Number(n) => n.to_string(),
+            Value::String(s) => s.clone(),
+            Value::Bool(b) => b.to_string(),
+            _ => return None,
+        };
+        parts.push(format!("{pk}=eq.{rendered}"));
+    }
+
+    Some(format!("{table_path}?{}", parts.join("&")))
 }
 
 /// Build the Content-Range header value.

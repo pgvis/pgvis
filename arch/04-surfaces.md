@@ -123,12 +123,10 @@ before calling tools: `pgvis://schemas`, `pgvis://{schema}/schema`, and
 tool name into `(schema, verb, target)`, maps the verb to a `RequestMethod`
 (`list`→`Get`, `create`→`Post`, `update`→`Patch`, `delete`→`Delete`,
 `call`→`Post` with `is_rpc`), builds an `ApiRequest`, and calls the same
-`plan_request`. **Unlike REST, MCP still returns a plan summary:** no backend is
-constructed for `McpServer` (`pgvis-lib` builds it with cache/config/dialect
-only), so `query::render` + `Backend::execute` are not yet invoked here
-([tools.rs](../crates/pgvis-mcp/src/tools.rs) TODO,
-[08-future-scope.md](08-future-scope.md)). Known parser gaps (select string,
-order, logic) are shared with REST.
+`plan_request`. `McpServer` holds an `Arc<dyn Backend>`, so `handle_tool_call`
+renders SQL and executes it end-to-end, returning real rows just like REST.
+Filter parsing reuses `query_params::parse_filter` (the exact parser REST uses),
+so the operator grammar is shared rather than a hand-rolled subset.
 
 ## Delivery wrappers
 

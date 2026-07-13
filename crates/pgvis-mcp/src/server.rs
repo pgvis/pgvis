@@ -356,14 +356,27 @@ impl McpServer {
         tool_name: &str,
         arguments: &Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        // Gate the CALL path on the same condition as tool *listing*
+        // (`pubsub.is_some() && config.pubsub.enabled`). Checking only
+        // `pubsub.is_some()` would let a client invoke these tools even when
+        // pub/sub is disabled in config.
         let pubsub = match &self.pubsub {
-            Some(ps) => ps,
-            None => {
+            Some(ps) if self.config.pubsub.enabled => ps,
+            _ => {
                 return Ok(CallToolResult::error(vec![Content::text(
                     "Pub/sub is not available on this server",
                 )]));
             }
         };
+
+        // Publishing is a side effect; a --read-only MCP server must reject it,
+        // mirroring how table/RPC mutations are refused. Listing channels is a
+        // read and stays allowed.
+        if tool_name == "pubsub_publish" && self.config.read_only {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "MCP server is read-only; publishing is not permitted",
+            )]));
+        }
 
         match tool_name {
             "pubsub_publish" => {

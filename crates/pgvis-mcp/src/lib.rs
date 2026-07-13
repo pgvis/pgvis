@@ -24,7 +24,7 @@
 //! use pgvis_core::{Config, SchemaCache, Backend, dialect::POSTGRES};
 //! use pgvis_mcp::{McpServer, transport::serve_stdio};
 //!
-//! # async fn example(backend: Arc<dyn Backend>) -> Result<(), Box<dyn std::error::Error>> {
+//! # async fn example(backend: Arc<dyn Backend>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 //! let cache = Arc::new(ArcSwap::new(Arc::new(SchemaCache::default())));
 //! let config = Arc::new(Config::default());
 //! let dialect = Arc::new(POSTGRES.clone());

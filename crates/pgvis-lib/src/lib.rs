@@ -277,8 +277,9 @@ impl Builder {
                 )
                 .await?;
 
-                // Mount pub/sub router
-                let pubsub_router = pgvis_router::build_pubsub_router(hub.clone());
+                // Mount pub/sub router (config threads JWT settings for auth)
+                let pubsub_router =
+                    pgvis_router::build_pubsub_router(hub.clone(), config.clone());
                 app = app.nest("/pubsub", pubsub_router);
 
                 Some(hub)

@@ -270,9 +270,13 @@ async fn test_patch_on_view_may_error() {
     // Views are typically not updatable unless explicitly made so
     let resp = patch("/api/test/items_view?id=eq.1", json!({"name": "NewName"})).await;
     let status = resp.status();
-    // Might be 405 Method Not Allowed or some other error
+    // Might be 405 Method Not Allowed or some other error, or (if the view is
+    // updatable) a successful mutation — 204 No Content without a representation.
     assert!(
-        status.is_client_error() || status.is_server_error() || status == StatusCode::OK,
+        status.is_client_error()
+            || status.is_server_error()
+            || status == StatusCode::OK
+            || status == StatusCode::NO_CONTENT,
         "got {status}"
     );
 }
@@ -282,7 +286,10 @@ async fn test_delete_on_view_may_error() {
     let resp = delete("/api/test/items_view?id=eq.1").await;
     let status = resp.status();
     assert!(
-        status.is_client_error() || status.is_server_error() || status == StatusCode::OK,
+        status.is_client_error()
+            || status.is_server_error()
+            || status == StatusCode::OK
+            || status == StatusCode::NO_CONTENT,
         "got {status}"
     );
 }

@@ -261,10 +261,26 @@ fn load_config(path: Option<&std::path::Path>) -> anyhow::Result<Config> {
         figment = figment.merge(Toml::file(path));
     }
 
-    // Layer 3: Environment variables (PGVIS_SCHEMAS, PGVIS_JWT_SECRET, etc.)
-    // Uses lowercase field names with underscore splitting:
-    // PGVIS_JWT_SECRET → jwt_secret, PGVIS_MAX_ROWS → max_rows
-    figment = figment.merge(Env::prefixed("PGVIS_").lowercase(true));
+    // Layer 3: Environment variables.
+    // - Nested keys use `__` as the separator, e.g.
+    //   `PGVIS_CACHE__TTL_SECONDS` → cache.ttl_seconds.
+    // - Flat keys map directly: `PGVIS_JWT_SECRET` → jwt_secret.
+    // Note: without `.split("__")`, a `PGVIS_SCHEMAS` value crashed extraction
+    // because figment tried to coerce the scalar into the `Vec<String>` field.
+    figment = figment.merge(Env::prefixed("PGVIS_").split("__").lowercase(true));
+
+    // Sequence-valued keys (`Vec<String>` fields) come in as comma-separated
+    // scalars from the environment. `PGVIS_SCHEMAS=public,app` → ["public","app"].
+    if let Ok(schemas) = std::env::var("PGVIS_SCHEMAS") {
+        let list: Vec<String> = schemas
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !list.is_empty() {
+            figment = figment.merge(Serialized::default("schemas", list));
+        }
+    }
 
     let config: Config = figment.extract()?;
     Ok(config)

@@ -96,9 +96,8 @@ Trace of `GET /api/public/users?select=id,name&age=gte.18&order=id.asc`:
    implemented: it opens a transaction, applies `ExecContext` (`SET LOCAL role`
    / `request.jwt.claims` / `statement_timeout` / pre-request), binds parameters
    via the text protocol, runs the CTE-wrapped statement, and decodes the single
-   result row into `QueryResult`. *The MCP surface still returns a plan summary
-   because no backend is wired into its server — see
-   [08-future-scope.md](08-future-scope.md).*
+   result row into `QueryResult`. The MCP surface executes the same way:
+   `McpServer` holds an `Arc<dyn Backend>` and runs render + execute end-to-end.
 6. **Respond.** The adapter maps `QueryResult` (or an `Error` via its
    `http_status()` / `PGRST*` code) to an HTTP response or an MCP tool result.
 

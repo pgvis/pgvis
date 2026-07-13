@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::StreamExt;
+use pgvis_core::Config;
 use pgvis_core::error::Error;
 use pgvis_core::pubsub::{PubSubBackend, PubSubConfig, PubSubErrorCode, PubSubMessage};
 use tokio::sync::{Mutex, broadcast};
@@ -262,6 +263,26 @@ async fn dispatch_loop(hub: Arc<PubSubHub>) -> Result<(), Error> {
 // REST SSE handlers
 // ---------------------------------------------------------------------------
 
+/// Router state for the pub/sub endpoints: the hub plus the server config so
+/// subscribe/publish can enforce the same JWT verification as the data API.
+#[derive(Clone)]
+pub struct PubSubState {
+    hub: Arc<PubSubHub>,
+    config: Arc<Config>,
+}
+
+/// Enforce JWT authentication for pub/sub endpoints, mirroring the data API.
+///
+/// Returns `Err(Response)` (401/500) when the request is unauthenticated and no
+/// anonymous role is configured. When `jwt_secret` is unset, all requests pass
+/// (same as the data API's anonymous mode).
+fn authorize_pubsub(state: &PubSubState, headers: &axum::http::HeaderMap) -> Result<(), axum::response::Response> {
+    // Reuse the exact JWT verification used by request dispatch. On success we
+    // discard the identity (channels aren't RLS-scoped here) but reject
+    // unauthenticated callers when auth is required.
+    crate::routing::verify_jwt(headers, &state.config).map(|_| ())
+}
+
 /// SSE subscribe handler: `GET /pubsub/{channel}`
 ///
 /// Returns a Server-Sent Events stream that yields messages from the specified
@@ -269,10 +290,16 @@ async fn dispatch_loop(hub: Arc<PubSubHub>) -> Result<(), Error> {
 ///
 /// Sends periodic `: keepalive` comments to prevent proxy timeouts.
 pub async fn handle_subscribe(
-    axum::extract::State(hub): axum::extract::State<Arc<PubSubHub>>,
+    axum::extract::State(state): axum::extract::State<PubSubState>,
     axum::extract::Path(channel): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+
+    if let Err(resp) = authorize_pubsub(&state, &headers) {
+        return resp;
+    }
+    let hub = state.hub;
 
     // Validate and subscribe
     let rx = match hub.subscribe(&channel).await {
@@ -298,10 +325,34 @@ pub async fn handle_subscribe(
     (headers, axum::body::Body::from_stream(stream)).into_response()
 }
 
+/// Drop guard that unsubscribes from the hub when the SSE stream is dropped.
+///
+/// A client disconnect drops the response body (and hence the stream and this
+/// guard); previously unsubscribe only ran on `RecvError::Closed`, which never
+/// fires while the hub retains its `Sender`, so disconnected clients leaked
+/// subscriber slots until `max_subscribers`. The guard runs on every drop.
+struct SseSubscription {
+    hub: Arc<PubSubHub>,
+    channel: String,
+}
+
+impl Drop for SseSubscription {
+    fn drop(&mut self) {
+        // `unsubscribe` is async; spawn it so Drop stays synchronous. This
+        // decrements the subscriber count and issues UNLISTEN for the last one.
+        let hub = self.hub.clone();
+        let channel = std::mem::take(&mut self.channel);
+        tokio::spawn(async move {
+            hub.unsubscribe(&channel).await;
+        });
+    }
+}
+
 /// Build an SSE byte stream from a broadcast receiver.
 ///
 /// Emits `data: {...}\n\n` for messages and `: keepalive\n\n` comments on idle.
-/// Calls `hub.unsubscribe()` when the stream ends.
+/// An [`SseSubscription`] guard owned by the stream calls `hub.unsubscribe()`
+/// when the stream is dropped (client disconnect) or ends.
 fn make_sse_stream(
     rx: broadcast::Receiver<PubSubMessage>,
     keepalive_secs: u64,
@@ -310,9 +361,15 @@ fn make_sse_stream(
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::convert::Infallible>> {
     let keepalive_interval = std::time::Duration::from_secs(keepalive_secs);
 
+    // The guard lives in the stream's state; dropping the stream drops it.
+    let guard = SseSubscription {
+        hub,
+        channel: channel.clone(),
+    };
+
     futures::stream::unfold(
-        (rx, hub, channel, keepalive_interval),
-        |(mut rx, hub, channel, interval)| async move {
+        (rx, guard, keepalive_interval),
+        |(mut rx, guard, interval)| async move {
             loop {
                 tokio::select! {
                     result = rx.recv() => {
@@ -322,7 +379,7 @@ fn make_sse_stream(
                                 let event = format!("data: {json}\n\n");
                                 return Some((
                                     Ok(bytes::Bytes::from(event)),
-                                    (rx, hub, channel, interval),
+                                    (rx, guard, interval),
                                 ));
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -330,11 +387,11 @@ fn make_sse_stream(
                                 let comment = format!(": lagged {n} messages\n\n");
                                 return Some((
                                     Ok(bytes::Bytes::from(comment)),
-                                    (rx, hub, channel, interval),
+                                    (rx, guard, interval),
                                 ));
                             }
                             Err(broadcast::error::RecvError::Closed) => {
-                                hub.unsubscribe(&channel).await;
+                                // Stream ends; `guard` drops here → unsubscribe.
                                 return None;
                             }
                         }
@@ -343,7 +400,7 @@ fn make_sse_stream(
                         let comment = bytes::Bytes::from_static(b": keepalive\n\n");
                         return Some((
                             Ok(comment),
-                            (rx, hub, channel, interval),
+                            (rx, guard, interval),
                         ));
                     }
                 }
@@ -361,11 +418,17 @@ fn make_sse_stream(
 ///
 /// Returns 200 on success with `{"ok": true}`.
 pub async fn handle_publish(
-    axum::extract::State(hub): axum::extract::State<Arc<PubSubHub>>,
+    axum::extract::State(state): axum::extract::State<PubSubState>,
     axum::extract::Path(channel): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+
+    if let Err(resp) = authorize_pubsub(&state, &headers) {
+        return resp;
+    }
+    let hub = state.hub;
 
     let payload = match std::str::from_utf8(&body) {
         Ok(s) => s.to_string(),
@@ -390,25 +453,28 @@ pub async fn handle_publish(
 ///
 /// Returns the current pub/sub status including active channels and subscriber counts.
 pub async fn handle_status(
-    axum::extract::State(hub): axum::extract::State<Arc<PubSubHub>>,
+    axum::extract::State(state): axum::extract::State<PubSubState>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let status = hub.status().await;
+    let status = state.hub.status().await;
     axum::Json(status).into_response()
 }
 
 /// Build the pub/sub router.
 ///
 /// Mounts the subscribe and publish handlers under the given prefix.
-/// Typically mounted at `/{routing_prefix}/pubsub`.
-pub fn build_pubsub_router(hub: Arc<PubSubHub>) -> axum::Router {
+/// Typically mounted at `/{routing_prefix}/pubsub`. `config` supplies the JWT
+/// settings so subscribe/publish enforce the same authentication as the data API.
+pub fn build_pubsub_router(hub: Arc<PubSubHub>, config: Arc<Config>) -> axum::Router {
     use axum::routing::{get, post};
+
+    let state = PubSubState { hub, config };
 
     axum::Router::new()
         .route("/", get(handle_status))
         .route("/{channel}", get(handle_subscribe))
         .route("/{channel}", post(handle_publish))
-        .with_state(hub)
+        .with_state(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -419,12 +485,19 @@ pub fn build_pubsub_router(hub: Arc<PubSubHub>) -> axum::Router {
 fn error_response(err: &Error) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    let status = axum::http::StatusCode::from_u16(err.http_status())
+    // For pub/sub errors, use the PubSubErrorCode's own string/status rather
+    // than `Error::code()` (which reports Internal/PGV500 for the PubSub variant).
+    let (status_u16, code) = match err {
+        Error::PubSub { code, .. } => (code.http_status(), code.as_str().to_string()),
+        other => (other.http_status(), other.code().as_str().to_string()),
+    };
+
+    let status = axum::http::StatusCode::from_u16(status_u16)
         .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
 
     let body = serde_json::json!({
         "error": err.to_string(),
-        "code": err.code().as_str(),
+        "code": code,
     });
 
     (status, axum::Json(body)).into_response()

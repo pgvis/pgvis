@@ -188,7 +188,24 @@ impl AppState {
             is_mutation: matches!(plan, ActionPlan::Mutate(_)),
         };
 
-        self.backend.execute(&exec_ctx, &sql, &params).await
+        let result = self.backend.execute(&exec_ctx, &sql, &params).await?;
+
+        // Invalidate the data cache on a successful mutating call, mirroring the
+        // HTTP dispatch path. A volatile RPC may touch any table, so clear all.
+        if let Some(dc) = &self.data_cache {
+            match &plan {
+                ActionPlan::Mutate(mutate_plan) => dc.invalidate_table(&mutate_plan.target),
+                ActionPlan::Call(call_plan)
+                    if call_plan.function_info.volatility
+                        == pgvis_core::cache::Volatility::Volatile =>
+                {
+                    dc.invalidate_all()
+                }
+                _ => {}
+            }
+        }
+
+        Ok(result)
     }
 
     /// Call a scalar-returning function and deserialize its single value into `T`.
@@ -296,14 +313,14 @@ impl AppState {
             method: RequestMethod::Get,
             is_rpc: false,
             select,
-            filters: parse_filters_from_params(params),
+            filters: parse_filters_from_params(params)?,
             order,
-            range: parse_range_from_params(params),
+            range: parse_range_from_params(params)?,
             preferences: Preferences::default(),
             body: None,
             on_conflict: None,
             columns: None,
-            logic_filters: parse_logic_filters_from_params(params),
+            logic_filters: parse_logic_filters_from_params(params)?,
             cursor: parse_cursor_from_params(params),
         };
 
@@ -722,15 +739,41 @@ async fn dispatch_request(
 ) -> Response {
     let cache = state.cache.load();
 
-    // Parse preferences early — needed for ExecContext and response formatting
-    let preferences = headers
+    // Parse preferences early — needed for ExecContext and response formatting.
+    // `handling=strict` rejects unknown Prefer tokens with 400 (PGRST122).
+    let (mut preferences, unknown_prefs) = headers
         .get("prefer")
         .and_then(|v| v.to_str().ok())
-        .map(|s| Preferences::parse(s).0)
+        .map(Preferences::parse)
         .unwrap_or_default();
 
-    // 1. Build the adapter-agnostic ApiRequest
-    let api_request = build_api_request(
+    // `Prefer: tx=` is ignored unless the server opts in; drop it so it isn't
+    // applied (build_exec_context) nor echoed in Preference-Applied.
+    if !state.config.tx_allow_override {
+        preferences.tx = None;
+    }
+
+    if preferences.handling == Some(pgvis_core::preferences::PreferHandling::Strict)
+        && !unknown_prefs.is_empty()
+    {
+        return response::format_error(&Error::Parse {
+            message: format!("Invalid preference: {}", unknown_prefs.join(", ")),
+            detail: None,
+            code: pgvis_core::error::ErrorCode::InvalidPreference,
+        });
+    }
+
+    // Authorization first: verify the JWT BEFORE planning so unauthenticated
+    // requests can't enumerate schema/tables or consume planning work.
+    let auth = match verify_jwt(headers, &state.config) {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+
+    // 1. Build the adapter-agnostic ApiRequest. Parse failures (malformed
+    //    select/filter/order/logic/range) surface as 400 rather than being
+    //    silently dropped (PostgREST fail-closed behaviour).
+    let api_request = match build_api_request(
         schema,
         target,
         method.clone(),
@@ -739,7 +782,10 @@ async fn dispatch_request(
         params,
         body,
         &preferences,
-    );
+    ) {
+        Ok(req) => req,
+        Err(err) => return response::format_error(&err),
+    };
 
     // 2. Plan the request against the schema cache
     let plan = match plan_request(&api_request, &cache, &state.dialect, &state.config) {
@@ -747,10 +793,13 @@ async fn dispatch_request(
         Err(err) => return response::format_error(&err),
     };
 
-    // For Inspect plans, return the inspection result directly
+    // For Inspect plans: not yet implemented — return 501 (was misreporting 200).
     if let ActionPlan::Inspect(_) = &plan {
-        let resp = serde_json::json!({"status": "inspect", "message": "not yet implemented"});
-        return (StatusCode::OK, Json(resp)).into_response();
+        let resp = serde_json::json!({
+            "code": "PGV001",
+            "message": "inspect endpoint is not yet implemented",
+        });
+        return (StatusCode::NOT_IMPLEMENTED, Json(resp)).into_response();
     }
 
     // 3. Render the plan to SQL + parameters
@@ -772,16 +821,17 @@ async fn dispatch_request(
 
     tracing::debug!(sql = %sql, params = ?params_vec, "executing query");
 
-    // 4. Verify JWT and build ExecContext
-    let auth = match verify_jwt(headers, &state.config) {
-        Ok(auth) => auth,
-        Err(response) => return response,
-    };
+    // 4. Build ExecContext (JWT already verified above, before planning).
     let is_mutation = matches!(&plan, ActionPlan::Mutate(_));
     let exec_ctx = build_exec_context(&state.config, &auth, &preferences, is_mutation);
 
-    // 4b. Data cache: compute key and check for cache hit (reads only)
-    let cache_key = if let ActionPlan::Read(ref read_plan) = plan {
+    // 4b. Data cache: compute key and check for cache hit (reads only).
+    //     When a `pre_request` hook is configured we bypass the read cache
+    //     entirely, otherwise a cache hit would skip `backend.execute` and the
+    //     hook would never run (it must observe every request).
+    let cache_key = if state.config.pre_request.is_some() {
+        None
+    } else if let ActionPlan::Read(ref read_plan) = plan {
         state.data_cache.as_ref().and_then(|dc| {
             dc.compute_key(
                 read_plan,
@@ -832,6 +882,7 @@ async fn dispatch_request(
                     is_singular,
                     request_offset,
                     cursor_column.as_deref(),
+                    None,
                 );
             }
         }
@@ -869,9 +920,36 @@ async fn dispatch_request(
         }
     }
 
+    // 5d. Scalar RPC: PostgREST returns the bare scalar for a singular,
+    // non-set, non-composite function. Our renderer produces `[{"result": v}]`,
+    // so unwrap it to `v` in the response layer (core is untouched).
+    let mut result = result;
+    if let ActionPlan::Call(call_plan) = &plan {
+        if call_plan.is_singular
+            && !call_plan.function_info.returns_set
+            && !call_plan.function_info.returns_table
+        {
+            result.body = unwrap_result_wrapper(std::mem::take(&mut result.body));
+        }
+    }
+
     // 6. Extract cursor column from the plan (for X-Next-Cursor header)
     let cursor_column = match &plan {
         ActionPlan::Read(read_plan) => read_plan.range.cursor_column.clone(),
+        _ => None,
+    };
+
+    // 6b. Mutation info for status/Location selection (derived from the plan).
+    let mutation = match &plan {
+        ActionPlan::Mutate(mutate_plan) => {
+            let was_insert =
+                matches!(mutate_plan.mutation, pgvis_core::plan::types::MutationType::Insert { .. });
+            Some(response::MutationInfo {
+                was_insert,
+                primary_key_columns: mutate_plan.table_info.primary_key_columns.clone(),
+                table_path: Some(build_table_path(&state.config, &mutate_plan.target.name)),
+            })
+        }
         _ => None,
     };
 
@@ -891,7 +969,52 @@ async fn dispatch_request(
         is_singular,
         request_offset,
         cursor_column.as_deref(),
+        mutation.as_ref(),
     )
+}
+
+/// Unwrap a scalar RPC body of shape `[{"result": v}]` (or `{"result": v}`) to
+/// the bare inner value. Leaves other shapes untouched. Used to match
+/// PostgREST's bare-scalar response for singular scalar functions.
+fn unwrap_result_wrapper(body: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    let is_result_wrapper = |v: &Value| {
+        v.as_object()
+            .map(|o| o.len() == 1 && o.contains_key("result"))
+            .unwrap_or(false)
+    };
+    match body {
+        Value::Array(arr) if arr.len() == 1 && is_result_wrapper(&arr[0]) => {
+            let mut arr = arr;
+            match arr.remove(0) {
+                Value::Object(mut o) => o.remove("result").unwrap_or(Value::Null),
+                other => other,
+            }
+        }
+        Value::Object(mut o) if o.len() == 1 && o.contains_key("result") => {
+            o.remove("result").unwrap_or(Value::Null)
+        }
+        other => other,
+    }
+}
+
+/// Build the request path for a table (best-effort, for the `Location` header).
+///
+/// Mirrors the route shapes in [`build_router`] for the non-`schema_in_path`
+/// modes. When `schema_in_path` is set the schema segment is included.
+fn build_table_path(config: &Config, table: &str) -> String {
+    let routing = &config.routing;
+    let prefix = routing.normalized_prefix();
+    let base = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("/{prefix}")
+    };
+    if routing.schema_in_path {
+        format!("{base}/{}/{table}", routing.default_schema)
+    } else {
+        format!("{base}/{table}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -911,30 +1034,61 @@ fn build_api_request(
     params: &HashMap<String, String>,
     body: Option<serde_json::Value>,
     preferences: &Preferences,
-) -> ApiRequest {
+) -> Result<ApiRequest, Error> {
     let _ = preferences; // Will be used for count strategy, etc.
 
-    // Parse select parameter
-    let select = params
-        .get("select")
-        .and_then(|s| query_params::parse_select(s).ok())
-        .unwrap_or_default();
-
-    // If select is empty, default to star
-    let select = if select.is_empty() {
-        vec![SelectItem::Star]
-    } else {
-        select
+    // Parse select parameter — a malformed select is a 400 (PGRST100), NOT a
+    // silent fall back to `SELECT *` (which would over-expose columns).
+    let select = match params.get("select") {
+        Some(s) => {
+            let parsed = query_params::parse_select(s)
+                .map_err(|e| Error::invalid_select(e.to_string()))?;
+            if parsed.is_empty() {
+                vec![SelectItem::Star]
+            } else {
+                parsed
+            }
+        }
+        None => vec![SelectItem::Star],
     };
 
-    // Parse filters from query params (columns not named select/order/limit/offset)
-    let filters = parse_filters_from_params(params);
+    // GET-based RPC: query parameters are the function's named arguments, not
+    // row filters. Turn them into a `RequestBody::Single` object so the planner
+    // resolves them as call params. Filters/order/range don't apply to a call.
+    let is_get_rpc = is_rpc && matches!(method, RequestMethod::Get | RequestMethod::Head);
+    if is_get_rpc {
+        let args = rpc_args_from_params(params);
+        return Ok(ApiRequest {
+            schema,
+            target,
+            method,
+            is_rpc,
+            select,
+            filters: Vec::new(),
+            order: Vec::new(),
+            range: None,
+            preferences: preferences.clone(),
+            body: Some(RequestBody::Single(args)),
+            on_conflict: None,
+            columns: None,
+            logic_filters: Vec::new(),
+            cursor: None,
+        });
+    }
 
-    // Parse order — extract only direct OrderTerms (skip relation terms for now)
-    let order = params
-        .get("order")
-        .and_then(|s| query_params::parse_order(s).ok())
-        .map(|items| {
+    // Parse filters from query params (columns not named select/order/limit/offset)
+    let filters = parse_filters_from_params(params)?;
+
+    // Parse order — extract only direct OrderTerms (skip relation terms for now).
+    // A malformed order is a 400.
+    let order = match params.get("order") {
+        Some(s) => {
+            let items =
+                query_params::parse_order(s).map_err(|e| Error::Parse {
+                    message: e.to_string(),
+                    detail: None,
+                    code: pgvis_core::error::ErrorCode::InvalidOrder,
+                })?;
             items
                 .into_iter()
                 .filter_map(|item| match item {
@@ -942,11 +1096,12 @@ fn build_api_request(
                     OrderItem::Relation(_) => None,
                 })
                 .collect()
-        })
-        .unwrap_or_default();
+        }
+        None => Vec::new(),
+    };
 
-    // Parse range (limit/offset)
-    let range = parse_range_from_params(params);
+    // Parse range (limit/offset) — non-numeric values are a 416 InvalidRange.
+    let range = parse_range_from_params(params)?;
 
     // Parse body into RequestBody
     let request_body = body.map(|v| {
@@ -965,13 +1120,13 @@ fn build_api_request(
         .get("columns")
         .map(|s| s.split(',').map(|c| c.trim().to_string()).collect());
 
-    // Parse logic filters (and=, or=, not.and=, not.or=)
-    let logic_filters = parse_logic_filters_from_params(params);
+    // Parse logic filters (and=, or=, not.and=, not.or=) — malformed logic → 400.
+    let logic_filters = parse_logic_filters_from_params(params)?;
 
     // Parse cursor pagination (cursor_column, cursor_value)
     let cursor = parse_cursor_from_params(params);
 
-    ApiRequest {
+    Ok(ApiRequest {
         schema,
         target,
         method,
@@ -986,11 +1141,11 @@ fn build_api_request(
         columns,
         logic_filters,
         cursor,
-    }
+    })
 }
 
 /// The result of JWT verification — either authenticated claims or anonymous.
-struct AuthResult {
+pub(crate) struct AuthResult {
     /// The role to SET LOCAL to (from JWT claim or anon_role).
     role: Option<String>,
     /// The full JWT claims as a JSON value (for GUC propagation).
@@ -1002,7 +1157,7 @@ struct AuthResult {
 /// Returns `Ok(AuthResult)` on success (including anonymous access when no JWT
 /// is required). Returns `Err(Response)` when auth fails and the request should
 /// be rejected immediately.
-fn verify_jwt(headers: &HeaderMap, config: &Config) -> Result<AuthResult, Response> {
+pub(crate) fn verify_jwt(headers: &HeaderMap, config: &Config) -> Result<AuthResult, Response> {
     // If no JWT secret is configured, all requests are anonymous
     let secret = match &config.jwt_secret {
         Some(s) => s,
@@ -1059,19 +1214,49 @@ fn verify_jwt(headers: &HeaderMap, config: &Config) -> Result<AuthResult, Respon
         JwtAlgorithm::EdDSA => Algorithm::EdDSA,
     };
 
+    // For asymmetric algorithms a PEM parse failure is a configuration error —
+    // do NOT silently fall back to HMAC (that would let an attacker forge tokens
+    // by knowing the *public* key). HMAC algorithms use the shared secret.
+    let jwt_config_error = || {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "PGRST301",
+                "message": "JWT verification is misconfigured",
+                "details": "The configured jwt_secret is not a valid PEM key for the selected algorithm",
+                "hint": "Provide a valid PEM public key for RS256/EdDSA, or use an HS* algorithm with a shared secret",
+            })),
+        )
+            .into_response()
+    };
+
     let decoding_key = match algorithm {
         Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => {
             DecodingKey::from_secret(secret.as_bytes())
         }
-        Algorithm::RS256 => DecodingKey::from_rsa_pem(secret.as_bytes())
-            .unwrap_or_else(|_| DecodingKey::from_secret(secret.as_bytes())),
-        Algorithm::EdDSA => DecodingKey::from_ed_pem(secret.as_bytes())
-            .unwrap_or_else(|_| DecodingKey::from_secret(secret.as_bytes())),
+        Algorithm::RS256 => match DecodingKey::from_rsa_pem(secret.as_bytes()) {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::error!(error = %e, "RS256 JWT public key (PEM) failed to parse");
+                return Err(jwt_config_error());
+            }
+        },
+        Algorithm::EdDSA => match DecodingKey::from_ed_pem(secret.as_bytes()) {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::error!(error = %e, "EdDSA JWT public key (PEM) failed to parse");
+                return Err(jwt_config_error());
+            }
+        },
         _ => DecodingKey::from_secret(secret.as_bytes()),
     };
 
     let mut validation = Validation::new(algorithm);
     validation.validate_exp = true;
+    // PostgREST ignores the `aud` claim unless `jwt-aud` is configured. Disable
+    // aud validation (jsonwebtoken 9 defaults it on), otherwise any token that
+    // carries an `aud` is rejected.
+    validation.validate_aud = false;
     // Don't require specific claims beyond exp
     validation.required_spec_claims = std::collections::HashSet::new();
 
@@ -1117,10 +1302,16 @@ fn build_exec_context(
     preferences: &Preferences,
     is_mutation: bool,
 ) -> ExecContext {
-    let tx_end = preferences.tx.and_then(|tx| match tx {
-        PreferTx::Commit => Some(TxEnd::Commit),
-        PreferTx::Rollback => Some(TxEnd::Rollback),
-    });
+    // `Prefer: tx=commit/rollback` is only honoured when the server opts in via
+    // `tx_allow_override`; otherwise the client cannot override transaction end.
+    let tx_end = if config.tx_allow_override {
+        preferences.tx.and_then(|tx| match tx {
+            PreferTx::Commit => Some(TxEnd::Commit),
+            PreferTx::Rollback => Some(TxEnd::Rollback),
+        })
+    } else {
+        None
+    };
 
     ExecContext {
         role: auth.role.clone(),
@@ -1146,7 +1337,7 @@ fn build_exec_context(
 /// makes debugging/logging reproducible.
 fn parse_filters_from_params(
     params: &HashMap<String, String>,
-) -> Vec<pgvis_core::query_params::Filter> {
+) -> Result<Vec<pgvis_core::query_params::Filter>, Error> {
     const RESERVED: &[&str] = &[
         "select",
         "order",
@@ -1167,16 +1358,46 @@ fn parse_filters_from_params(
         if is_logic_filter_key(key) {
             continue;
         }
-        // Try to parse as a filter: column=operator.value
-        if let Ok(filter) = query_params::parse_filter(key, value) {
-            filters.push(filter);
-        }
+        // Parse as a filter: column=operator.value. A malformed filter is a 400
+        // (PGRST100), not silently dropped — dropping would broaden the result set.
+        let filter = query_params::parse_filter(key, value)
+            .map_err(|e| Error::invalid_filter(e.to_string()))?;
+        filters.push(filter);
     }
 
     // Sort by column name for deterministic SQL output
     filters.sort_by(|a, b| a.field.cmp(&b.field));
 
-    filters
+    Ok(filters)
+}
+
+/// Build the argument object for a GET-based RPC call from query parameters.
+///
+/// Every non-reserved query parameter becomes a named argument. Values are
+/// passed as JSON strings (the function's parameter types drive coercion in the
+/// database), except `select` which is reserved for the response projection.
+fn rpc_args_from_params(params: &HashMap<String, String>) -> serde_json::Value {
+    use serde_json::Value;
+    let mut obj = serde_json::Map::new();
+    for (key, value) in params {
+        if key == "select" {
+            continue;
+        }
+        // Coerce obvious scalar literals so bound parameters carry the right JSON
+        // type (e.g. an integer argument binds as a number, not text). Anything
+        // else stays a string; the function's parameter type drives final casting.
+        let coerced = if let Ok(i) = value.parse::<i64>() {
+            Value::from(i)
+        } else if let Ok(f) = value.parse::<f64>() {
+            Value::from(f)
+        } else if value == "true" || value == "false" {
+            Value::from(value == "true")
+        } else {
+            Value::String(value.clone())
+        };
+        obj.insert(key.clone(), coerced);
+    }
+    Value::Object(obj)
 }
 
 /// Check if a query parameter key is a logic filter operator.
@@ -1189,52 +1410,68 @@ fn is_logic_filter_key(key: &str) -> bool {
 /// Parse logic filter expressions (`and=`, `or=`, `not.and=`, `not.or=`) from query parameters.
 ///
 /// Returns parsed `LogicTree` nodes that express boolean combinations of leaf filters.
-fn parse_logic_filters_from_params(params: &HashMap<String, String>) -> Vec<LogicTree> {
+fn parse_logic_filters_from_params(
+    params: &HashMap<String, String>,
+) -> Result<Vec<LogicTree>, Error> {
     let mut trees = Vec::new();
 
     for (key, value) in params {
         if !is_logic_filter_key(key) {
             continue;
         }
-        match query_params::parse_logic_tree(key, value) {
-            Ok(node) => {
-                // Wrap the top-level LogicNode in a LogicTree
-                match node {
-                    pgvis_core::query_params::LogicNode::Tree(tree) => trees.push(tree),
-                    pgvis_core::query_params::LogicNode::Not(inner) => {
-                        // not.and/not.or: wrap in a single-item And with negation
-                        // The plan layer handles Not nodes within the tree
-                        trees.push(LogicTree::And(vec![
-                            pgvis_core::query_params::LogicNode::Not(inner),
-                        ]));
-                    }
-                    pgvis_core::query_params::LogicNode::Filter(f) => {
-                        trees.push(LogicTree::And(vec![
-                            pgvis_core::query_params::LogicNode::Filter(f),
-                        ]));
-                    }
-                }
+        // A malformed logic filter is a 400 (PGRST100), not silently dropped.
+        let node = query_params::parse_logic_tree(key, value)
+            .map_err(|e| Error::invalid_filter(e.to_string()))?;
+        // Wrap the top-level LogicNode in a LogicTree
+        match node {
+            pgvis_core::query_params::LogicNode::Tree(tree) => trees.push(tree),
+            pgvis_core::query_params::LogicNode::Not(inner) => {
+                // not.and/not.or: wrap in a single-item And with negation
+                // The plan layer handles Not nodes within the tree
+                trees.push(LogicTree::And(vec![
+                    pgvis_core::query_params::LogicNode::Not(inner),
+                ]));
             }
-            Err(e) => {
-                tracing::debug!(key = %key, error = %e, "failed to parse logic filter, skipping");
+            pgvis_core::query_params::LogicNode::Filter(f) => {
+                trees.push(LogicTree::And(vec![
+                    pgvis_core::query_params::LogicNode::Filter(f),
+                ]));
             }
         }
     }
 
-    trees
+    Ok(trees)
 }
 
 /// Parse limit/offset from query parameters into a `RangeSpec`.
+///
+/// Non-numeric `limit`/`offset` values are a 416 InvalidRange (PGRST103), not
+/// silently ignored — silently ignoring an invalid `limit` would return the
+/// full unpaginated set.
 fn parse_range_from_params(
     params: &HashMap<String, String>,
-) -> Option<pgvis_core::query_params::RangeSpec> {
-    let limit = params.get("limit").and_then(|s| s.parse().ok());
-    let offset = params.get("offset").and_then(|s| s.parse().ok());
+) -> Result<Option<pgvis_core::query_params::RangeSpec>, Error> {
+    fn parse_u64(
+        params: &HashMap<String, String>,
+        key: &str,
+    ) -> Result<Option<u64>, Error> {
+        match params.get(key) {
+            Some(s) => s.parse::<u64>().map(Some).map_err(|_| Error::Parse {
+                message: format!("Invalid {key}: {s}"),
+                detail: None,
+                code: pgvis_core::error::ErrorCode::InvalidRange,
+            }),
+            None => Ok(None),
+        }
+    }
+
+    let limit = parse_u64(params, "limit")?;
+    let offset = parse_u64(params, "offset")?;
 
     if limit.is_some() || offset.is_some() {
-        Some(pgvis_core::query_params::RangeSpec { limit, offset })
+        Ok(Some(pgvis_core::query_params::RangeSpec { limit, offset }))
     } else {
-        None
+        Ok(None)
     }
 }
 

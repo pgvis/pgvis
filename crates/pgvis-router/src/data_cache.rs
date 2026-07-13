@@ -434,7 +434,9 @@ mod tests {
             embeds: vec![],
             filters: vec![ResolvedFilter {
                 column: "id".to_string(),
+                json_path: vec![],
                 operator: Operator::Eq,
+                quantifier: None,
                 value: FilterValue::Single("42".to_string()),
                 negated: false,
                 rewrite: None,
@@ -467,7 +469,9 @@ mod tests {
             embeds: vec![],
             filters: vec![ResolvedFilter {
                 column: "active".to_string(),
+                json_path: vec![],
                 operator: Operator::Eq,
+                quantifier: None,
                 value: FilterValue::Single("true".to_string()),
                 negated: false,
                 rewrite: None,
@@ -591,6 +595,7 @@ mod tests {
                 target_table: QualifiedIdentifier::new("public", "orders"),
                 cardinality: pgvis_core::cache::Cardinality::O2M,
             },
+            join_type: None,
             plan: make_list_read_plan(),
             is_spread: false,
         });
