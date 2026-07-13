@@ -77,7 +77,24 @@ fn column_to_json(value_ref: ValueRef<'_>, declared_type: Option<&str>) -> Value
             if decl_upper.contains("JSON") {
                 serde_json::from_str(&s).unwrap_or_else(|_| Value::String(s.into_owned()))
             } else {
-                Value::String(s.into_owned())
+                // Embedded resources are produced by expression columns wrapping
+                // `COALESCE((SELECT json_group_array(json_object(...))), '[]')`.
+                // SQLite's `sqlite3_column_decltype` returns NULL for expression
+                // columns, so `declared_type` (hence `decl_upper`) is empty and we
+                // never see the "JSON" hint above. To keep embed nesting working,
+                // heuristically parse TEXT that looks like a JSON array/object: if
+                // the trimmed value starts with `[` or `{` AND parses cleanly, use
+                // the parsed value; otherwise keep it as a plain string so genuine
+                // string columns that merely resemble JSON are preserved.
+                let trimmed = s.trim_start();
+                if trimmed.starts_with('[') || trimmed.starts_with('{') {
+                    match serde_json::from_str(&s) {
+                        Ok(parsed) => parsed,
+                        Err(_) => Value::String(s.into_owned()),
+                    }
+                } else {
+                    Value::String(s.into_owned())
+                }
             }
         }
         ValueRef::Blob(bytes) => {
@@ -169,11 +186,24 @@ pub async fn execute_query(
         result.map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))
     })
     .await
-    .map_err(|e| Error::Execution {
-        message: format!("SQLite execution failed: {e}"),
-        db_code: None,
-        detail: None,
-        hint: None,
+    .map_err(|e| {
+        // Recover the SQLSTATE-equivalent db_code from our internal error, which
+        // is wrapped in `tokio_rusqlite::Error::Other`. The extended SQLite code
+        // was captured at the failure site (before stringification) so constraint
+        // violations map to the right HTTP status instead of a blanket 500.
+        let db_code = if let tokio_rusqlite::Error::Other(boxed) = &e {
+            boxed
+                .downcast_ref::<SqliteInternalError>()
+                .and_then(|err| err.db_code.clone())
+        } else {
+            None
+        };
+        Error::Execution {
+            message: format!("SQLite execution failed: {e}"),
+            db_code,
+            detail: None,
+            hint: None,
+        }
     })
 }
 
@@ -185,7 +215,7 @@ fn execute_and_collect(
 ) -> Result<QueryResult, SqliteInternalError> {
     let mut stmt = conn
         .prepare_cached(sql)
-        .map_err(|e| SqliteInternalError(format!("prepare failed: {e}")))?;
+        .map_err(|e| SqliteInternalError::from_rusqlite("prepare failed", &e))?;
 
     // Get column metadata
     let col_count = stmt.column_count();
@@ -204,12 +234,12 @@ fn execute_and_collect(
     // Execute and iterate rows
     let mut rows = stmt
         .query(param_refs.as_slice())
-        .map_err(|e| SqliteInternalError(format!("query failed: {e}")))?;
+        .map_err(|e| SqliteInternalError::from_rusqlite("query failed", &e))?;
 
     let mut body = Vec::with_capacity(64);
     while let Some(row) = rows
         .next()
-        .map_err(|e| SqliteInternalError(format!("row iteration failed: {e}")))?
+        .map_err(|e| SqliteInternalError::from_rusqlite("row iteration failed", &e))?
     {
         let mut obj = serde_json::Map::with_capacity(col_count);
         for i in 0..col_count {
@@ -224,7 +254,13 @@ fn execute_and_collect(
 
     Ok(QueryResult {
         body: Value::Array(body),
-        total_count: None, // SQLite doesn't support estimated count
+        // KNOWN GAP: `Prefer: count=exact` is not implemented on SQLite. The
+        // backend receives pre-rendered inner SQL (via `query::render_inner`) with
+        // no count column and no count signal in `ExecContext`, so it cannot run
+        // the separate `SELECT count(*)` here without a router/core change to
+        // thread the count strategy (and an unpaginated count source) through to
+        // `Backend::execute`. Planned/estimated counts are Postgres-only.
+        total_count: None,
         page_total: Some(page_total),
         response_status: None,  // No GUC mechanism
         response_headers: None, // No GUC mechanism
@@ -318,6 +354,36 @@ mod tests {
             val,
             Value::Array(vec![Value::from(1), Value::from(2), Value::from(3)])
         );
+    }
+
+    #[test]
+    fn test_column_to_json_embed_array_no_decltype() {
+        // Embedded resources arrive as expression columns with no declared type;
+        // TEXT that looks like a JSON array must be parsed, not returned as a string.
+        let json_str = r#"[{"id":1},{"id":2}]"#;
+        let val = column_to_json(ValueRef::Text(json_str.as_bytes()), None);
+        assert_eq!(val, serde_json::json!([{"id": 1}, {"id": 2}]));
+    }
+
+    #[test]
+    fn test_column_to_json_embed_object_no_decltype() {
+        let json_str = r#"{"id":1,"name":"a"}"#;
+        let val = column_to_json(ValueRef::Text(json_str.as_bytes()), None);
+        assert_eq!(val, serde_json::json!({"id": 1, "name": "a"}));
+    }
+
+    #[test]
+    fn test_column_to_json_plain_string_not_parsed() {
+        // A genuine string column that doesn't look like JSON stays a string.
+        let val = column_to_json(ValueRef::Text(b"hello world"), None);
+        assert_eq!(val, Value::String("hello world".to_string()));
+    }
+
+    #[test]
+    fn test_column_to_json_bracket_but_invalid_json_kept_as_string() {
+        // Starts with `[` but isn't valid JSON: preserve as string, don't error.
+        let val = column_to_json(ValueRef::Text(b"[not json"), None);
+        assert_eq!(val, Value::String("[not json".to_string()));
     }
 
     #[test]

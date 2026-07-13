@@ -55,14 +55,9 @@ struct HealthState {
 
 impl HealthState {
     fn new(reader_count: u32) -> Self {
-        // Start with all readers eligible
-        let all_eligible = if reader_count >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << reader_count) - 1
-        };
+        // Start with all readers eligible.
         Self {
-            eligible: AtomicU64::new(all_eligible),
+            eligible: AtomicU64::new(all_eligible_bits(reader_count)),
             next: AtomicU32::new(0),
             reader_count,
         }
@@ -82,6 +77,28 @@ impl HealthState {
     /// Update the eligibility bitfield atomically.
     fn set_eligible(&self, bits: u64) {
         self.eligible.store(bits, Ordering::Relaxed);
+    }
+}
+
+/// Maximum number of readers supported by the `u64` eligibility bitfield.
+const MAX_READERS: usize = 64;
+
+/// Build an "all eligible" bitfield for `count` readers (clamped to 64).
+fn all_eligible_bits(count: u32) -> u64 {
+    if count >= MAX_READERS as u32 {
+        u64::MAX
+    } else {
+        (1u64 << count) - 1
+    }
+}
+
+/// Convert a pool checkout error into an execution [`Error`].
+fn pool_exec_error(e: deadpool_postgres::PoolError) -> Error {
+    Error::Execution {
+        message: format!("pool error: {e}"),
+        db_code: None,
+        detail: None,
+        hint: None,
     }
 }
 
@@ -143,10 +160,26 @@ impl PgReplicaBackend {
             replica_pools.push(crate::create_pool(dsn, pool_cfg)?);
         }
 
-        let replica_count = replica_pools.len();
-
-        // Build the readers list: replicas first, then optionally primary
+        // Build the readers list: replicas first, then optionally primary.
+        // The eligibility bitfield is a u64, so at most 64 readers are supported.
+        // Reserve a slot for the primary when primary_reads is enabled, then
+        // truncate the replicas so the total reader count never exceeds 64.
         let mut readers: Vec<Pool> = replica_pools;
+        let replica_cap = if config.primary_reads {
+            MAX_READERS - 1
+        } else {
+            MAX_READERS
+        };
+        if readers.len() > replica_cap {
+            tracing::warn!(
+                requested = readers.len(),
+                max = replica_cap,
+                "too many replica readers configured; truncating to fit the 64-reader limit"
+            );
+            readers.truncate(replica_cap);
+        }
+        // Number of replicas actually retained as readers (replicas come first).
+        let replica_count = readers.len();
         if config.primary_reads {
             readers.push(primary.clone());
         }
@@ -181,17 +214,13 @@ impl PgReplicaBackend {
         })
     }
 
-    /// Pick a reader pool for a read query.
+    /// Pick a reader pool for a read query, returning its reader index.
     ///
-    /// Falls back to the primary if no readers are eligible.
-    fn pick_read_pool(&self) -> &Pool {
-        if let Some(idx) = self.health.pick_reader() {
-            if idx < self.readers.len() {
-                return &self.readers[idx];
-            }
-        }
-        // Fallback: always use primary
-        &self.primary
+    /// Returns `None` when no readers are eligible (caller falls back to primary).
+    fn pick_read_pool(&self) -> Option<usize> {
+        self.health
+            .pick_reader()
+            .filter(|&idx| idx < self.readers.len())
     }
 }
 
@@ -200,13 +229,13 @@ impl Backend for PgReplicaBackend {
         // Always introspect from the primary (authoritative schema)
         let cfg = cfg.clone();
         Box::pin(async move {
-            let client = self
+            let mut client = self
                 .primary
                 .get()
                 .await
                 .map_err(|e| Error::Introspection(format!("pool error: {e}")))?;
 
-            introspect::load_schema_cache(&client, &cfg).await
+            introspect::load_schema_cache(&mut client, &cfg).await
         })
     }
 
@@ -221,20 +250,35 @@ impl Backend for PgReplicaBackend {
         let ctx = ctx.clone();
 
         Box::pin(async move {
-            let pool = if ctx.is_mutation {
-                &self.primary
-            } else {
-                self.pick_read_pool()
-            };
+            // Mutations always go to the primary.
+            if ctx.is_mutation {
+                let mut client = self.primary.get().await.map_err(pool_exec_error)?;
+                return execute::execute_query(&mut client, &ctx, &sql, &params).await;
+            }
 
-            let client = pool.get().await.map_err(|e| Error::Execution {
-                message: format!("pool error: {e}"),
-                db_code: None,
-                detail: None,
-                hint: None,
-            })?;
+            // Reads: try an eligible reader, then retry once with the next
+            // eligible reader on checkout failure, then fall back to primary.
+            for _ in 0..2 {
+                let Some(idx) = self.pick_read_pool() else {
+                    break;
+                };
+                match self.readers[idx].get().await {
+                    Ok(mut client) => {
+                        return execute::execute_query(&mut client, &ctx, &sql, &params).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            reader_index = idx,
+                            error = %e,
+                            "reader pool checkout failed, trying next reader"
+                        );
+                    }
+                }
+            }
 
-            execute::execute_query(&client, &ctx, &sql, &params).await
+            // Fall back to the primary.
+            let mut client = self.primary.get().await.map_err(pool_exec_error)?;
+            execute::execute_query(&mut client, &ctx, &sql, &params).await
         })
     }
 
@@ -268,24 +312,24 @@ async fn health_monitor_loop(
 
         let mut eligible: u64 = 0;
 
-        // Get primary WAL position (needed for lag calculation)
-        let primary_lsn = if !lag_disabled {
+        // Get primary WAL position (needed for lag calculation). If the primary
+        // is unreachable we can't compute lag, so we fall back to a connectivity-
+        // only check per replica (primary_lsn = None) rather than blindly marking
+        // every reader — including down replicas — eligible.
+        let primary_lsn = if lag_disabled {
+            None
+        } else {
             match get_primary_lsn(&primary).await {
                 Ok(lsn) => Some(lsn),
                 Err(e) => {
-                    tracing::error!(error = %e, "health monitor: failed to query primary WAL position");
-                    // If we can't reach primary, mark all readers eligible (best-effort)
-                    let all = if health.reader_count >= 64 {
-                        u64::MAX
-                    } else {
-                        (1u64 << health.reader_count) - 1
-                    };
-                    health.set_eligible(all);
-                    continue;
+                    tracing::error!(
+                        error = %e,
+                        "health monitor: failed to query primary WAL position; \
+                         falling back to connectivity-only replica checks"
+                    );
+                    None
                 }
             }
-        } else {
-            None
         };
 
         // Check each reader
@@ -293,7 +337,9 @@ async fn health_monitor_loop(
             let is_replica = i < replica_count;
 
             if is_replica {
-                // Check replica health and lag
+                // Check replica health and lag. When primary_lsn is None (lag
+                // checking disabled OR primary unreachable), check_replica only
+                // verifies connectivity.
                 match check_replica(pool, primary_lsn, config.max_replication_lag_bytes).await {
                     ReplicaStatus::Healthy => {
                         eligible |= 1u64 << i;
@@ -359,7 +405,12 @@ async fn get_primary_lsn(pool: &Pool) -> Result<u64, String> {
         .await
         .map_err(|e| format!("query: {e}"))?;
 
-    let lsn_bytes: i64 = row.get("lsn_bytes");
+    // Use try_get: pg_current_wal_lsn() is non-NULL on a primary, but if the
+    // node is unexpectedly in recovery it returns NULL — treat that as an error
+    // rather than panicking.
+    let lsn_bytes: i64 = row
+        .try_get("lsn_bytes")
+        .map_err(|e| format!("primary WAL lsn unavailable: {e}"))?;
     Ok(lsn_bytes as u64)
 }
 
@@ -374,15 +425,21 @@ async fn check_replica(
         Err(e) => return ReplicaStatus::Unreachable(format!("pool: {e}")),
     };
 
-    // If lag checking is disabled (primary_lsn is None), just check connectivity
+    // If lag checking is unavailable (disabled, or the primary is unreachable),
+    // fall back to a connectivity-only probe. A replica that can't run a trivial
+    // query is unreachable and must not be marked eligible.
     let Some(primary_lsn) = primary_lsn else {
-        return ReplicaStatus::Healthy;
+        return match client.query_one("SELECT 1", &[]).await {
+            Ok(_) => ReplicaStatus::Healthy,
+            Err(e) => ReplicaStatus::Unreachable(format!("query: {e}")),
+        };
     };
 
-    // Query the replica's receive LSN
+    // Query the replica's replayed LSN — the position actually visible to
+    // queries on the replica (per plans/replica-support.md), not merely received.
     let row = match client
         .query_one(
-            "SELECT pg_last_wal_receive_lsn() - '0/0'::pg_lsn AS lsn_bytes",
+            "SELECT pg_last_wal_replay_lsn() - '0/0'::pg_lsn AS lsn_bytes",
             &[],
         )
         .await
@@ -391,7 +448,17 @@ async fn check_replica(
         Err(e) => return ReplicaStatus::Unreachable(format!("query: {e}")),
     };
 
-    let replica_lsn: i64 = row.get("lsn_bytes");
+    // pg_last_wal_replay_lsn() is NULL when the node is not in recovery (e.g. the
+    // "replica" DSN actually points at a primary). Treat NULL/error as
+    // ineligible rather than panicking (which would kill the monitor task).
+    let replica_lsn: i64 = match row.try_get("lsn_bytes") {
+        Ok(v) => v,
+        Err(e) => {
+            return ReplicaStatus::Unreachable(format!(
+                "replay LSN unavailable (node not in recovery?): {e}"
+            ));
+        }
+    };
     let replica_lsn = replica_lsn as u64;
 
     // Calculate lag (primary is always ahead or equal)
@@ -421,6 +488,25 @@ mod tests {
         assert_eq!(nth_set_bit(bits, 1), 3);
         assert_eq!(nth_set_bit(bits, 2), 5);
         assert_eq!(nth_set_bit(bits, 3), 7);
+    }
+
+    #[test]
+    fn test_all_eligible_bits() {
+        assert_eq!(all_eligible_bits(0), 0);
+        assert_eq!(all_eligible_bits(1), 0b1);
+        assert_eq!(all_eligible_bits(3), 0b111);
+        // No shift overflow at or beyond the 64-reader limit.
+        assert_eq!(all_eligible_bits(63), (1u64 << 63) - 1);
+        assert_eq!(all_eligible_bits(64), u64::MAX);
+        assert_eq!(all_eligible_bits(200), u64::MAX);
+    }
+
+    #[test]
+    fn test_health_state_at_64_readers() {
+        // Constructing with 64 readers must not panic (shift-overflow guard).
+        let state = HealthState::new(64);
+        assert_eq!(state.eligible.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(state.pick_reader(), Some(0));
     }
 
     #[test]

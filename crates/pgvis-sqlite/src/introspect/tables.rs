@@ -86,7 +86,7 @@ fn query_columns(
 ) -> Result<IndexMap<String, Column>, SqliteInternalError> {
     let sql = format!("PRAGMA table_xinfo(\"{}\")", escape_ident(table_name));
     let mut stmt = conn.prepare(&sql).map_err(|e| {
-        SqliteInternalError(format!(
+        SqliteInternalError::msg(format!(
             "failed to prepare table_xinfo for {table_name}: {e}"
         ))
     })?;
@@ -94,11 +94,11 @@ fn query_columns(
     // table_xinfo columns: cid, name, type, notnull, dflt_value, pk, hidden
     let mut columns = IndexMap::new();
     let mut rows = stmt.query([]).map_err(|e| {
-        SqliteInternalError(format!("failed to query table_xinfo for {table_name}: {e}"))
+        SqliteInternalError::msg(format!("failed to query table_xinfo for {table_name}: {e}"))
     })?;
 
     while let Some(row) = rows.next().map_err(|e| {
-        SqliteInternalError(format!(
+        SqliteInternalError::msg(format!(
             "table_xinfo iteration failed for {table_name}: {e}"
         ))
     })? {
@@ -161,18 +161,18 @@ fn determine_pk_cols(
     // Fallback: query PRAGMA table_info for pk columns
     let sql = format!("PRAGMA table_info(\"{}\")", escape_ident(table_name));
     let mut stmt = conn.prepare(&sql).map_err(|e| {
-        SqliteInternalError(format!(
+        SqliteInternalError::msg(format!(
             "failed to prepare table_info for {table_name}: {e}"
         ))
     })?;
 
     let mut pk_entries: Vec<(i32, String)> = Vec::new();
     let mut rows = stmt.query([]).map_err(|e| {
-        SqliteInternalError(format!("failed to query table_info for {table_name}: {e}"))
+        SqliteInternalError::msg(format!("failed to query table_info for {table_name}: {e}"))
     })?;
 
     while let Some(row) = rows.next().map_err(|e| {
-        SqliteInternalError(format!("table_info iteration failed for {table_name}: {e}"))
+        SqliteInternalError::msg(format!("table_info iteration failed for {table_name}: {e}"))
     })? {
         let name: String = row.get(1).unwrap_or_default();
         let pk: i32 = row.get(5).unwrap_or(0);
@@ -193,7 +193,7 @@ fn query_unique_constraints(
 ) -> Result<Vec<UniqueConstraint>, SqliteInternalError> {
     let sql = format!("PRAGMA index_list(\"{}\")", escape_ident(table_name));
     let mut stmt = conn.prepare(&sql).map_err(|e| {
-        SqliteInternalError(format!(
+        SqliteInternalError::msg(format!(
             "failed to prepare index_list for {table_name}: {e}"
         ))
     })?;
@@ -201,11 +201,11 @@ fn query_unique_constraints(
     // index_list columns: seq, name, unique, origin, partial
     let mut constraints = Vec::new();
     let mut rows = stmt.query([]).map_err(|e| {
-        SqliteInternalError(format!("failed to query index_list for {table_name}: {e}"))
+        SqliteInternalError::msg(format!("failed to query index_list for {table_name}: {e}"))
     })?;
 
     while let Some(row) = rows.next().map_err(|e| {
-        SqliteInternalError(format!("index_list iteration failed for {table_name}: {e}"))
+        SqliteInternalError::msg(format!("index_list iteration failed for {table_name}: {e}"))
     })? {
         let index_name: String = row.get(1).unwrap_or_default();
         let is_unique: bool = row.get::<_, i32>(2).unwrap_or(0) != 0;
@@ -245,7 +245,7 @@ fn query_index_columns(
 ) -> Result<Vec<String>, SqliteInternalError> {
     let sql = format!("PRAGMA index_info(\"{}\")", escape_ident(index_name));
     let mut stmt = conn.prepare(&sql).map_err(|e| {
-        SqliteInternalError(format!(
+        SqliteInternalError::msg(format!(
             "failed to prepare index_info for {index_name}: {e}"
         ))
     })?;
@@ -253,11 +253,11 @@ fn query_index_columns(
     // index_info columns: seqno, cid, name
     let mut columns: Vec<(i32, String)> = Vec::new();
     let mut rows = stmt.query([]).map_err(|e| {
-        SqliteInternalError(format!("failed to query index_info for {index_name}: {e}"))
+        SqliteInternalError::msg(format!("failed to query index_info for {index_name}: {e}"))
     })?;
 
     while let Some(row) = rows.next().map_err(|e| {
-        SqliteInternalError(format!("index_info iteration failed for {index_name}: {e}"))
+        SqliteInternalError::msg(format!("index_info iteration failed for {index_name}: {e}"))
     })? {
         let seqno: i32 = row.get(0).unwrap_or(0);
         let name: String = row.get(2).unwrap_or_default();

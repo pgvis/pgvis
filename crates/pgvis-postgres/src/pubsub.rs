@@ -261,7 +261,16 @@ async fn listener_task(
             }
         };
 
-        // Re-issue LISTEN for all active channels
+        // Spawn a task to drive the `Connection` and forward async messages
+        // (notifications) over an mpsc channel. This is essential: `Client`
+        // requests (LISTEN/UNLISTEN below) only make progress while the
+        // `Connection` future is being polled. Driving it in a separate task
+        // means our LISTEN commands complete instead of deadlocking.
+        let (async_tx, mut async_rx) = mpsc::unbounded_channel();
+        let conn_task = tokio::spawn(drive_connection(connection, async_tx));
+
+        // Re-issue LISTEN for all active channels. The connection is now being
+        // polled by `conn_task`, so batch_execute makes progress.
         let channels: Vec<String> = active.lock().await.iter().cloned().collect();
         let mut listen_failed = false;
         for channel in &channels {
@@ -275,6 +284,7 @@ async fn listener_task(
         }
 
         if listen_failed {
+            conn_task.abort();
             attempt = attempt.saturating_add(1);
             let delay = backoff_delay(attempt, config.reconnect_base_ms, config.reconnect_max_ms);
             tokio::time::sleep(delay).await;
@@ -284,12 +294,16 @@ async fn listener_task(
         // Run the event loop on this connection
         let should_shutdown = connection_event_loop(
             &client,
-            connection,
+            &mut async_rx,
             &config,
             &mut cmd_rx,
             &notify_tx,
         )
         .await;
+
+        // Drop the client and stop driving the connection before reconnecting.
+        drop(client);
+        conn_task.abort();
 
         if should_shutdown {
             tracing::info!("pub/sub listener shutting down");
@@ -309,20 +323,44 @@ async fn listener_task(
     }
 }
 
-/// Drives the connection and processes commands + notifications.
+/// Drive a `Connection` future to completion, forwarding every `AsyncMessage`
+/// (notifications, notices, …) over `async_tx`.
+///
+/// tokio-postgres only advances in-flight `Client` requests and delivers
+/// notifications while this future is polled, so it runs in its own task.
+/// When the connection ends (error or close), the channel is dropped, which
+/// signals the event loop to reconnect.
+async fn drive_connection(
+    mut connection: Connection<Socket, NoTlsStream>,
+    async_tx: mpsc::UnboundedSender<Result<AsyncMessage, tokio_postgres::Error>>,
+) {
+    loop {
+        match std::future::poll_fn(|cx| connection.poll_message(cx)).await {
+            Some(msg) => {
+                // If the receiver is gone, the event loop has moved on — stop.
+                if async_tx.send(msg).is_err() {
+                    return;
+                }
+            }
+            None => return, // Connection closed cleanly.
+        }
+    }
+}
+
+/// Drives command handling and consumes forwarded notifications.
 ///
 /// Returns `true` if shutdown was requested, `false` if the connection broke.
 async fn connection_event_loop(
     client: &tokio_postgres::Client,
-    mut connection: Connection<Socket, NoTlsStream>,
+    async_rx: &mut mpsc::UnboundedReceiver<Result<AsyncMessage, tokio_postgres::Error>>,
     config: &PubSubConfig,
     cmd_rx: &mut mpsc::Receiver<PubSubCmd>,
     notify_tx: &broadcast::Sender<PubSubMessage>,
 ) -> bool {
     loop {
         tokio::select! {
-            // Drive the connection and extract async messages (notifications)
-            msg = std::future::poll_fn(|cx| connection.poll_message(cx)) => {
+            // Consume async messages forwarded by the connection driver task.
+            msg = async_rx.recv() => {
                 match msg {
                     Some(Ok(AsyncMessage::Notification(n))) => {
                         let logical_channel = config

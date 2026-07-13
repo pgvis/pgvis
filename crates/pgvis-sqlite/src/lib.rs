@@ -81,6 +81,9 @@ impl SqliteBackend {
 
     /// Open with a configurable number of reader connections.
     pub async fn open_with_readers(path: &str, reader_count: usize) -> Result<Self, Error> {
+        // Always keep at least one reader; `next_reader` indexes `readers` with
+        // `% self.readers.len()`, which panics on an empty pool.
+        let reader_count = reader_count.max(1);
         let path = normalize_path(path);
 
         // For :memory: databases, use a shared-cache URI so all connections
@@ -200,13 +203,53 @@ impl Backend for SqliteBackend {
 }
 
 /// Normalize the DSN/path for SQLite.
+///
+/// Accepts bare paths, `:memory:`, and `sqlite:`/`sqlite://` URIs. For the
+/// authority form (`sqlite://foo.db`), the `//` is stripped so relative paths
+/// resolve to the intended file rather than `//foo.db`. `sqlite::memory:` maps to
+/// `:memory:`.
 fn normalize_path(path: &str) -> String {
     if path == ":memory:" {
         return path.to_string();
     }
-    if let Some(stripped) = path.strip_prefix("sqlite:") {
-        stripped.to_string()
-    } else {
-        path.to_string()
+    let stripped = path.strip_prefix("sqlite:").unwrap_or(path);
+    // `sqlite://foo.db` -> `//foo.db` after removing `sqlite:`; drop the leading
+    // `//` (empty authority) so the remainder is treated as a plain path. An
+    // absolute URI (`sqlite:///abs/path` -> `///abs/path`) keeps its leading `/`.
+    let stripped = stripped.strip_prefix("//").unwrap_or(stripped);
+    stripped.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_path_memory() {
+        assert_eq!(normalize_path(":memory:"), ":memory:");
+        assert_eq!(normalize_path("sqlite::memory:"), ":memory:");
+    }
+
+    #[test]
+    fn normalize_path_relative_authority() {
+        assert_eq!(normalize_path("sqlite://foo.db"), "foo.db");
+        assert_eq!(normalize_path("sqlite:foo.db"), "foo.db");
+        assert_eq!(normalize_path("foo.db"), "foo.db");
+    }
+
+    #[test]
+    fn normalize_path_absolute() {
+        assert_eq!(normalize_path("sqlite:///abs/path.db"), "/abs/path.db");
+        assert_eq!(normalize_path("/abs/path.db"), "/abs/path.db");
+    }
+
+    #[tokio::test]
+    async fn open_with_zero_readers_does_not_panic() {
+        // reader_count is clamped to >=1 so next_reader() cannot divide by zero.
+        let backend = SqliteBackend::open_with_readers(":memory:", 0)
+            .await
+            .expect("open should succeed");
+        // Exercise the reader pool.
+        let _ = backend.next_reader();
     }
 }

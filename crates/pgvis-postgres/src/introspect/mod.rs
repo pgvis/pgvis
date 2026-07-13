@@ -69,28 +69,36 @@ async fn check_pg_version(client: &Client) -> Result<i32, Error> {
 /// Returns [`Error::Introspection`] if any introspection query fails or if the
 /// PostgreSQL version is below 17.
 pub async fn load_schema_cache(
-    client: &Client,
+    client: &mut Client,
     cfg: &IntrospectConfig,
 ) -> Result<SchemaCache, Error> {
     // Enforce minimum PG version before proceeding with introspection.
     check_pg_version(client).await?;
 
-    // Wrap in a transaction so SET LOCAL takes effect for all introspection queries.
-    // Without a transaction, SET LOCAL is a no-op on pooled connections.
-    client
-        .batch_execute("BEGIN; SET LOCAL search_path = ''")
+    // Wrap in a RAII transaction so SET LOCAL takes effect for all introspection
+    // queries. Without a transaction, SET LOCAL is a no-op on pooled connections.
+    // If this future is dropped mid-introspection, `Transaction`'s Drop impl
+    // rolls back, so the connection never returns to the pool with an open
+    // transaction or a lingering `search_path` override.
+    let tx = client
+        .transaction()
         .await
         .map_err(|e| Error::Introspection(format!("failed to begin introspection tx: {e}")))?;
 
-    let result = run_introspection(client, cfg).await;
-
-    // Always end the transaction (COMMIT on success, ROLLBACK on error).
-    // Either way, SET LOCAL is reverted when the transaction ends.
-    let end_sql = if result.is_ok() { "COMMIT" } else { "ROLLBACK" };
-    client
-        .batch_execute(end_sql)
+    tx.batch_execute("SET LOCAL search_path = ''")
         .await
-        .map_err(|e| Error::Introspection(format!("failed to end introspection tx: {e}")))?;
+        .map_err(|e| Error::Introspection(format!("failed to set search_path: {e}")))?;
+
+    // Run introspection queries on the transaction's client (SET LOCAL applies).
+    let result = run_introspection(tx.client(), cfg).await;
+
+    // Always end the transaction. Either way, SET LOCAL is reverted when it ends.
+    let end = if result.is_ok() {
+        tx.commit().await
+    } else {
+        tx.rollback().await
+    };
+    end.map_err(|e| Error::Introspection(format!("failed to end introspection tx: {e}")))?;
 
     result
 }

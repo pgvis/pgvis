@@ -91,13 +91,13 @@ impl Backend for PgBackend {
     fn introspect(&self, cfg: &IntrospectConfig) -> BoxFuture<'_, Result<SchemaCache, Error>> {
         let cfg = cfg.clone();
         Box::pin(async move {
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .map_err(|e| Error::Introspection(format!("pool error: {e}")))?;
 
-            introspect::load_schema_cache(&client, &cfg).await
+            introspect::load_schema_cache(&mut client, &cfg).await
         })
     }
 
@@ -111,14 +111,14 @@ impl Backend for PgBackend {
         let params = params.to_vec();
         let ctx = ctx.clone();
         Box::pin(async move {
-            let client = self.pool.get().await.map_err(|e| Error::Execution {
+            let mut client = self.pool.get().await.map_err(|e| Error::Execution {
                 message: format!("pool error: {e}"),
                 db_code: None,
                 detail: None,
                 hint: None,
             })?;
 
-            execute::execute_query(&client, &ctx, &sql, &params).await
+            execute::execute_query(&mut client, &ctx, &sql, &params).await
         })
     }
 
