@@ -71,9 +71,13 @@ impl<'d> RenderContext<'d> {
     }
 
     /// Quote an identifier (table/column name) using the dialect's quote character.
+    ///
+    /// Any embedded quote character is doubled so that an alias or identifier
+    /// containing the quote char cannot terminate the quoting early.
     pub fn quote_ident(&self, name: &str) -> String {
         let q = self.dialect.identifier_quote;
-        format!("{q}{name}{q}")
+        let escaped = name.replace(q, &format!("{q}{q}"));
+        format!("{q}{escaped}{q}")
     }
 
     /// Emit a qualified table reference: `"schema"."table"` or just `"table"`.

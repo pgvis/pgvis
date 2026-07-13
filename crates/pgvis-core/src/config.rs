@@ -113,10 +113,12 @@ impl RoutingConfig {
     /// assert_eq!(compat.schema_path_prefix("public"), "");
     /// ```
     pub fn schema_path_prefix(&self, schema: &str) -> String {
-        let prefix_part = if self.prefix.is_empty() {
+        // Normalise so a configured prefix like `/api/` doesn't produce `//api//`.
+        let normalized = self.normalized_prefix();
+        let prefix_part = if normalized.is_empty() {
             String::new()
         } else {
-            format!("/{}", self.prefix)
+            format!("/{normalized}")
         };
 
         if self.schema_in_path {

@@ -154,89 +154,107 @@ impl Preferences {
             if let Some((key, value)) = part.split_once('=') {
                 let key = key.trim();
                 let value = value.trim();
+                // Per RFC 7240 §2, the first occurrence of a preference wins and
+                // an unrecognised value is ignored (never clears an already-parsed
+                // value). Each arm only assigns when the field is still unset, and
+                // an invalid value pushes to `unknown` without overwriting.
                 match key {
                     "return" => {
-                        prefs.return_repr = match value {
+                        let parsed = match value {
                             "representation" => Some(PreferReturn::Representation),
                             "minimal" => Some(PreferReturn::Minimal),
                             "headers-only" => Some(PreferReturn::HeadersOnly),
                             "none" => Some(PreferReturn::None),
-                            _ => {
-                                unknown.push(part.to_string());
-                                None
-                            }
+                            _ => None,
                         };
+                        match parsed {
+                            Some(v) if prefs.return_repr.is_none() => prefs.return_repr = Some(v),
+                            Some(_) => {}
+                            None => unknown.push(part.to_string()),
+                        }
                     }
                     "count" => {
-                        prefs.count = match value {
+                        let parsed = match value {
                             "exact" => Some(PreferCount::Exact),
                             "planned" => Some(PreferCount::Planned),
                             "estimated" => Some(PreferCount::Estimated),
-                            _ => {
-                                unknown.push(part.to_string());
-                                None
-                            }
+                            _ => None,
                         };
-                    }
-                    "resolution" => {
-                        prefs.resolution = match value {
-                            "merge-duplicates" => Some(PreferResolution::MergeDuplicates),
-                            "ignore-duplicates" => Some(PreferResolution::IgnoreDuplicates),
-                            _ => {
-                                unknown.push(part.to_string());
-                                None
-                            }
-                        };
-                    }
-                    "handling" => {
-                        prefs.handling = match value {
-                            "strict" => Some(PreferHandling::Strict),
-                            "lenient" => Some(PreferHandling::Lenient),
-                            _ => {
-                                unknown.push(part.to_string());
-                                None
-                            }
-                        };
-                    }
-                    "timezone" => {
-                        prefs.timezone = Some(value.to_string());
-                    }
-                    "missing" => {
-                        prefs.missing = match value {
-                            "default" => Some(PreferMissing::Default),
-                            "null" => Some(PreferMissing::Null),
-                            _ => {
-                                unknown.push(part.to_string());
-                                None
-                            }
-                        };
-                    }
-                    "tx" => {
-                        prefs.tx = match value {
-                            "commit" => Some(PreferTx::Commit),
-                            "rollback" => Some(PreferTx::Rollback),
-                            _ => {
-                                unknown.push(part.to_string());
-                                None
-                            }
-                        };
-                    }
-                    "max-affected" => {
-                        if let Ok(n) = value.parse::<u64>() {
-                            prefs.max_affected = Some(n);
-                        } else {
-                            unknown.push(part.to_string());
+                        match parsed {
+                            Some(v) if prefs.count.is_none() => prefs.count = Some(v),
+                            Some(_) => {}
+                            None => unknown.push(part.to_string()),
                         }
                     }
+                    "resolution" => {
+                        let parsed = match value {
+                            "merge-duplicates" => Some(PreferResolution::MergeDuplicates),
+                            "ignore-duplicates" => Some(PreferResolution::IgnoreDuplicates),
+                            _ => None,
+                        };
+                        match parsed {
+                            Some(v) if prefs.resolution.is_none() => prefs.resolution = Some(v),
+                            Some(_) => {}
+                            None => unknown.push(part.to_string()),
+                        }
+                    }
+                    "handling" => {
+                        let parsed = match value {
+                            "strict" => Some(PreferHandling::Strict),
+                            "lenient" => Some(PreferHandling::Lenient),
+                            _ => None,
+                        };
+                        match parsed {
+                            Some(v) if prefs.handling.is_none() => prefs.handling = Some(v),
+                            Some(_) => {}
+                            None => unknown.push(part.to_string()),
+                        }
+                    }
+                    "timezone" => {
+                        if prefs.timezone.is_none() {
+                            prefs.timezone = Some(value.to_string());
+                        }
+                    }
+                    "missing" => {
+                        let parsed = match value {
+                            "default" => Some(PreferMissing::Default),
+                            "null" => Some(PreferMissing::Null),
+                            _ => None,
+                        };
+                        match parsed {
+                            Some(v) if prefs.missing.is_none() => prefs.missing = Some(v),
+                            Some(_) => {}
+                            None => unknown.push(part.to_string()),
+                        }
+                    }
+                    "tx" => {
+                        let parsed = match value {
+                            "commit" => Some(PreferTx::Commit),
+                            "rollback" => Some(PreferTx::Rollback),
+                            _ => None,
+                        };
+                        match parsed {
+                            Some(v) if prefs.tx.is_none() => prefs.tx = Some(v),
+                            Some(_) => {}
+                            None => unknown.push(part.to_string()),
+                        }
+                    }
+                    "max-affected" => match value.parse::<u64>() {
+                        Ok(n) if prefs.max_affected.is_none() => prefs.max_affected = Some(n),
+                        Ok(_) => {}
+                        Err(_) => unknown.push(part.to_string()),
+                    },
                     "params" => {
-                        prefs.params = match value {
+                        let parsed = match value {
                             "multiple-objects" => Some(PreferParams::MultipleObjects),
                             // "single-object" was removed in PostgREST v13
-                            _ => {
-                                unknown.push(part.to_string());
-                                None
-                            }
+                            _ => None,
                         };
+                        match parsed {
+                            Some(v) if prefs.params.is_none() => prefs.params = Some(v),
+                            Some(_) => {}
+                            None => unknown.push(part.to_string()),
+                        }
                     }
                     _ => {
                         unknown.push(part.to_string());

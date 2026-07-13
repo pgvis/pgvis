@@ -10,6 +10,7 @@
 use crate::cache::Cardinality;
 use crate::error::Error;
 use crate::plan::types::{EmbeddedResource, ReadPlan, ResolvedJoin};
+use crate::select_ast::JoinType;
 
 use super::RenderContext;
 use super::fragment;
@@ -56,6 +57,19 @@ pub fn render_read(plan: &ReadPlan, ctx: &mut RenderContext<'_>) -> Result<Strin
         .as_ref()
         .map(|cursor| fragment::render_cursor_condition(cursor, Some(table_alias), ctx));
 
+    // --- Inner-join embeds ---
+    // `!inner` restricts the parent to rows that have at least one matching
+    // child. With correlated-subquery embedding, that means an EXISTS predicate
+    // on the parent. (Rendered after the cursor so bound params stay in order.)
+    let mut inner_exists = Vec::new();
+    for embed in &plan.embeds {
+        if matches!(embed.join_type, Some(JoinType::Inner)) {
+            if let Some(pred) = render_embed_exists(embed, table_alias, ctx) {
+                inner_exists.push(pred);
+            }
+        }
+    }
+
     // --- GROUP BY ---
     let group_by = fragment::render_group_by(&plan.select, Some(table_alias), ctx);
 
@@ -68,23 +82,20 @@ pub fn render_read(plan: &ReadPlan, ctx: &mut RenderContext<'_>) -> Result<Strin
     // --- Assemble ---
     let mut sql = format!("SELECT {select_clause} FROM {from_clause}");
 
-    // Combine WHERE clause and cursor condition
-    match (&where_clause, &cursor_condition) {
-        (Some(wc), Some(cc)) => {
-            sql.push_str(" WHERE ");
-            sql.push_str(wc);
-            sql.push_str(" AND ");
-            sql.push_str(cc);
-        }
-        (Some(wc), None) => {
-            sql.push_str(" WHERE ");
-            sql.push_str(wc);
-        }
-        (None, Some(cc)) => {
-            sql.push_str(" WHERE ");
-            sql.push_str(cc);
-        }
-        (None, None) => {}
+    // Combine WHERE clause, cursor condition, and inner-join EXISTS predicates.
+    let mut where_parts: Vec<&str> = Vec::new();
+    if let Some(wc) = &where_clause {
+        where_parts.push(wc);
+    }
+    if let Some(cc) = &cursor_condition {
+        where_parts.push(cc);
+    }
+    for pred in &inner_exists {
+        where_parts.push(pred);
+    }
+    if !where_parts.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_parts.join(" AND "));
     }
 
     if let Some(gb) = group_by {
@@ -282,6 +293,76 @@ fn render_embed(
     Ok(embed_expr)
 }
 
+/// Render an `EXISTS (...)` predicate for an `!inner` embed, correlating the
+/// child (and any junction table) back to the parent. Returns `None` for
+/// computed relationships, which have no static join condition.
+fn render_embed_exists(
+    embed: &EmbeddedResource,
+    parent_alias: &str,
+    ctx: &mut RenderContext<'_>,
+) -> Option<String> {
+    if matches!(embed.join, ResolvedJoin::Computed { .. }) {
+        return None;
+    }
+
+    let child_plan = &embed.plan;
+    let child_table_ref = ctx.qualified_table(&child_plan.target.schema, &child_plan.target.name);
+    let child_alias = &child_plan.target.name;
+
+    let join_condition = render_join_condition(&embed.join, parent_alias, child_alias, ctx);
+
+    let mut inner = format!(
+        "SELECT 1 FROM {child_table_ref} AS {}",
+        ctx.quote_ident(child_alias)
+    );
+
+    // Junction table for M2M (mirrors render_embed).
+    if let ResolvedJoin::Junction {
+        junction_table,
+        junction_target_columns,
+        target_columns,
+        ..
+    } = &embed.join
+    {
+        let jt_ref = ctx.qualified_table(&junction_table.schema, &junction_table.name);
+        let jt_alias = &junction_table.name;
+        inner.push_str(&format!(
+            " INNER JOIN {jt_ref} AS {} ON ",
+            ctx.quote_ident(jt_alias)
+        ));
+        let jt_conditions: Vec<String> = junction_target_columns
+            .iter()
+            .zip(target_columns.iter())
+            .map(|(jc, tc)| {
+                format!(
+                    "{}.{} = {}.{}",
+                    ctx.quote_ident(jt_alias),
+                    ctx.quote_ident(jc),
+                    ctx.quote_ident(child_alias),
+                    ctx.quote_ident(tc),
+                )
+            })
+            .collect();
+        inner.push_str(&jt_conditions.join(" AND "));
+    }
+
+    let child_where = fragment::render_where_clause(
+        &child_plan.filters,
+        &child_plan.logic_filters,
+        Some(child_alias),
+        ctx,
+    );
+
+    let mut conditions = vec![join_condition];
+    if let Some(cw) = child_where {
+        conditions.push(cw);
+    }
+    inner.push_str(" WHERE ");
+    inner.push_str(&conditions.join(" AND "));
+
+    Some(format!("EXISTS ({inner})"))
+}
+
 /// Build a `json_object('col1', "col1", 'col2', "col2", ...)` expression
 /// from the embed's select list. Used for SQLite which cannot serialize row references.
 fn build_sqlite_json_object(
@@ -302,7 +383,11 @@ fn build_sqlite_json_object(
             }
             ResolvedSelect::Column(col) => {
                 let name = col.alias.as_deref().unwrap_or(&col.name);
-                pairs.push(format!("'{}', {}", name, ctx.quote_ident(&col.name)));
+                pairs.push(format!(
+                    "'{}', {}",
+                    name.replace('\'', "''"),
+                    ctx.quote_ident(&col.name)
+                ));
             }
             ResolvedSelect::Aggregate(agg) => {
                 let func = agg.function.sql_name();
@@ -314,7 +399,7 @@ fn build_sqlite_json_object(
                     .alias
                     .as_deref()
                     .unwrap_or_else(|| agg.column.as_deref().unwrap_or(func));
-                pairs.push(format!("'{}', {func}({inner})", alias_name));
+                pairs.push(format!("'{}', {func}({inner})", alias_name.replace('\'', "''")));
             }
             ResolvedSelect::Embed(_) => {
                 // Embeds are appended separately by render_embed; not part of the row JSON
@@ -430,6 +515,7 @@ mod tests {
                     name: "id".to_string(),
                     alias: None,
                     json_path: vec![],
+                    cast: None,
                     data_type: "integer".to_string(),
                     nullable: false,
                 }),
@@ -437,6 +523,7 @@ mod tests {
                     name: "name".to_string(),
                     alias: None,
                     json_path: vec![],
+                    cast: None,
                     data_type: "text".to_string(),
                     nullable: true,
                 }),

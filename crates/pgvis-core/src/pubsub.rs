@@ -367,6 +367,17 @@ impl PubSubConfig {
                 code: PubSubErrorCode::InvalidChannel,
             });
         }
+        // Postgres truncates LISTEN identifiers at NAMEDATALEN-1 (63 bytes) while
+        // pg_notify errors on longer names — so a too-long prefixed channel would
+        // silently never deliver. Reject it up front.
+        if self.channel_prefix.len() + channel.len() > 63 {
+            return Err(Error::PubSub {
+                message: format!(
+                    "channel '{channel}' is too long (prefix + name must be <= 63 bytes)"
+                ),
+                code: PubSubErrorCode::InvalidChannel,
+            });
+        }
         if !self.is_channel_allowed(channel) {
             return Err(Error::PubSub {
                 message: format!("channel '{channel}' is not in the allowed list"),
@@ -474,31 +485,32 @@ fn glob_match(pattern: &str, input: &str) -> bool {
         return pattern == input;
     }
 
-    let mut pos = 0;
+    let first = parts[0];
+    let last = parts[parts.len() - 1];
 
-    // First part must be a prefix
-    if let Some(first) = parts.first() {
-        if !first.is_empty() {
-            if !input.starts_with(*first) {
-                return false;
-            }
-            pos = first.len();
-        }
+    // Prefix and suffix must anchor at the ends.
+    if !input.starts_with(first) || !input.ends_with(last) {
+        return false;
     }
 
-    // Last part must be a suffix
-    if let Some(last) = parts.last() {
-        if !last.is_empty() && !input[pos..].ends_with(*last) {
-            return false;
-        }
+    // The region available for middle parts lies strictly between the prefix and
+    // the suffix; if they overlap, the pattern cannot match.
+    let start = first.len();
+    let Some(end) = input.len().checked_sub(last.len()) else {
+        return false;
+    };
+    if start > end {
+        return false;
     }
 
-    // Middle parts must appear in order
-    for part in &parts[1..parts.len().saturating_sub(1)] {
+    // Middle parts must appear, in order, within that region — so a middle part
+    // cannot borrow characters the suffix already claimed.
+    let mut pos = start;
+    for part in &parts[1..parts.len() - 1] {
         if part.is_empty() {
             continue;
         }
-        if let Some(idx) = input[pos..].find(*part) {
+        if let Some(idx) = input[pos..end].find(*part) {
             pos += idx + part.len();
         } else {
             return false;

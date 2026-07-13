@@ -13,6 +13,7 @@ use crate::select_ast::{FieldSelect, RelationSelect, SelectItem, SpreadSelect};
 
 use super::planner::PlanConfig;
 use super::types::*;
+use super::validate;
 
 // ---------------------------------------------------------------------------
 // Table resolution
@@ -123,6 +124,9 @@ fn resolve_field_select(table: &Table, field: &FieldSelect) -> Result<ResolvedSe
             return Ok(ResolvedSelect::Aggregate(ResolvedAggregate {
                 function: *agg_fn,
                 column: None,
+                json_path: Vec::new(),
+                cast: field.cast.clone(),
+                aggregate_cast: field.aggregate_cast.clone(),
                 alias: field.alias.clone(),
             }));
         }
@@ -131,6 +135,9 @@ fn resolve_field_select(table: &Table, field: &FieldSelect) -> Result<ResolvedSe
         return Ok(ResolvedSelect::Aggregate(ResolvedAggregate {
             function: *agg_fn,
             column: Some(field.name.clone()),
+            json_path: field.json_path.clone(),
+            cast: field.cast.clone(),
+            aggregate_cast: field.aggregate_cast.clone(),
             alias: field.alias.clone(),
         }));
     }
@@ -141,6 +148,7 @@ fn resolve_field_select(table: &Table, field: &FieldSelect) -> Result<ResolvedSe
         name: field.name.clone(),
         alias: field.alias.clone(),
         json_path: field.json_path.clone(),
+        cast: field.cast.clone(),
         data_type: col.typ.clone(),
         nullable: col.nullable,
     }))
@@ -242,6 +250,10 @@ pub fn resolve_embed(
     //     row_to_json handles both forms identically, so this is safe for all backends.
     let child_selects = expand_star_for_embed(target_table, child_selects);
 
+    // 7c. Validate and collect any aggregates in the embedded select so the
+    //     enablement check applies to children and GROUP BY synthesis works.
+    let child_aggregates = validate::validate_aggregates(&child_selects, config)?;
+
     // 8. Build child read plan
     let child_plan = ReadPlan {
         target: target_id.clone(),
@@ -257,7 +269,7 @@ pub fn resolve_embed(
             cursor_column: None,
         },
         logic_filters: Vec::new(),
-        aggregates: Vec::new(),
+        aggregates: child_aggregates,
         count: None,
         preferences: Default::default(),
     };
@@ -266,6 +278,7 @@ pub fn resolve_embed(
         name: rel.name.clone(),
         alias: rel.alias.clone(),
         join,
+        join_type: rel.join_type,
         plan: child_plan,
         is_spread: false,
     })
@@ -468,7 +481,9 @@ fn resolve_filter(
 
     Ok(ResolvedFilter {
         column: filter.field.clone(),
+        json_path: filter.json_path.clone(),
         operator: filter.operator.clone(),
+        quantifier: filter.quantifier,
         value: filter.value.clone(),
         negated: filter.negate,
         rewrite,
@@ -504,6 +519,7 @@ pub fn resolve_order(
             let _col = resolve_column(table, &term.field)?;
             Ok(ResolvedOrder {
                 column: term.field.clone(),
+                json_path: term.json_path.clone(),
                 direction: term.direction,
                 nulls: term.nulls,
             })
@@ -679,6 +695,7 @@ fn expand_star_for_embed(table: &Table, selects: Vec<ResolvedSelect>) -> Vec<Res
                         name: col_name.clone(),
                         alias: None,
                         json_path: vec![],
+                        cast: None,
                         data_type: col.typ.clone(),
                         nullable: col.nullable,
                     }));

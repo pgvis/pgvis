@@ -154,6 +154,7 @@ fn plan_read(
                 0,
                 ResolvedOrder {
                     column: cursor_col_name,
+                    json_path: Vec::new(),
                     direction: OrderDirection::Asc,
                     nulls: None,
                 },
@@ -224,19 +225,32 @@ fn plan_mutate(
         RequestMethod::Post => {
             let payload_columns = extract_payload_columns(&request.body);
             let is_bulk = matches!(&request.body, Some(RequestBody::Bulk(_)));
-            let on_conflict = request.on_conflict.as_ref().map(|col| {
-                let columns: Vec<String> = col.split(',').map(|s| s.trim().to_string()).collect();
-                let resolution = match request.preferences.resolution {
-                    Some(crate::preferences::PreferResolution::IgnoreDuplicates) => {
-                        ConflictResolution::IgnoreDuplicates
-                    }
-                    _ => ConflictResolution::MergeDuplicates,
-                };
-                ResolvedConflict {
-                    columns,
-                    resolution,
+            // Determine the conflict target. An explicit `on_conflict=` param wins;
+            // otherwise, when the client asked for upsert semantics via
+            // `Prefer: resolution=merge-duplicates`/`ignore-duplicates`, PostgREST
+            // defaults the target to the table's primary key.
+            let conflict_resolution = match request.preferences.resolution {
+                Some(crate::preferences::PreferResolution::IgnoreDuplicates) => {
+                    Some(ConflictResolution::IgnoreDuplicates)
                 }
-            });
+                Some(crate::preferences::PreferResolution::MergeDuplicates) => {
+                    Some(ConflictResolution::MergeDuplicates)
+                }
+                None => None,
+            };
+            let on_conflict = match (&request.on_conflict, conflict_resolution) {
+                (Some(col), resolution) => Some(ResolvedConflict {
+                    columns: col.split(',').map(|s| s.trim().to_string()).collect(),
+                    resolution: resolution.unwrap_or(ConflictResolution::MergeDuplicates),
+                }),
+                (None, Some(resolution)) if !table_info.primary_key_columns.is_empty() => {
+                    Some(ResolvedConflict {
+                        columns: table_info.primary_key_columns.clone(),
+                        resolution,
+                    })
+                }
+                (None, _) => None,
+            };
             MutationType::Insert {
                 payload_columns,
                 is_bulk,
@@ -359,22 +373,14 @@ fn extract_payload_columns(body: &Option<RequestBody>) -> Vec<String> {
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default(),
         Some(RequestBody::Bulk(arr)) => {
-            // Union of all keys across all objects.
-            // Optimisation: most bulk inserts have uniform shape, so once we've
-            // seen all keys from the first object we can skip subsequent objects
-            // that don't introduce new columns.
+            // Union of all keys across all objects. A heterogeneous bulk insert
+            // may introduce new columns in any object, so every object must be
+            // scanned (an early break would silently drop later columns).
             let mut cols = indexmap::IndexSet::new();
             for obj in arr {
                 if let Some(map) = obj.as_object() {
-                    let prev_len = cols.len();
                     for key in map.keys() {
                         cols.insert(key.clone());
-                    }
-                    // If this object didn't add any new columns and we already
-                    // have at least one object's worth, subsequent uniform
-                    // objects won't either — skip the rest.
-                    if cols.len() == prev_len && prev_len > 0 {
-                        break;
                     }
                 }
             }

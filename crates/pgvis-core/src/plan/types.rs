@@ -9,9 +9,9 @@ use crate::cache::{Cardinality, IsolationLevel, QualifiedIdentifier, Volatility}
 use crate::preferences::Preferences;
 use crate::query_params::types::{
     CursorSpec, Filter, FilterValue, LogicTree, NullsOrder, Operator, OrderDirection, OrderTerm,
-    RangeSpec,
+    Quantifier, RangeSpec,
 };
-use crate::select_ast::{AggregateFunction, JsonOperation, SelectItem};
+use crate::select_ast::{AggregateFunction, JoinType, JsonOperation, SelectItem};
 
 // ---------------------------------------------------------------------------
 // ApiRequest — adapter-agnostic input to the plan layer
@@ -170,6 +170,8 @@ pub struct ResolvedColumn {
     pub alias: Option<String>,
     /// JSON path operations (for JSONB columns).
     pub json_path: Vec<JsonOperation>,
+    /// Cast applied to the column (`::type`).
+    pub cast: Option<String>,
     /// The column's data type (from schema cache).
     pub data_type: String,
     /// Whether this column is nullable.
@@ -183,6 +185,12 @@ pub struct ResolvedAggregate {
     pub function: AggregateFunction,
     /// The column to aggregate (None for count(*)).
     pub column: Option<String>,
+    /// JSON path applied to the column before aggregation.
+    pub json_path: Vec<JsonOperation>,
+    /// Cast applied to the column before aggregation (`amount::numeric.sum()`).
+    pub cast: Option<String>,
+    /// Cast applied to the aggregate result (`.sum()::text`).
+    pub aggregate_cast: Option<String>,
     /// Alias for the result.
     pub alias: Option<String>,
 }
@@ -200,6 +208,8 @@ pub struct EmbeddedResource {
     pub alias: Option<String>,
     /// The fully-resolved join strategy.
     pub join: ResolvedJoin,
+    /// Join type override (`!inner` excludes parent rows with no children).
+    pub join_type: Option<JoinType>,
     /// The child's own read plan (recursive).
     pub plan: ReadPlan,
     /// Whether this is a spread embed (`...posts(title)` flattens into parent).
@@ -264,8 +274,12 @@ pub enum ResolvedJoin {
 pub struct ResolvedFilter {
     /// Column name.
     pub column: String,
+    /// JSON path on the column (e.g. `data->>key`).
+    pub json_path: Vec<JsonOperation>,
     /// The operator.
     pub operator: Operator,
+    /// Optional quantifier (`eq(any)`, `gte(all)`).
+    pub quantifier: Option<Quantifier>,
     /// The filter value.
     pub value: FilterValue,
     /// Whether this is negated (`not.eq.5`).
@@ -302,6 +316,8 @@ pub enum FilterRewrite {
 pub struct ResolvedOrder {
     /// Column name.
     pub column: String,
+    /// JSON path on the column (e.g. `order=data->key.asc`).
+    pub json_path: Vec<JsonOperation>,
     /// Sort direction.
     pub direction: OrderDirection,
     /// Nulls ordering.

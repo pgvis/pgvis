@@ -7,7 +7,9 @@ use crate::plan::types::{
     FilterRewrite, ResolvedCursor, ResolvedFilter, ResolvedLogicNode, ResolvedLogicTree,
     ResolvedOrder, ResolvedSelect,
 };
-use crate::query_params::types::{FilterValue, IsKind, NullsOrder, Operator, OrderDirection};
+use crate::query_params::types::{
+    FilterValue, IsKind, NullsOrder, Operator, OrderDirection, Quantifier,
+};
 use crate::select_ast::{JsonOperand, JsonOperation};
 use serde_json::Value;
 
@@ -48,7 +50,11 @@ fn render_filter(
     table_alias: Option<&str>,
     ctx: &mut RenderContext<'_>,
 ) -> String {
-    let col = qualified_column(table_alias, &filter.column, ctx);
+    // Apply any JSON path (`data->>'key'`) to the column reference.
+    let mut col = qualified_column(table_alias, &filter.column, ctx);
+    for json_op in &filter.json_path {
+        col = render_json_path(&col, json_op);
+    }
 
     // Check for dialect-specific rewrite
     if let Some(rewrite) = &filter.rewrite {
@@ -56,6 +62,16 @@ fn render_filter(
     }
 
     let negation = if filter.negated { "NOT " } else { "" };
+
+    // Full-text search operators wrap the query text in a *_tsquery function.
+    if let Some(fts) = render_fts_filter(&col, filter, negation, ctx) {
+        return fts;
+    }
+
+    // Quantified comparison: `col op ANY(ARRAY[...])` / `ALL(...)`.
+    if let Some(quantifier) = filter.quantifier {
+        return render_quantified_filter(&col, filter, quantifier, negation, ctx);
+    }
 
     match &filter.operator {
         // IS operator — no parameter needed
@@ -108,6 +124,64 @@ fn render_filter(
             format!("{negation}{col} {sql_op} {placeholder}")
         }
     }
+}
+
+/// Render a full-text-search filter, or `None` if the operator isn't FTS.
+///
+/// Postgres wraps the query text in the appropriate `*_tsquery` function; SQLite
+/// (FTS5) uses the `MATCH` operator.
+fn render_fts_filter(
+    col: &str,
+    filter: &ResolvedFilter,
+    negation: &str,
+    ctx: &mut RenderContext<'_>,
+) -> Option<String> {
+    let (fn_name, lang) = match &filter.operator {
+        Operator::Fts(l) => ("to_tsquery", l),
+        Operator::PlainFts(l) => ("plainto_tsquery", l),
+        Operator::PhraseFts(l) => ("phraseto_tsquery", l),
+        Operator::WebFts(l) => ("websearch_to_tsquery", l),
+        _ => return None,
+    };
+    let query_ph = push_filter_value(&filter.value, ctx);
+    if ctx.dialect.supports_row_to_json {
+        // Postgres: `col @@ to_tsquery(['lang'::regconfig,] query)`
+        let tsquery = match lang {
+            Some(l) => {
+                let lang_ph = ctx.push_param(Value::from(l.as_str()));
+                format!("{fn_name}({lang_ph}::regconfig, {query_ph})")
+            }
+            None => format!("{fn_name}({query_ph})"),
+        };
+        Some(format!("{negation}{col} @@ {tsquery}"))
+    } else {
+        // SQLite FTS5 exposes matching via the MATCH operator.
+        Some(format!("{negation}{col} MATCH {query_ph}"))
+    }
+}
+
+/// Render a quantified comparison: `col op ANY(ARRAY[...])` / `ALL(...)`.
+fn render_quantified_filter(
+    col: &str,
+    filter: &ResolvedFilter,
+    quantifier: Quantifier,
+    negation: &str,
+    ctx: &mut RenderContext<'_>,
+) -> String {
+    let quant = match quantifier {
+        Quantifier::Any => "ANY",
+        Quantifier::All => "ALL",
+    };
+    let placeholders = match &filter.value {
+        FilterValue::List(values) => values
+            .iter()
+            .map(|v| ctx.push_param(Value::from(v.as_str())))
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => push_filter_value(other, ctx),
+    };
+    let sql_op = operator_to_sql(&filter.operator);
+    format!("{negation}{col} {sql_op} {quant}(ARRAY[{placeholders}])")
 }
 
 /// Render a filter that has a dialect-specific rewrite annotation.
@@ -269,7 +343,10 @@ pub fn render_order_clause(
     let terms: Vec<String> = order
         .iter()
         .map(|term| {
-            let col = qualified_column(table_alias, &term.column, ctx);
+            let mut col = qualified_column(table_alias, &term.column, ctx);
+            for json_op in &term.json_path {
+                col = render_json_path(&col, json_op);
+            }
             let dir = match term.direction {
                 OrderDirection::Asc => "ASC",
                 OrderDirection::Desc => "DESC",
@@ -321,6 +398,11 @@ pub fn render_select_list(
                     expr = render_json_path(&expr, json_op);
                 }
 
+                // Apply cast (`::type`)
+                if let Some(cast) = &col.cast {
+                    expr = render_cast(&expr, cast, ctx);
+                }
+
                 // Apply alias
                 if let Some(alias) = &col.alias {
                     Some(format!("{expr} AS {}", ctx.quote_ident(alias)))
@@ -330,18 +412,27 @@ pub fn render_select_list(
             }
             ResolvedSelect::Aggregate(agg) => {
                 let func = agg.function.sql_name();
-                let inner = match &agg.column {
+                let mut inner = match &agg.column {
                     Some(col_name) => qualified_column(table_alias, col_name, ctx),
                     None => "*".to_string(),
                 };
+                // JSON path + pre-aggregation cast apply to the column argument.
+                for json_op in &agg.json_path {
+                    inner = render_json_path(&inner, json_op);
+                }
+                if let Some(cast) = &agg.cast {
+                    inner = render_cast(&inner, cast, ctx);
+                }
+                let mut expr = format!("{func}({inner})");
+                // Post-aggregation cast applies to the aggregate result.
+                if let Some(cast) = &agg.aggregate_cast {
+                    expr = render_cast(&expr, cast, ctx);
+                }
                 let alias_name = agg
                     .alias
                     .as_deref()
                     .unwrap_or_else(|| agg.column.as_deref().unwrap_or(func));
-                Some(format!(
-                    "{func}({inner}) AS {}",
-                    ctx.quote_ident(alias_name)
-                ))
+                Some(format!("{expr} AS {}", ctx.quote_ident(alias_name)))
             }
             ResolvedSelect::Embed(_) => None, // Embeds are handled separately
         })
@@ -368,10 +459,28 @@ fn render_json_path(expr: &str, op: &JsonOperation) -> String {
     }
 }
 
+/// Render a `CAST(expr AS type)` expression.
+///
+/// The target type name is sanitised to a conservative identifier subset
+/// (letters, digits, underscore, spaces, and `[]` for arrays) so a user-supplied
+/// `::type` token cannot break out of the cast.
+fn render_cast(expr: &str, cast_type: &str, _ctx: &RenderContext<'_>) -> String {
+    let safe: String = cast_type
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ' ' | '[' | ']'))
+        .collect();
+    if safe.is_empty() {
+        expr.to_string()
+    } else {
+        format!("CAST({expr} AS {safe})")
+    }
+}
+
 /// Convert a JSON operand to its SQL representation.
 fn json_operand_to_sql(operand: &JsonOperand) -> String {
     match operand {
-        JsonOperand::Key(k) => format!("'{k}'"),
+        // Escape single quotes to keep the key inside the string literal.
+        JsonOperand::Key(k) => format!("'{}'", k.replace('\'', "''")),
         JsonOperand::Index(i) => i.to_string(),
     }
 }
@@ -494,7 +603,9 @@ mod tests {
         let mut ctx = RenderContext::new(&POSTGRES);
         let filter = ResolvedFilter {
             column: "age".to_string(),
+            json_path: vec![],
             operator: Operator::Eq,
+            quantifier: None,
             value: FilterValue::Single("25".to_string()),
             negated: false,
             rewrite: None,
@@ -508,7 +619,9 @@ mod tests {
         let mut ctx = RenderContext::new(&POSTGRES);
         let filter = ResolvedFilter {
             column: "bio".to_string(),
+            json_path: vec![],
             operator: Operator::Is,
+            quantifier: None,
             value: FilterValue::Is(IsKind::Null),
             negated: false,
             rewrite: None,
@@ -522,7 +635,9 @@ mod tests {
         let mut ctx = RenderContext::new(&POSTGRES);
         let filter = ResolvedFilter {
             column: "status".to_string(),
+            json_path: vec![],
             operator: Operator::In,
+            quantifier: None,
             value: FilterValue::List(vec!["active".to_string(), "pending".to_string()]),
             negated: false,
             rewrite: None,
@@ -536,7 +651,9 @@ mod tests {
         let mut ctx = RenderContext::new(&POSTGRES);
         let filter = ResolvedFilter {
             column: "name".to_string(),
+            json_path: vec![],
             operator: Operator::Like,
+            quantifier: None,
             value: FilterValue::Single("%smith%".to_string()),
             negated: true,
             rewrite: None,
@@ -550,7 +667,9 @@ mod tests {
         let mut ctx = RenderContext::new(&crate::dialect::SQLITE);
         let filter = ResolvedFilter {
             column: "name".to_string(),
+            json_path: vec![],
             operator: Operator::ILike,
+            quantifier: None,
             value: FilterValue::Single("%smith%".to_string()),
             negated: false,
             rewrite: Some(FilterRewrite::InstrFallback),

@@ -116,27 +116,29 @@ impl ErrorCode {
     /// errors, and `"PGV001"` for pgvis-specific errors.
     pub fn as_str(&self) -> &'static str {
         match self {
+            // All query-string parse failures share PGRST100 in PostgREST.
             Self::ConnectionError => "PGRST000",
-            Self::InvalidSelect => "PGRST100",
-            Self::InvalidFilter => "PGRST101",
-            Self::InvalidOrder => "PGRST102",
+            Self::InvalidSelect | Self::InvalidFilter | Self::InvalidOrder => "PGRST100",
             Self::InvalidRange => "PGRST103",
-            Self::InvalidBody => "PGRST104",
-            Self::InvalidPreference => "PGRST105",
-            Self::AmbiguousRelationship => "PGRST200",
+            Self::InvalidBody => "PGRST102",
+            Self::InvalidPreference => "PGRST122",
+            // PGRST200 = relationship not found; PGRST201 = ambiguous embedding.
+            Self::AmbiguousRelationship => "PGRST201",
+            Self::RelationshipNotFound => "PGRST200",
             Self::AmbiguousFunction => "PGRST203",
-            Self::NotFound => "PGRST204",
-            Self::RelationshipNotFound => "PGRST201",
-            Self::ColumnNotFound => "PGRST202",
-            Self::SpreadOnToMany => "PGRST127",
+            // PGRST202 = function not found; PGRST204 = column not found; PGRST205 = table not found.
+            Self::NotFound => "PGRST205",
+            Self::ColumnNotFound => "PGRST204",
+            Self::SpreadOnToMany => "PGRST119",
             Self::AggregatesDisabled => "PGRST123",
-            Self::JwtMissing => "PGRST300",
+            // PGRST301 = JWT invalid/expired; PGRST302 = anonymous access disabled.
+            Self::JwtMissing => "PGRST302",
             Self::JwtInvalid => "PGRST301",
-            Self::JwtExpired => "PGRST302",
+            Self::JwtExpired => "PGRST301",
             Self::InsufficientPrivilege => "PGRST303",
             Self::DatabaseError => "PGRST400",
-            Self::StatementTimeout => "PGRST401",
-            Self::MaxAffectedExceeded => "PGRST402",
+            Self::StatementTimeout => "PGRST109",
+            Self::MaxAffectedExceeded => "PGRST124",
             Self::UnsupportedOperation => "PGV001",
             Self::Internal => "PGV500",
             Self::ConfigError => "PGV002",
@@ -153,11 +155,15 @@ impl ErrorCode {
             Self::InvalidSelect
             | Self::InvalidFilter
             | Self::InvalidOrder
-            | Self::InvalidRange
             | Self::InvalidBody
             | Self::InvalidPreference => 400,
+            // PostgREST returns 416 for an unsatisfiable range (PGRST103).
+            Self::InvalidRange => 416,
+            // Ambiguous embedding/function → 300 Multiple Choices.
             Self::AmbiguousRelationship | Self::AmbiguousFunction => 300,
-            Self::NotFound | Self::RelationshipNotFound | Self::ColumnNotFound => 404,
+            // Table/function not found → 404; relationship/column not found → 400.
+            Self::NotFound => 404,
+            Self::RelationshipNotFound | Self::ColumnNotFound => 400,
             Self::SpreadOnToMany | Self::AggregatesDisabled => 400,
             Self::JwtMissing | Self::JwtInvalid | Self::JwtExpired => 401,
             Self::InsufficientPrivilege => 403,
@@ -320,8 +326,14 @@ impl Error {
                     "23503" => 409, // foreign_key_violation
                     "23502" => 400, // not_null_violation
                     "23514" => 400, // check_violation
+                    "22P02" | "22003" | "22007" => 400, // invalid text/numeric/datetime input
                     "42501" => 403, // insufficient_privilege
                     "42P01" => 404, // undefined_table
+                    "42883" => 404, // undefined_function
+                    "57014" => 504, // query_canceled (statement timeout)
+                    "25006" => 405, // read_only_sql_transaction
+                    // Connection-exception class (08xxx) → service unavailable.
+                    c if c.starts_with("08") => 503,
                     _ => 500,
                 };
             }

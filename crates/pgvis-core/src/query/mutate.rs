@@ -315,7 +315,9 @@ mod tests {
             returning: vec![ResolvedSelect::Star],
             filters: vec![crate::plan::types::ResolvedFilter {
                 column: "id".to_string(),
+                json_path: vec![],
                 operator: crate::query_params::types::Operator::Eq,
+                quantifier: None,
                 value: crate::query_params::types::FilterValue::Single("5".to_string()),
                 negated: false,
                 rewrite: None,
