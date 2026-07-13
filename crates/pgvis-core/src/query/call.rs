@@ -8,6 +8,10 @@ use crate::plan::types::CallPlan;
 use serde_json::Value;
 
 use super::RenderContext;
+use super::fragment;
+
+/// Alias bound to a set/table-returning function's result for projection.
+const RPC_RESULT_ALIAS: &str = "pgvis_rpc";
 
 /// Render a [`CallPlan`] into the inner SQL (without CTE wrapper).
 ///
@@ -45,8 +49,31 @@ pub fn render_call(plan: &CallPlan, ctx: &mut RenderContext<'_>) -> Result<Strin
     let args_sql = args.join(", ");
 
     let sql = if plan.function_info.returns_set || plan.function_info.returns_table {
-        // Set-returning or composite-returning function: SELECT * FROM fn(args)
-        format!("SELECT * FROM {fn_ref}({args_sql})")
+        // Set/composite-returning function. Wrap the call in a subquery so the
+        // client's select projection, filters, ordering, and pagination apply to
+        // the result set (PostgREST supports `?select=`/`?col=eq.x`/`?order=`/`?limit=`).
+        let alias = RPC_RESULT_ALIAS;
+        let projection = fragment::render_select_list(&plan.returning, Some(alias), ctx);
+        let mut out = format!(
+            "SELECT {projection} FROM {fn_ref}({args_sql}) AS {}",
+            ctx.quote_ident(alias)
+        );
+
+        if let Some(wc) =
+            fragment::render_where_clause(&plan.filters, &plan.logic_filters, Some(alias), ctx)
+        {
+            out.push_str(" WHERE ");
+            out.push_str(&wc);
+        }
+        if let Some(ob) = fragment::render_order_clause(&plan.order, Some(alias), ctx) {
+            out.push_str(" ORDER BY ");
+            out.push_str(&ob);
+        }
+        if let Some(lo) = fragment::render_limit_offset(plan.range.limit, plan.range.offset) {
+            out.push(' ');
+            out.push_str(&lo);
+        }
+        out
     } else {
         // Scalar/single-row function: SELECT fn(args) AS result
         format!("SELECT {fn_ref}({args_sql}) AS result")
@@ -60,7 +87,18 @@ mod tests {
     use super::*;
     use crate::cache::{QualifiedIdentifier, Volatility};
     use crate::dialect::POSTGRES;
-    use crate::plan::types::{CallPlan, ResolvedFunctionInfo, ResolvedParam, ResolvedSelect};
+    use crate::plan::types::{
+        CallPlan, ResolvedFunctionInfo, ResolvedParam, ResolvedRange, ResolvedSelect,
+    };
+
+    fn empty_range() -> ResolvedRange {
+        ResolvedRange {
+            limit: None,
+            offset: None,
+            cursor: None,
+            cursor_column: None,
+        }
+    }
     use crate::preferences::Preferences;
 
     #[test]
@@ -81,6 +119,10 @@ mod tests {
                 is_variadic: false,
             }],
             returning: vec![ResolvedSelect::Star],
+            filters: vec![],
+            logic_filters: vec![],
+            order: vec![],
+            range: empty_range(),
             is_singular: false,
             preferences: Preferences::default(),
             body: None,
@@ -91,7 +133,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "SELECT * FROM \"public\".\"get_users\"(\"min_age\" := $1)"
+            "SELECT \"pgvis_rpc\".* FROM \"public\".\"get_users\"(\"min_age\" := $1) AS \"pgvis_rpc\""
         );
     }
 
@@ -121,6 +163,10 @@ mod tests {
                 },
             ],
             returning: vec![ResolvedSelect::Star],
+            filters: vec![],
+            logic_filters: vec![],
+            order: vec![],
+            range: empty_range(),
             is_singular: true,
             preferences: Preferences::default(),
             body: None,
@@ -148,6 +194,10 @@ mod tests {
             },
             params: vec![],
             returning: vec![ResolvedSelect::Star],
+            filters: vec![],
+            logic_filters: vec![],
+            order: vec![],
+            range: empty_range(),
             is_singular: true,
             preferences: Preferences::default(),
             body: None,

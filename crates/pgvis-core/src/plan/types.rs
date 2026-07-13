@@ -489,6 +489,14 @@ pub struct CallPlan {
     pub params: Vec<ResolvedParam>,
     /// Columns to return from the result.
     pub returning: Vec<ResolvedSelect>,
+    /// Filters applied to a set/table-returning function's result.
+    pub filters: Vec<ResolvedFilter>,
+    /// Logic-tree filters applied to the result.
+    pub logic_filters: Vec<ResolvedLogicTree>,
+    /// Ordering applied to the result.
+    pub order: Vec<ResolvedOrder>,
+    /// Limit/offset applied to the result (with server-side cap).
+    pub range: ResolvedRange,
     /// Whether to return a single object or an array.
     pub is_singular: bool,
     /// Response preferences.

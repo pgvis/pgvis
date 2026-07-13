@@ -315,10 +315,23 @@ fn plan_call(
     // Resolve parameters from the request body
     let params = resolve_call_params(routine, &request.body)?;
 
-    // Resolve returning columns from select parameter
-    let returning = if routine.return_type_is_composite && !request.select.is_empty() {
-        // For table-valued functions, resolve select columns against the return type
-        if let Some(return_table) = cache.find_table(&request.schema, &routine.return_type) {
+    // For a table/composite-returning function whose result type is a known
+    // table, we can resolve select/filters/order against its columns. Otherwise
+    // projection and filtering can't be validated, so they're left empty.
+    let return_table = if routine.return_type_is_composite {
+        // `return_type` may be schema-qualified (`schema.type`) when the composite
+        // type lives outside pg_catalog; fall back to the request schema otherwise.
+        let (rt_schema, rt_name) = match routine.return_type.split_once('.') {
+            Some((schema, name)) => (schema, name),
+            None => (request.schema.as_str(), routine.return_type.as_str()),
+        };
+        cache.find_table(rt_schema, rt_name)
+    } else {
+        None
+    };
+
+    let returning = match (return_table, request.select.is_empty()) {
+        (Some(return_table), false) => {
             let (selects, _embeds) = resolve::resolve_select_items(
                 cache,
                 return_table,
@@ -328,15 +341,28 @@ fn plan_call(
                 config,
             )?;
             selects
-        } else {
-            // Can't resolve columns — just pass star
-            vec![ResolvedSelect::Star]
         }
-    } else if request.select.is_empty() {
-        vec![ResolvedSelect::Star]
+        _ => vec![ResolvedSelect::Star],
+    };
+
+    // Resolve result-level filters/order/range for set/table-returning functions.
+    let (filters, logic_filters, order, range) = if let Some(return_table) = return_table {
+        let filters = resolve::resolve_filters(return_table, &request.filters, dialect)?;
+        let logic_filters = request
+            .logic_filters
+            .iter()
+            .map(|lt| resolve::resolve_logic_tree(return_table, lt, dialect))
+            .collect::<Result<Vec<_>, _>>()?;
+        let order = resolve::resolve_order(return_table, &request.order)?;
+        let range = resolve::resolve_range(&request.range, config.max_rows);
+        (filters, logic_filters, order, range)
     } else {
-        // Non-composite return: can't validate columns, pass through as star
-        vec![ResolvedSelect::Star]
+        (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            resolve::resolve_range(&None, config.max_rows),
+        )
     };
 
     let is_singular = !routine.return_type_is_set;
@@ -346,6 +372,10 @@ fn plan_call(
         function_info,
         params,
         returning,
+        filters,
+        logic_filters,
+        order,
+        range,
         is_singular,
         preferences: request.preferences.clone(),
         body: request.body.clone(),
