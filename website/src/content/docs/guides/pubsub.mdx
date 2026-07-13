@@ -28,7 +28,7 @@ Or in your TOML configuration:
 enabled = true
 channel_prefix = "pgvis:"      # optional, default "pgvis:"
 max_payload_bytes = 7500        # optional, default 7500
-buffer_capacity = 256           # optional, default 256
+channel_buffer_size = 64        # optional, default 64
 allowed_channels = []           # empty = allow all
 ```
 
@@ -89,7 +89,7 @@ curl -X POST http://localhost:3000/pubsub/notifications \
   -d '{"event":"order_placed","order_id":42}'
 ```
 
-**Response:** `204 No Content` on success, or an error JSON body with appropriate status code.
+**Response:** `200 OK` with `{"ok": true}` on success, or an error JSON body with the appropriate status code.
 
 ### Channel Status
 
@@ -318,7 +318,7 @@ async fn main() -> anyhow::Result<()> {
 | `enabled` | bool | `false` | Enable the pub/sub subsystem |
 | `channel_prefix` | string | `"pgvis:"` | Prefix added to Postgres channel names |
 | `max_payload_bytes` | usize | `7500` | Maximum payload size (Postgres limit is ~8000) |
-| `buffer_capacity` | usize | `256` | In-process broadcast buffer per channel |
+| `channel_buffer_size` | usize | `64` | In-process broadcast buffer per channel |
 | `allowed_channels` | string[] | `[]` | Channel allowlist (empty = allow all). Supports glob patterns: `chat.*`, `events.*` |
 
 ### Environment Variables

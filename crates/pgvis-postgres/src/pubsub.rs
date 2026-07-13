@@ -121,27 +121,23 @@ impl PgPubSub {
         })
     }
 
-    /// Get a `broadcast::Receiver` for notifications.
-    ///
-    /// This is the primary way for the [`PubSubHub`] to consume notifications.
-    /// Each call returns a new independent receiver.
-    pub fn subscribe_broadcast(&self) -> broadcast::Receiver<PubSubMessage> {
-        self.notify_tx.subscribe()
-    }
 }
 
 impl PubSubBackend for PgPubSub {
     fn listen(&self, channel: &str) -> BoxFuture<'_, Result<(), Error>> {
         let channel = channel.to_string();
         Box::pin(async move {
-            self.active.lock().await.insert(channel.clone());
+            // Only record the channel as active once the command is enqueued, so a
+            // failed send doesn't leave a phantom entry that reconnect would re-LISTEN.
             self.cmd_tx
-                .send(PubSubCmd::Listen(channel))
+                .send(PubSubCmd::Listen(channel.clone()))
                 .await
                 .map_err(|_| Error::PubSub {
                     message: "listener task is not running".to_string(),
                     code: PubSubErrorCode::ConnectionLost,
-                })
+                })?;
+            self.active.lock().await.insert(channel);
+            Ok(())
         })
     }
 
@@ -428,12 +424,40 @@ async fn connection_event_loop(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Exponential backoff with ~10% jitter.
+/// Deterministic exponential-backoff base (capped at `max_ms`), before jitter.
+fn backoff_base(attempt: u32, base_ms: u64, max_ms: u64) -> u64 {
+    let multiplier = 1u64.checked_shl(attempt.min(20)).unwrap_or(u64::MAX);
+    base_ms.saturating_mul(multiplier).min(max_ms)
+}
+
+/// Exponential backoff with randomized jitter (up to ~20%).
+///
+/// The jitter is drawn from process/time entropy so that multiple instances
+/// that disconnect together don't reconnect in lockstep (thundering herd).
 fn backoff_delay(attempt: u32, base_ms: u64, max_ms: u64) -> Duration {
-    let exp = base_ms.saturating_mul(1u64.wrapping_shl(attempt.min(20)));
-    let capped = exp.min(max_ms);
-    let jitter = capped / 10;
+    let capped = backoff_base(attempt, base_ms, max_ms);
+    let jitter_range = capped / 5;
+    let jitter = if jitter_range == 0 {
+        0
+    } else {
+        jitter_entropy() % (jitter_range + 1)
+    };
     Duration::from_millis(capped.saturating_add(jitter))
+}
+
+/// A cheap, non-cryptographic entropy source for backoff jitter.
+///
+/// Mixes the current time's nanoseconds with the thread id — good enough to
+/// desynchronize reconnects across instances without pulling in an RNG crate.
+fn jitter_entropy() -> u64 {
+    use std::time::SystemTime;
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let mut hasher = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&std::thread::current().id(), &mut hasher);
+    nanos ^ std::hash::Hasher::finish(&hasher)
 }
 
 /// Escape a string for use inside double-quotes in SQL.
@@ -486,17 +510,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_backoff_delay() {
-        let d = backoff_delay(0, 500, 30_000);
-        assert!(d.as_millis() >= 500);
-        assert!(d.as_millis() <= 600); // 500 + 10% jitter
+    fn test_backoff_base_deterministic() {
+        assert_eq!(backoff_base(0, 500, 30_000), 500);
+        assert_eq!(backoff_base(1, 500, 30_000), 1000);
+        assert_eq!(backoff_base(2, 500, 30_000), 2000);
+        // Caps at max_ms and never overflows for large attempts.
+        assert_eq!(backoff_base(30, 500, 30_000), 30_000);
+        assert_eq!(backoff_base(1000, 500, 30_000), 30_000);
+    }
 
-        let d = backoff_delay(1, 500, 30_000);
-        assert!(d.as_millis() >= 1000);
-
-        // Should cap at max
-        let d = backoff_delay(30, 500, 30_000);
-        assert!(d.as_millis() <= 33_000); // 30000 + 10%
+    #[test]
+    fn test_backoff_delay_within_jittered_bounds() {
+        for attempt in 0..5 {
+            let base = backoff_base(attempt, 500, 30_000);
+            let d = backoff_delay(attempt, 500, 30_000).as_millis() as u64;
+            assert!(d >= base, "delay {d} below base {base}");
+            assert!(d <= base + base / 5 + 1, "delay {d} exceeds base+20% {base}");
+        }
     }
 
     #[test]

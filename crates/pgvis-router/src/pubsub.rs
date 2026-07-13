@@ -87,11 +87,7 @@ impl PubSubHub {
 
         // Start the dispatch task that reads from the backend notification stream
         let dispatch_hub = hub.clone();
-        tokio::spawn(async move {
-            if let Err(e) = dispatch_loop(dispatch_hub).await {
-                tracing::error!(error = %e, "pub/sub dispatch loop terminated with error");
-            }
-        });
+        tokio::spawn(dispatch_loop(dispatch_hub));
 
         Ok(hub)
     }
@@ -242,21 +238,32 @@ pub struct ChannelInfo {
 
 /// Reads messages from the backend notification stream and dispatches them
 /// to the appropriate per-channel broadcast sender.
-async fn dispatch_loop(hub: Arc<PubSubHub>) -> Result<(), Error> {
-    let mut stream = hub.backend.notification_stream().await?;
-
-    while let Some(msg) = stream.next().await {
-        let channels = hub.channels.lock().await;
-        if let Some(state) = channels.get(&msg.channel) {
-            // Broadcast to local subscribers — ignore "no receivers" error
-            let _ = state.tx.send(msg);
+///
+/// The stream normally lives for the whole process (the backend's broadcast
+/// sender is stable across reconnects). If it ever ends or fails to open, the
+/// loop re-opens it after a short delay so the hub never becomes a zombie that
+/// holds subscribers but delivers nothing.
+async fn dispatch_loop(hub: Arc<PubSubHub>) {
+    loop {
+        match hub.backend.notification_stream().await {
+            Ok(mut stream) => {
+                while let Some(msg) = stream.next().await {
+                    let channels = hub.channels.lock().await;
+                    if let Some(state) = channels.get(&msg.channel) {
+                        // Broadcast to local subscribers — ignore "no receivers".
+                        let _ = state.tx.send(msg);
+                    }
+                    // Messages for channels with no local subscribers are dropped
+                    // (they can arrive briefly during UNLISTEN propagation).
+                }
+                tracing::warn!("pub/sub dispatch stream ended; re-opening");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to open pub/sub notification stream; retrying");
+            }
         }
-        // Drop messages for channels with no local subscribers
-        // (they might arrive briefly during UNLISTEN propagation)
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-
-    tracing::warn!("pub/sub dispatch stream ended");
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -376,7 +383,7 @@ fn make_sse_stream(
                         match result {
                             Ok(msg) => {
                                 let json = serde_json::to_string(&msg).unwrap_or_default();
-                                let event = format!("data: {json}\n\n");
+                                let event = format!("event: message\ndata: {json}\n\n");
                                 return Some((
                                     Ok(bytes::Bytes::from(event)),
                                     (rx, guard, interval),
@@ -454,8 +461,14 @@ pub async fn handle_publish(
 /// Returns the current pub/sub status including active channels and subscriber counts.
 pub async fn handle_status(
     axum::extract::State(state): axum::extract::State<PubSubState>,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    // Status exposes channel names and subscriber counts, so it requires the same
+    // authentication as subscribe/publish when JWT is configured.
+    if let Err(resp) = authorize_pubsub(&state, &headers) {
+        return resp;
+    }
     let status = state.hub.status().await;
     axum::Json(status).into_response()
 }
