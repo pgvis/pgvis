@@ -676,9 +676,18 @@ mod tests {
         };
         assert_eq!(render(empty(Operator::In, None, false)), "FALSE");
         assert_eq!(render(empty(Operator::In, None, true)), "TRUE");
-        assert_eq!(render(empty(Operator::Eq, Some(Quantifier::Any), false)), "FALSE");
-        assert_eq!(render(empty(Operator::Eq, Some(Quantifier::All), false)), "TRUE");
-        assert_eq!(render(empty(Operator::Eq, Some(Quantifier::Any), true)), "TRUE");
+        assert_eq!(
+            render(empty(Operator::Eq, Some(Quantifier::Any), false)),
+            "FALSE"
+        );
+        assert_eq!(
+            render(empty(Operator::Eq, Some(Quantifier::All), false)),
+            "TRUE"
+        );
+        assert_eq!(
+            render(empty(Operator::Eq, Some(Quantifier::Any), true)),
+            "TRUE"
+        );
     }
 
     #[test]

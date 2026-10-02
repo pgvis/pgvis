@@ -351,7 +351,10 @@ mod tests {
                 _ => panic!("expected field"),
             })
             .collect();
-        assert_eq!(casts, [Some("text[]".into()), Some("double precision".into())]);
+        assert_eq!(
+            casts,
+            [Some("text[]".into()), Some("double precision".into())]
+        );
     }
 
     #[test]

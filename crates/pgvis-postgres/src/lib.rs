@@ -214,7 +214,9 @@ pub(crate) fn tls_connector() -> MakeRustlsConnect {
                 tracing::warn!(ignored, "ignored unparsable platform CA certificates");
             }
             if added == 0 {
-                tracing::warn!("no platform CA certificates found; TLS to Postgres will fail verification");
+                tracing::warn!(
+                    "no platform CA certificates found; TLS to Postgres will fail verification"
+                );
             }
             let config = rustls::ClientConfig::builder_with_provider(Arc::new(
                 rustls::crypto::ring::default_provider(),

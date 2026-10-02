@@ -253,7 +253,7 @@ fn build_content_range(result: &QueryResult, request_offset: Option<u64>) -> Str
     } else {
         let offset = request_offset.unwrap_or(0);
         // `offset` comes straight from the client, so don't let it overflow.
-        let range_end = offset.saturating_add(page as u64 - 1);
+        let range_end = offset.saturating_add(page.cast_unsigned() - 1);
         format!("{offset}-{range_end}/{total}")
     }
 }

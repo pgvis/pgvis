@@ -33,8 +33,8 @@ use futures::future::BoxFuture;
 use pgvis_core::error::Error;
 use pgvis_core::pubsub::{PubSubBackend, PubSubConfig, PubSubErrorCode, PubSubMessage, PubSubStream};
 use tokio::sync::{broadcast, mpsc, Mutex};
-use tokio_postgres::{AsyncMessage, Connection, Socket};
 use tokio_postgres::tls::MakeTlsConnect;
+use tokio_postgres::{AsyncMessage, Connection, Socket};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::{create_pool, tls_connector};
