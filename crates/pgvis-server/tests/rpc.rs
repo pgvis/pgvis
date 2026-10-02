@@ -802,14 +802,25 @@ async fn test_in_process_rpc_echo_defaults() {
 #[tokio::test]
 async fn test_in_process_rpc_with_role() {
     let ips = in_process_state();
-    // Call with a specific role — should still work for public functions
+    // Call with a specific role — should still work for public functions. Use
+    // the role the test DSN connects as: a fixed name like `postgres` doesn't
+    // exist on a locally initdb'd cluster.
+    let (client, connection) = tokio_postgres::connect(&test_dsn(), tokio_postgres::NoTls)
+        .await
+        .expect("failed to connect to test database");
+    tokio::spawn(connection);
+    let role: String = client
+        .query_one("SELECT current_user::text", &[])
+        .await
+        .expect("current_user")
+        .get(0);
     let result = ips
         .state
         .call_rpc(
             "test",
             "add",
             json!({"a": 1, "b": 2}),
-            &pgvis_router::CallerIdentity::with_role("postgres"),
+            &pgvis_router::CallerIdentity::with_role(&role),
         )
         .await
         .expect("call_rpc with role should succeed");

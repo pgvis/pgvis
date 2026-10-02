@@ -184,8 +184,17 @@ impl PgvisServer {
     }
 }
 
-/// Run schema.sql and seed.sql against the test database.
+/// Run schema.sql and seed.sql against the test database, once per test binary.
+///
+/// A binary may start several shared fixtures concurrently (rpc.rs runs an HTTP
+/// server and an in-process state); schema.sql drops and recreates the schema,
+/// so a second run would pull it out from under tests already using the first.
 pub async fn setup_test_db(dsn: &str) {
+    static DONE: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    DONE.get_or_init(|| load_fixtures(dsn)).await;
+}
+
+async fn load_fixtures(dsn: &str) {
     let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
         .await
         .expect("failed to connect to test database");

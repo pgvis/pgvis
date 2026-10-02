@@ -373,10 +373,13 @@ async fn test_combined_select_filter_order_limit() {
 
 #[tokio::test]
 async fn test_get_is_idempotent() {
-    let resp1 = get("/api/test/items?order=id.asc").await;
+    // Only the seeded rows (ids 1-10): the POST tests in this binary insert
+    // items concurrently, which would otherwise change the second read.
+    let resp1 = get("/api/test/items?id=lte.10&order=id.asc").await;
     let body1: serde_json::Value = resp1.json().await.unwrap();
+    assert_eq!(body1.as_array().map(Vec::len), Some(10), "seeded items");
 
-    let resp2 = get("/api/test/items?order=id.asc").await;
+    let resp2 = get("/api/test/items?id=lte.10&order=id.asc").await;
     let body2: serde_json::Value = resp2.json().await.unwrap();
 
     assert_eq!(body1, body2, "GET should be idempotent");
