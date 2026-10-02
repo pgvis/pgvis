@@ -154,8 +154,7 @@ async fn test_introspect_relationships() {
 
     // items.user_id → users.id should create M2O
     let items_ident = pgvis_core::QualifiedIdentifier::new("main", "items");
-    let item_rels = cache.find_relationships(&items_ident);
-    let user_rel = item_rels.iter().find(|r| {
+    let user_rel = cache.find_relationships(&items_ident).find(|r| {
         r.source_table.name == "items"
             && r.target_table.name == "users"
             && matches!(r.cardinality, Cardinality::M2O)
@@ -173,8 +172,7 @@ async fn test_introspect_inverse_relationships() {
 
     // Should have O2M from users to items (inverse of items→users M2O)
     let users_ident = pgvis_core::QualifiedIdentifier::new("main", "users");
-    let user_rels = cache.find_relationships(&users_ident);
-    let o2m_rel = user_rels.iter().find(|r| {
+    let o2m_rel = cache.find_relationships(&users_ident).find(|r| {
         r.source_table.name == "users"
             && r.target_table.name == "items"
             && matches!(r.cardinality, Cardinality::O2M)
@@ -216,8 +214,7 @@ async fn test_introspect_self_referential() {
         .unwrap();
 
     let cat_ident = pgvis_core::QualifiedIdentifier::new("main", "categories");
-    let cat_rels = cache.find_relationships(&cat_ident);
-    let self_rel = cat_rels.iter().find(|r| r.is_self);
+    let self_rel = cache.find_relationships(&cat_ident).find(|r| r.is_self);
     assert!(
         self_rel.is_some(),
         "categories should have a self-referential FK"

@@ -671,4 +671,16 @@ mod tests {
         assert_eq!(PubSubErrorCode::NotAvailable.http_status(), 501);
         assert_eq!(PubSubErrorCode::MaxSubscribersExceeded.http_status(), 503);
     }
+
+    #[test]
+    fn test_pubsub_error_reports_its_code_through_generic_accessors() {
+        // The REST and MCP error builders use `Error::code()`; it must not
+        // degrade a pub/sub error to Internal/PGV500.
+        let err = Error::PubSub {
+            message: "denied".into(),
+            code: PubSubErrorCode::ChannelDenied,
+        };
+        assert_eq!(err.code().as_str(), "PGVIS_PUBSUB_CHANNEL_DENIED");
+        assert_eq!(err.http_status(), 403);
+    }
 }

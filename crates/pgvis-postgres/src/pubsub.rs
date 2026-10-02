@@ -33,10 +33,11 @@ use futures::future::BoxFuture;
 use pgvis_core::error::Error;
 use pgvis_core::pubsub::{PubSubBackend, PubSubConfig, PubSubErrorCode, PubSubMessage, PubSubStream};
 use tokio::sync::{broadcast, mpsc, Mutex};
-use tokio_postgres::tls::NoTlsStream;
-use tokio_postgres::{AsyncMessage, Connection, NoTls, Socket};
+use tokio_postgres::{AsyncMessage, Connection, Socket};
+use tokio_postgres::tls::MakeTlsConnect;
+use tokio_postgres_rustls::MakeRustlsConnect;
 
-use crate::create_pool;
+use crate::{create_pool, tls_connector};
 
 // ---------------------------------------------------------------------------
 // Commands sent to the listener task
@@ -228,7 +229,7 @@ async fn listener_task(
 
     loop {
         // Attempt to connect
-        let connect_result = tokio_postgres::connect(&dsn, NoTls).await;
+        let connect_result = tokio_postgres::connect(&dsn, tls_connector()).await;
 
         let (client, connection) = match connect_result {
             Ok(pair) => {
@@ -327,7 +328,7 @@ async fn listener_task(
 /// When the connection ends (error or close), the channel is dropped, which
 /// signals the event loop to reconnect.
 async fn drive_connection(
-    mut connection: Connection<Socket, NoTlsStream>,
+    mut connection: Connection<Socket, <MakeRustlsConnect as MakeTlsConnect<Socket>>::Stream>,
     async_tx: mpsc::UnboundedSender<Result<AsyncMessage, tokio_postgres::Error>>,
 ) {
     loop {

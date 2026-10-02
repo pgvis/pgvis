@@ -19,7 +19,7 @@
 //! Table-scoped: a mutation on table T bumps its generation counter, causing all
 //! existing cache entries for that table to become stale misses (the generation
 //! in the key no longer matches). Volatile RPCs bump a global generation that
-//! affects all tables. Old stale entries are cleaned up by TTL/LRU eviction.
+//! affects all tables. Old stale entries are cleaned up by TTL/SIEVE eviction.
 //!
 //! ## Thread Safety
 //!
@@ -272,7 +272,7 @@ impl DataCache {
     /// Invalidate all cached entries (for volatile RPCs that can affect anything).
     ///
     /// Bumps the global generation counter so all existing keys become stale.
-    /// Stale entries are cleaned up by TTL/LRU eviction naturally.
+    /// Stale entries are cleaned up by TTL/SIEVE eviction naturally.
     pub fn invalidate_all(&self) {
         self.global_generation.fetch_add(1, Ordering::Relaxed);
         self.stat_invalidations.fetch_add(1, Ordering::Relaxed);

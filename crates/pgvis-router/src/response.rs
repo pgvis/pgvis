@@ -252,7 +252,8 @@ fn build_content_range(result: &QueryResult, request_offset: Option<u64>) -> Str
         format!("*/{total}")
     } else {
         let offset = request_offset.unwrap_or(0);
-        let range_end = offset + (page as u64) - 1;
+        // `offset` comes straight from the client, so don't let it overflow.
+        let range_end = offset.saturating_add(page as u64 - 1);
         format!("{offset}-{range_end}/{total}")
     }
 }
@@ -337,4 +338,34 @@ fn extract_next_cursor(body: &Value, cursor_column: &str) -> Option<String> {
         Value::Null => return None,
         other => other.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(rows: i64) -> QueryResult {
+        QueryResult {
+            body: Value::Array(vec![]),
+            total_count: None,
+            page_total: Some(rows),
+            response_status: None,
+            response_headers: None,
+            was_insert: None,
+        }
+    }
+
+    #[test]
+    fn content_range_is_offset_based() {
+        assert_eq!(build_content_range(&page(3), Some(10)), "10-12/*");
+        assert_eq!(build_content_range(&page(0), Some(10)), "*/*");
+    }
+
+    #[test]
+    fn content_range_does_not_overflow_on_huge_client_offset() {
+        assert_eq!(
+            build_content_range(&page(5), Some(u64::MAX - 1)),
+            format!("{}-{}/*", u64::MAX - 1, u64::MAX)
+        );
+    }
 }

@@ -25,6 +25,7 @@ pub mod introspect;
 pub mod pubsub;
 pub mod replica;
 
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use deadpool_postgres::{Config as DeadpoolConfig, ManagerConfig, Pool, RecyclingMethod, Runtime};
@@ -37,7 +38,7 @@ use pgvis_core::config::PoolConfig;
 use pgvis_core::dialect::{self, Dialect};
 use pgvis_core::error::Error;
 use serde_json::Value;
-use tokio_postgres::NoTls;
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub use pubsub::PgPubSub;
 pub use replica::PgReplicaBackend;
@@ -189,6 +190,40 @@ pub(crate) fn create_pool(dsn: &str, pool_cfg: &PoolConfig) -> Result<Pool, Erro
         },
     });
 
-    cfg.create_pool(Some(Runtime::Tokio1), NoTls)
+    cfg.create_pool(Some(Runtime::Tokio1), tls_connector())
         .map_err(|e| Error::Introspection(format!("failed to create pool: {e}")))
+}
+
+/// TLS connector shared by every Postgres connection (pool and pub/sub).
+///
+/// tokio-postgres applies the DSN's `sslmode` (`disable`, `prefer` — the
+/// default — or `require`): TLS is negotiated whenever the server offers it,
+/// and the server certificate is verified against the platform trust store
+/// (honouring `SSL_CERT_FILE`). Built once; loading the store is not free.
+pub(crate) fn tls_connector() -> MakeRustlsConnect {
+    static CONNECTOR: OnceLock<MakeRustlsConnect> = OnceLock::new();
+    CONNECTOR
+        .get_or_init(|| {
+            let native = rustls_native_certs::load_native_certs();
+            for e in &native.errors {
+                tracing::warn!(error = %e, "failed to load a platform CA certificate");
+            }
+            let mut roots = rustls::RootCertStore::empty();
+            let (added, ignored) = roots.add_parsable_certificates(native.certs);
+            if ignored > 0 {
+                tracing::warn!(ignored, "ignored unparsable platform CA certificates");
+            }
+            if added == 0 {
+                tracing::warn!("no platform CA certificates found; TLS to Postgres will fail verification");
+            }
+            let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("ring supports the default TLS protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            MakeRustlsConnect::new(config)
+        })
+        .clone()
 }

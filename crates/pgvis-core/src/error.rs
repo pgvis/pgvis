@@ -107,6 +107,8 @@ pub enum ErrorCode {
     Internal,
     /// Configuration error at startup.
     ConfigError,
+    /// A pub/sub failure; the inner code carries its own string and status.
+    PubSub(crate::pubsub::PubSubErrorCode),
 }
 
 impl ErrorCode {
@@ -142,6 +144,7 @@ impl ErrorCode {
             Self::UnsupportedOperation => "PGV001",
             Self::Internal => "PGV500",
             Self::ConfigError => "PGV002",
+            Self::PubSub(code) => code.as_str(),
         }
     }
 
@@ -173,6 +176,7 @@ impl ErrorCode {
             Self::UnsupportedOperation => 400,
             Self::Internal => 500,
             Self::ConfigError => 500,
+            Self::PubSub(code) => code.http_status(),
         }
     }
 }
@@ -312,7 +316,7 @@ impl Error {
             Self::Auth { code, .. } => code.clone(),
             Self::Unsupported(_) => ErrorCode::UnsupportedOperation,
             Self::Internal(_) => ErrorCode::Internal,
-            Self::PubSub { .. } => ErrorCode::Internal, // code is in the PubSubErrorCode
+            Self::PubSub { code, .. } => ErrorCode::PubSub(*code),
         }
     }
 
@@ -337,10 +341,6 @@ impl Error {
                     _ => 500,
                 };
             }
-        }
-        // PubSub errors carry their own HTTP status in PubSubErrorCode
-        if let Self::PubSub { code, .. } = self {
-            return code.http_status();
         }
         self.code().http_status()
     }

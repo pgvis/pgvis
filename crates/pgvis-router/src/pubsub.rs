@@ -498,12 +498,7 @@ pub fn build_pubsub_router(hub: Arc<PubSubHub>, config: Arc<Config>) -> axum::Ro
 fn error_response(err: &Error) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    // For pub/sub errors, use the PubSubErrorCode's own string/status rather
-    // than `Error::code()` (which reports Internal/PGV500 for the PubSub variant).
-    let (status_u16, code) = match err {
-        Error::PubSub { code, .. } => (code.http_status(), code.as_str().to_string()),
-        other => (other.http_status(), other.code().as_str().to_string()),
-    };
+    let (status_u16, code) = (err.http_status(), err.code().as_str());
 
     let status = axum::http::StatusCode::from_u16(status_u16)
         .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);

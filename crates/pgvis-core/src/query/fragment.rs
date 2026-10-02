@@ -106,6 +106,11 @@ fn render_filter(
 
         // IN operator — multiple placeholders
         Operator::In => {
+            // `IN ()` is a syntax error; an empty list matches nothing (PostgREST
+            // parity), so render the constant instead.
+            if matches!(&filter.value, FilterValue::List(v) if v.is_empty()) {
+                return if filter.negated { "TRUE" } else { "FALSE" }.to_string();
+            }
             let placeholders = match &filter.value {
                 FilterValue::List(values) => values
                     .iter()
@@ -172,6 +177,12 @@ fn render_quantified_filter(
         Quantifier::Any => "ANY",
         Quantifier::All => "ALL",
     };
+    // An untyped empty `ARRAY[]` fails in Postgres. Over an empty set ANY is
+    // false and ALL is (vacuously) true, so render the constant.
+    if matches!(&filter.value, FilterValue::List(v) if v.is_empty()) {
+        let holds = matches!(quantifier, Quantifier::All) != filter.negated;
+        return if holds { "TRUE" } else { "FALSE" }.to_string();
+    }
     let placeholders = match &filter.value {
         FilterValue::List(values) => values
             .iter()
@@ -644,6 +655,30 @@ mod tests {
         };
         let sql = render_filter(&filter, None, &mut ctx);
         assert_eq!(sql, "\"status\" IN ($1, $2)");
+    }
+
+    #[test]
+    fn test_render_filter_empty_list_is_constant() {
+        let empty = |operator, quantifier, negated| ResolvedFilter {
+            column: "status".to_string(),
+            json_path: vec![],
+            operator,
+            quantifier,
+            value: FilterValue::List(vec![]),
+            negated,
+            rewrite: None,
+        };
+        let render = |f: ResolvedFilter| {
+            let mut ctx = RenderContext::new(&POSTGRES);
+            let sql = render_filter(&f, None, &mut ctx);
+            assert!(ctx.params.is_empty(), "no params for a constant");
+            sql
+        };
+        assert_eq!(render(empty(Operator::In, None, false)), "FALSE");
+        assert_eq!(render(empty(Operator::In, None, true)), "TRUE");
+        assert_eq!(render(empty(Operator::Eq, Some(Quantifier::Any), false)), "FALSE");
+        assert_eq!(render(empty(Operator::Eq, Some(Quantifier::All), false)), "TRUE");
+        assert_eq!(render(empty(Operator::Eq, Some(Quantifier::Any), true)), "TRUE");
     }
 
     #[test]

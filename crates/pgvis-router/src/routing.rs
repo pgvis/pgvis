@@ -56,8 +56,10 @@ pub struct AppState {
     /// In-memory data cache for read responses (None when caching is disabled).
     pub data_cache: Option<Arc<DataCache>>,
     /// Cached OpenAPI JSON, lazily populated and invalidated on schema reload.
-    /// Tuple: (schema_cache_ptr as usize, serialized Value).
-    openapi_cache: Arc<std::sync::Mutex<(usize, Option<serde_json::Value>)>>,
+    /// Tuple: (schema cache the spec was built from, serialized Value). The
+    /// `Weak` pins that cache's allocation, so a reloaded cache can never reuse
+    /// its address and be mistaken for it.
+    openapi_cache: Arc<std::sync::Mutex<(std::sync::Weak<SchemaCache>, Option<serde_json::Value>)>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +123,7 @@ impl AppState {
             dialect,
             backend,
             data_cache,
-            openapi_cache: Arc::new(std::sync::Mutex::new((0, None))),
+            openapi_cache: Arc::new(std::sync::Mutex::new((std::sync::Weak::new(), None))),
         }
     }
 
@@ -650,13 +652,12 @@ async fn handle_root(State(state): State<AppState>, headers: HeaderMap) -> Respo
         }
 
         // Use cached OpenAPI spec, regenerating only when schema cache changes.
-        let cache = state.cache.load();
-        let cache_ptr = Arc::as_ptr(&cache) as usize;
+        let cache = state.cache.load_full();
 
         // Fast path: check if we already have a cached spec for this schema version.
         let cached_val = {
             let guard = state.openapi_cache.lock().unwrap();
-            if guard.0 == cache_ptr {
+            if std::ptr::eq(guard.0.as_ptr(), Arc::as_ptr(&cache)) {
                 guard.1.clone()
             } else {
                 None
@@ -672,7 +673,7 @@ async fn handle_root(State(state): State<AppState>, headers: HeaderMap) -> Respo
         match serde_json::to_value(&spec) {
             Ok(val) => {
                 let mut guard = state.openapi_cache.lock().unwrap();
-                *guard = (cache_ptr, Some(val.clone()));
+                *guard = (Arc::downgrade(&cache), Some(val.clone()));
                 (StatusCode::OK, Json(val)).into_response()
             }
             Err(e) => (
