@@ -1,14 +1,45 @@
-/* Starlight custom overrides */
+/* Starlight custom overrides — same palette and fonts as the landing pages */
 :root {
-  --sl-color-accent-low: #1a1a2e;
+  --sl-color-accent-low: #e0e7ff;
   --sl-color-accent: #4f46e5;
-  --sl-color-accent-high: #818cf8;
+  --sl-color-accent-high: #312e81;
   --sl-font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --sl-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 /* Dark mode accent colors */
 :root[data-theme="dark"] {
   --sl-color-accent-low: #1e1b4b;
   --sl-color-accent: #6366f1;
-  --sl-color-accent-high: #a5b4fc;
+  --sl-color-accent-high: #c7d2fe;
+}
+
+/* Site title: Prism mark + Geist 700 split wordmark, as on the landing pages */
+.site-title {
+  gap: 0.5rem;
+}
+
+.site-title img {
+  height: 1.75rem;
+  width: auto;
+}
+
+.pgvis-wordmark {
+  font-family: "Geist", var(--sl-font);
+  font-weight: 700;
+  font-size: 1.35rem;
+  letter-spacing: -0.03em;
+  color: #0b0b14;
+}
+
+.pgvis-wordmark .vis {
+  color: #4f46e5;
+}
+
+:root[data-theme="dark"] .pgvis-wordmark {
+  color: #f5f2eb;
+}
+
+:root[data-theme="dark"] .pgvis-wordmark .vis {
+  color: #a78bfa;
 }

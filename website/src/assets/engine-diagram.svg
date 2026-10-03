@@ -218,7 +218,7 @@
       <path d="M3 14c0 2.2 4.9 4 11 4s11-1.8 11-4" />
       <path d="M3 22c0 2.2 4.9 4 11 4s11-1.8 11-4" />
     </g>
-    <text x="60" y="42" class="ed-label">Postgres</text>
+    <text x="60" y="34" class="ed-label">Postgres</text>
   </g>
 
   <!-- Source: SQLite -->
@@ -230,24 +230,24 @@
       <path d="M3 14c0 2.2 4.9 4 11 4s11-1.8 11-4" />
       <path d="M3 22c0 2.2 4.9 4 11 4s11-1.8 11-4" />
     </g>
-    <text x="60" y="42" class="ed-label">SQLite</text>
+    <text x="60" y="34" class="ed-label">SQLite</text>
   </g>
 
   <!-- Engine -->
   <g class="ed-engine" transform="translate(300 130)">
     <rect class="ed-engine-rect" width="200" height="100" rx="16" />
-    <text x="100" y="42" class="ed-engine-title">pgvis engine</text>
-    <text x="100" y="70" class="ed-engine-sub">parse → plan → SQL</text>
+    <text x="100" y="38" class="ed-engine-title">pgvis engine</text>
+    <text x="100" y="66" class="ed-engine-sub">parse → plan → SQL</text>
   </g>
 
   <!-- Surface: MCP -->
   <g class="ed-pill ed-pill-mcp" transform="translate(600 60)">
     <rect width="160" height="52" rx="12" />
-    <g transform="translate(18 14)" class="ed-icon" aria-hidden="true">
+    <g transform="translate(18 16)" class="ed-icon" aria-hidden="true">
       <path d="M12 0a4 4 0 0 0-4 4v1a4 4 0 0 0-4 4v1a4 4 0 0 0 4 4v1a4 4 0 0 0 4 4 4 4 0 0 0 4-4v-1a4 4 0 0 0 4-4v-1a4 4 0 0 0-4-4V4a4 4 0 0 0-4-4z" />
       <path d="M12 6v12M6 12h12" />
     </g>
-    <text x="56" y="34" class="ed-label">MCP</text>
+    <text x="56" y="26" class="ed-label">MCP</text>
   </g>
 
   <!-- Surface: REST -->
@@ -257,7 +257,7 @@
       <path d="M2 6h20M2 12h20M2 18h12" />
       <circle cx="20" cy="18" r="2.5" />
     </g>
-    <text x="56" y="34" class="ed-label">REST</text>
+    <text x="56" y="26" class="ed-label">REST</text>
   </g>
 
   <!-- Surface: OpenAPI -->
@@ -267,6 +267,6 @@
       <path d="M14 0H4a2 2 0 0 0-2 2v20a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6z" />
       <path d="M14 0v6h6M8 12h6M8 16h4" />
     </g>
-    <text x="56" y="34" class="ed-label">OpenAPI</text>
+    <text x="56" y="26" class="ed-label">OpenAPI</text>
   </g>
 </svg>

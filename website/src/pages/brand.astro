@@ -315,7 +315,7 @@ const markSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fil
       </article>
 
       <!-- 9. Don'ts -->
-      <article class="card">
+      <article class="card card-wide">
         <div class="hat">
           <div>
             <div class="hat-section">Misuse</div>
@@ -840,8 +840,14 @@ const markSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fil
   /* Card 9: Don'ts */
   .donts-grid {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(6, 1fr);
     gap: 10px;
+  }
+
+  @media (max-width: 1100px) {
+    .donts-grid {
+      grid-template-columns: repeat(3, 1fr);
+    }
   }
 
   @media (max-width: 700px) {
