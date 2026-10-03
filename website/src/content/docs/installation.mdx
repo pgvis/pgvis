@@ -3,8 +3,6 @@ title: Installation
 description: All the ways to install and run pgvis.
 ---
 
-# Installation
-
 ## Requirements
 
 - **PostgreSQL 17 or newer.** PostgreSQL 17 and 18 are tested; pgvis refuses to start against an older server. No libpq or other system Postgres library is needed — the driver is pure Rust.
@@ -59,13 +57,18 @@ nix build github:pgvis/pgvis
 # Run directly without installing (local experiment: no auth)
 nix run github:pgvis/pgvis -- --dsn "postgres://localhost/mydb" serve --insecure-no-auth
 
-# Development shell (Rust toolchain, PostgreSQL, pgcli, PostgREST, cargo-nextest, Node.js for the website)
+# Development shell: Rust toolchain, PostgreSQL, pgcli,
+# PostgREST, cargo-nextest, Node.js for the website
 nix develop
 ```
 
 The flake provides a complete development environment with all system dependencies.
 
 ## Docker (Coming Soon)
+
+:::caution[Not published yet]
+There is no published image yet. The command below shows the intended usage once one is available.
+:::
 
 ```bash
 docker run -e PGVIS_DSN="postgres://host.docker.internal/mydb" \

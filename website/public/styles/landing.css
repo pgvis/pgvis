@@ -301,6 +301,16 @@ body > header nav {
   height: auto;
 }
 
+/* Phones get the vertical layout; the wide one shrinks text below legibility. */
+.engine-diagram-tall {
+  display: none;
+}
+
+.engine-diagram-tall svg {
+  max-width: 400px;
+  margin: 0 auto;
+}
+
 /* ── Section header ─────────────────────────────────────────────────── */
 
 .section-header {
@@ -945,7 +955,15 @@ footer {
   }
 
   .engine-diagram-wrap {
-    padding: 0.5rem;
+    padding: 0.75rem;
+  }
+
+  .engine-diagram-wide {
+    display: none;
+  }
+
+  .engine-diagram-tall {
+    display: block;
   }
 
   .hero-meta {

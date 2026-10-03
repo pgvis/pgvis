@@ -3,7 +3,7 @@ title: Quick Start
 description: Get pgvis running in under 5 minutes.
 ---
 
-# Quick Start
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
 
 Get a REST API, MCP tools, and an OpenAPI spec from your database in under 5 minutes.
 
@@ -45,6 +45,8 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO web_anon;
 If your server requires TLS, add `?sslmode=require` to the DSN; certificates are verified against the system trust store (or `SSL_CERT_FILE`).
 
 ## Option B: SQLite (No Server Required)
+
+Using the binary built in Option A:
 
 ```bash
 # Use any existing SQLite database
@@ -199,7 +201,9 @@ or send `SIGUSR1` to the `pgvis serve` process.
 
 ## Next Steps
 
-- [Installation](/installation) — Docker, Nix, cargo install
-- [REST API Guide](/guides/rest-api) — full query DSL with all 30+ operators
-- [MCP Guide](/guides/mcp) — tool generation, resources, transport options
-- [Configuration](/reference/configuration) — environment variables, TOML config, CLI flags
+<CardGrid>
+  <LinkCard title="Installation" href="/installation" description="Cargo, Nix, and the full CLI reference" />
+  <LinkCard title="REST API Guide" href="/guides/rest-api" description="The full query DSL: filters, embedding, mutations, RPC" />
+  <LinkCard title="MCP Guide" href="/guides/mcp" description="Tool generation, resources, transport options" />
+  <LinkCard title="Configuration" href="/reference/configuration" description="Environment variables, TOML config, CLI flags" />
+</CardGrid>

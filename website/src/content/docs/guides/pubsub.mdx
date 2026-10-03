@@ -3,8 +3,6 @@ title: Pub/Sub Messaging
 description: Real-time publish/subscribe messaging backed by Postgres LISTEN/NOTIFY.
 ---
 
-# Pub/Sub Messaging
-
 pgvis includes a general-purpose publish/subscribe system backed by Postgres `LISTEN/NOTIFY`. It works like Redis pub/sub — any client can publish messages to named channels, and any number of subscribers receive them in real time.
 
 Multiple pgvis instances connected to the same Postgres database automatically form a shared message bus without additional infrastructure.
@@ -59,7 +57,7 @@ curl -N -H "Accept: text/event-stream" \
 
 Response stream:
 
-```
+```text wrap
 : keepalive
 
 event: message
@@ -384,35 +382,46 @@ async fn main() -> anyhow::Result<()> {
 
 ## How It Works
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  REST SSE   │     │  MCP Tool   │     │  Embedded   │
-│  Client     │     │  Agent      │     │  Rust App   │
-└──────┬──────┘     └──────┬──────┘     └──────┬──────┘
-       │                   │                   │
-       ▼                   ▼                   ▼
-┌──────────────────────────────────────────────────────┐
-│                    PubSubHub                          │
-│         (in-process fan-out via broadcast)            │
-└──────────────────────────┬───────────────────────────┘
-                           │
-                           ▼
-┌──────────────────────────────────────────────────────┐
-│                    PgPubSub                           │
-│         (dedicated LISTEN connection)                 │
-└──────────────────────────┬───────────────────────────┘
-                           │
-                           ▼
-┌──────────────────────────────────────────────────────┐
-│               PostgreSQL LISTEN/NOTIFY               │
-│     (shared across all pgvis instances on same DB)   │
-└──────────────────────────────────────────────────────┘
+Publishing and delivery take different paths. REST and MCP publishes run through `Backend::execute` like any data request, so `pg_notify` executes as the caller's role. Delivery comes back through `PgPubSub`'s dedicated `LISTEN` connection: the hub issues `LISTEN` for a channel when its first local subscriber joins, and `UNLISTEN` when the last one leaves.
+
+```mermaid
+flowchart TB
+    pub(["REST or MCP publisher"]) --> exec["<b>Backend::execute</b><br/>authorize + pg_notify as caller"]
+    app(["Embedded Rust app"]) -.->|"hub.publish / subscribe"| hub
+    exec --> pg[("Postgres<br/>LISTEN / NOTIFY")]
+    pg -.-> others(["Other pgvis instances<br/>on the same database"])
+    pg -->|notification| listener["<b>PgPubSub</b><br/>dedicated LISTEN connection"]
+    listener --> hub["<b>PubSubHub</b><br/>per-channel broadcast"]
+    hub -.->|"LISTEN on first subscriber"| listener
+    hub --> sse(["SSE subscribers"])
 ```
 
-1. **Publish:** REST and MCP validate the channel and payload, then run `authorize_function` (if set) and `pg_notify` in one statement as the caller's role; embedded code calling `hub.publish(channel, payload)` validates and sends `NOTIFY` as the DSN's role
+The sequence below follows one subscriber and one publisher on the same channel, with `authorize_function` configured:
+
+```mermaid
+sequenceDiagram
+    participant S as Subscriber
+    participant P as Publisher
+    participant G as pgvis
+    participant D as Postgres
+    S->>G: GET /pubsub/chat
+    G->>G: verify JWT + channel
+    G->>D: authorize(subscribe) as caller
+    D-->>G: true
+    G->>D: LISTEN, if first subscriber
+    G-->>S: 200 text/event-stream
+    P->>G: POST /pubsub/chat
+    G->>D: authorize + pg_notify
+    D-->>G: ok
+    G-->>P: 200 {"ok": true}
+    D-->>G: notification
+    G-->>S: event: message
+```
+
+1. **Publish:** REST and MCP validate the channel and payload, then run `authorize_function` (if set) and `pg_notify` in one statement as the caller's role; anything but `true` is a `403`. Embedded code calling `hub.publish(channel, payload)` validates and sends `NOTIFY` as the DSN's role
 2. **Delivery:** Postgres broadcasts the notification to ALL connected listeners (including other pgvis instances)
-3. **Fan-out:** The dedicated listener task receives the notification → broadcasts to all local subscribers via `tokio::sync::broadcast`
-4. **Subscribe:** REST returns SSE frames; MCP returns tool results; embedded code receives from the broadcast channel
+3. **Fan-out:** The dedicated listener task receives the notification and broadcasts it to all local subscribers via `tokio::sync::broadcast`
+4. **Subscribe:** REST streams SSE frames; embedded code receives from the broadcast channel. MCP has no subscribe tool
 
 ## Limitations
 

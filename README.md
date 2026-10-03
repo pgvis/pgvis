@@ -13,9 +13,9 @@ engine.**
 
 ## What it is
 
-Point pgvis at a database. It introspects the schema once at startup and then
-serves that schema **three ways from a single pipeline** — one query parser,
-one planner, one SQL builder:
+Point pgvis at a database. It introspects the schema at startup (and again on
+`NOTIFY pgrst` or `SIGUSR1`) and serves that schema **three ways from a single
+pipeline** — one query parser, one planner, one SQL builder:
 
 - **MCP** — every table and function becomes a typed [Model Context
   Protocol](https://modelcontextprotocol.io) tool an LLM agent can call. No
@@ -233,9 +233,9 @@ The authoritative architecture reference lives in **[arch/](arch/README.md)**:
 6. [Errors, configuration, preferences](arch/06-errors-and-config.md)
 7. [Design decisions](arch/07-design-decisions.md)
 8. [Future scope and known gaps](arch/08-future-scope.md)
-
-> Note: the `arch/` docs predate a rename and may refer to `pgvis-rest` /
-> `pgvis-embed`; in the code these are `pgvis-router` / `pgvis-lib`.
+9. [Data cache — in-memory read caching](arch/09-data-cache.md)
+10. [Pub/sub — LISTEN/NOTIFY over SSE and MCP](arch/10-pubsub.md)
+11. [Metrics and health — design and plan (proposed)](arch/11-metrics.md)
 
 ## Roadmap
 

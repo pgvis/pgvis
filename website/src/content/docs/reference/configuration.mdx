@@ -3,7 +3,7 @@ title: Configuration
 description: Full configuration reference for pgvis.
 ---
 
-# Configuration Reference
+import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 pgvis configuration is layered (later sources override earlier):
 
@@ -11,6 +11,13 @@ pgvis configuration is layered (later sources override earlier):
 2. **TOML config file** — specified via `--config` flag or `PGVIS_CONFIG` env var
 3. **Environment variables** — prefixed with `PGVIS_`, lowercase field names; nested tables use `__` (double underscore), e.g. `PGVIS_POOL__SIZE` → `pool.size`
 4. **CLI flags** — e.g. `--schema`, `--cache-ttl`, `--read-only`
+
+Each layer overrides only the keys it sets, so a key missing from the TOML file and the environment keeps its default:
+
+```mermaid
+flowchart LR
+    d["<b>Defaults</b>"] --> t["<b>TOML</b>"] --> e["<b>Env</b>"] --> c["<b>CLI</b>"]
+```
 
 The config file is **strict**: a missing file, or any key pgvis does not recognise (a typo, or a PostgREST spelling such as `jwt-secret`), stops startup with an error that names the offending keys. Environment variables are not checked this way — an unrecognised `PGVIS_*` variable is silently ignored, so double-check the spelling (in particular the `__` for nested keys).
 
@@ -41,6 +48,9 @@ These are read by the CLI itself (see [CLI Flags](#cli-flags)).
 
 Every scalar config key can also be set as `PGVIS_<KEY>` (top-level keys) or `PGVIS_<TABLE>__<KEY>` (keys inside a `[table]`). List-valued keys other than `schemas` (`extra_search_path`, `replica.replica_dsns`, `pubsub.allowed_channels`) are best set in the TOML file.
 
+<Tabs>
+<TabItem label="Top-level">
+
 | Variable | Config key | Default |
 |----------|-----------|---------|
 | `PGVIS_JWT_SECRET` | `jwt_secret` | none |
@@ -59,6 +69,12 @@ Every scalar config key can also be set as `PGVIS_<KEY>` (top-level keys) or `PG
 | `PGVIS_OPENAPI_TITLE` | `openapi_title` | none |
 | `PGVIS_OPENAPI_SERVER_URL` | `openapi_server_url` | none |
 | `PGVIS_OPENAPI_MODE` | `openapi_mode` | `IgnorePrivileges` |
+
+</TabItem>
+<TabItem label="pool">
+
+| Variable | Config key | Default |
+|----------|-----------|---------|
 | `PGVIS_POOL__SIZE` | `pool.size` | `16` |
 | `PGVIS_POOL__TIMEOUT_MS` | `pool.timeout_ms` | `5000` |
 | `PGVIS_POOL__CREATE_TIMEOUT_MS` | `pool.create_timeout_ms` | `5000` |
@@ -67,17 +83,41 @@ Every scalar config key can also be set as `PGVIS_<KEY>` (top-level keys) or `PG
 | `PGVIS_POOL__KEEPALIVES_IDLE_SECS` | `pool.keepalives_idle_secs` | `60` |
 | `PGVIS_POOL__CONNECT_TIMEOUT_SECS` | `pool.connect_timeout_secs` | `10` |
 | `PGVIS_POOL__RECYCLING_METHOD` | `pool.recycling_method` | `Fast` |
+
+</TabItem>
+<TabItem label="routing">
+
+| Variable | Config key | Default |
+|----------|-----------|---------|
 | `PGVIS_ROUTING__PREFIX` | `routing.prefix` | `api` |
 | `PGVIS_ROUTING__SCHEMA_IN_PATH` | `routing.schema_in_path` | `true` |
 | `PGVIS_ROUTING__DEFAULT_SCHEMA` | `routing.default_schema` | `public` |
 | `PGVIS_ROUTING__MCP_SEPARATOR` | `routing.mcp_separator` | `/` |
+
+</TabItem>
+<TabItem label="replica">
+
+| Variable | Config key | Default |
+|----------|-----------|---------|
 | `PGVIS_REPLICA__MAX_REPLICATION_LAG_BYTES` | `replica.max_replication_lag_bytes` | `10485760` (10 MB) |
 | `PGVIS_REPLICA__HEALTH_CHECK_INTERVAL_MS` | `replica.health_check_interval_ms` | `5000` |
 | `PGVIS_REPLICA__PRIMARY_READS` | `replica.primary_reads` | `true` |
+
+</TabItem>
+<TabItem label="cache">
+
+| Variable | Config key | Default |
+|----------|-----------|---------|
 | `PGVIS_CACHE__ENABLED` | `cache.enabled` | `false` |
 | `PGVIS_CACHE__TTL_SECONDS` | `cache.ttl_seconds` | `60` |
 | `PGVIS_CACHE__MAX_ENTRIES` | `cache.max_entries` | `10000` |
 | `PGVIS_CACHE__CACHE_LISTS` | `cache.cache_lists` | `false` |
+
+</TabItem>
+<TabItem label="pubsub">
+
+| Variable | Config key | Default |
+|----------|-----------|---------|
 | `PGVIS_PUBSUB__ENABLED` | `pubsub.enabled` | `false` |
 | `PGVIS_PUBSUB__CHANNEL_PREFIX` | `pubsub.channel_prefix` | `pgvis:` |
 | `PGVIS_PUBSUB__MAX_PAYLOAD_BYTES` | `pubsub.max_payload_bytes` | `7500` |
@@ -88,6 +128,9 @@ Every scalar config key can also be set as `PGVIS_<KEY>` (top-level keys) or `PG
 | `PGVIS_PUBSUB__RECONNECT_BASE_MS` | `pubsub.reconnect_base_ms` | `500` |
 | `PGVIS_PUBSUB__RECONNECT_MAX_MS` | `pubsub.reconnect_max_ms` | `30000` |
 | `PGVIS_PUBSUB__KEEPALIVE_INTERVAL_SECS` | `pubsub.keepalive_interval_secs` | `15` |
+
+</TabItem>
+</Tabs>
 
 :::caution
 Flat spellings such as `PGVIS_POOL_SIZE` or `PGVIS_MAX_REPLICATION_LAG_BYTES` are **not** read — nested keys need the `__` separator.
@@ -189,9 +232,26 @@ cache_lists = false
 
 1. Client sends `Authorization: Bearer <token>` header
 2. pgvis verifies the token against `jwt_secret` using `jwt_algo`. The signature is always checked; `exp` and `nbf` are checked when present; `aud` is checked when `jwt_aud` is set
-3. The role from the token's `role_claim_key` claim becomes the transaction's role (`SET LOCAL role`). A token without that claim falls back to `anon_role`; if no `anon_role` is configured it is rejected with **401** — it never runs as the DSN's own role
+3. The role from the token's `role_claim_key` claim becomes the transaction's role (`set_config('role', …, true)`). A token without that claim falls back to `anon_role`; if no `anon_role` is configured it is rejected with **401** — it never runs as the DSN's own role
 4. All JWT claims are available as one JSON value in `current_setting('request.jwt.claims', true)` in SQL. (The older per-claim `request.jwt.claim.<key>` settings are **not** set — read claims from the JSON, e.g. `current_setting('request.jwt.claims', true)::json->>'sub'`.)
 5. This integrates with PostgreSQL Row-Level Security (RLS)
+
+The role a request runs as is decided before any query planning. Every path either ends at a role or at a `401`; with `jwt_secret` set, none of them falls through to the DSN's own role. "Valid" means the signature verifies, `exp`/`nbf` pass, and `aud` matches when `jwt_aud` is set:
+
+```mermaid
+flowchart TB
+    req(["Request"]) --> secret{"jwt_secret?"}
+    secret -->|no| noauth["<b>No verification</b><br/>anon_role, or the DSN role if unset"]
+    secret -->|yes| tok{"token?"}
+    tok -->|no| anon{"anon_role?"}
+    tok -->|yes| valid{"valid?"}
+    valid -->|no| e401(["401"])
+    valid -->|yes| claim{"role claim?"}
+    claim -->|yes| role["<b>Claimed role</b><br/>claims set"]
+    claim -->|no| anon
+    anon -->|yes| anonrole["<b>anon_role</b><br/>claims set if a token was sent"]
+    anon -->|no| e401
+```
 
 Requests **without** a token run as `anon_role`. When `jwt_secret` is set and there is no `anon_role`, an unauthenticated request is a 401 — this also applies to the metadata endpoints (the OpenAPI/schema root and `GET /pgvis/cache`).
 
@@ -477,11 +537,7 @@ Global options go **before** the subcommand (`pgvis --dsn … serve`, not `pgvis
 
 ## Configuration Priority
 
-When the same setting is specified in multiple places, the highest-priority source wins:
-
-```
-CLI flags  >  Environment variables  >  TOML config file  >  Defaults
-```
+When the same setting is specified in multiple places, the highest-priority source wins: CLI flags, then environment variables, then the TOML file, then the defaults.
 
 Example:
 

@@ -3,8 +3,6 @@ title: MCP for AI Agents
 description: Using pgvis as an MCP server for LLM agents.
 ---
 
-# MCP for AI Agents
-
 pgvis automatically generates [Model Context Protocol](https://modelcontextprotocol.io) tools from your database schema. Every table becomes a set of typed tools that LLM agents can discover and call — no glue code, no hand-written tool schemas.
 
 ## What Gets Generated
@@ -138,7 +136,7 @@ MCP has no token-passing mechanism in pgvis today, on either transport: tool cal
 
 | Configuration | What MCP tool calls run as |
 |---------------|----------------------------|
-| `anon_role` set | `SET LOCAL role` to `anon_role`, no JWT claims |
+| `anon_role` set | `role` set to `anon_role` for the transaction, no JWT claims |
 | `jwt_secret` set, no `anon_role` | Refused — every tool returns `PGRST302` (anonymous access disabled) |
 | Neither set | The DSN's own role (often the table owner, bypassing RLS) |
 
@@ -171,7 +169,7 @@ Each tool has a JSON Schema for its inputs, generated from the database introspe
 
 ### `list_{table}` example
 
-```json
+```json wrap
 {
   "name": "public-list_users",
   "description": "List rows from public.users with filtering, ordering, and embedding",
@@ -199,7 +197,7 @@ Each tool has a JSON Schema for its inputs, generated from the database introspe
 
 ### `create_{table}` example
 
-```json
+```json wrap
 {
   "name": "public-create_users",
   "description": "Insert rows into public.users",
@@ -225,7 +223,7 @@ Each tool has a JSON Schema for its inputs, generated from the database introspe
 
 ### `update_{table}` example
 
-```json
+```json wrap
 {
   "name": "public-update_users",
   "description": "Update rows in public.users matching filter conditions",
@@ -278,7 +276,28 @@ These all return `PGRST100` parse errors as tool error results, so the agent can
 
 ## Execution Flow
 
-When an agent calls a tool:
+An agent first discovers the tools, then calls them. Each call is planned in-process and runs as one database transaction under the `anon_role`:
+
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant M as pgvis MCP
+    participant D as Postgres
+    A->>M: tools/list
+    M-->>A: tools from the schema cache
+    A->>M: tools/call public-list_users
+    M->>M: arguments → plan → SQL
+    alt jwt_secret set, no anon_role
+        M-->>A: PGRST302 tool error
+    else otherwise
+        M->>D: BEGIN, set_config(...), query
+        D-->>M: result row
+        M->>D: COMMIT
+        M-->>A: tool result (JSON content)
+    end
+```
+
+Step by step:
 
 1. **Parse** — tool arguments are mapped to an `ApiRequest` (same as REST)
 2. **Plan** — validated against the schema cache, relationships resolved

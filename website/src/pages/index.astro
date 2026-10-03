@@ -1,6 +1,7 @@
 ---
 import Layout from "../layouts/Landing.astro";
 import engineDiagram from "../assets/engine-diagram.svg?raw";
+import engineDiagramVertical from "../assets/engine-diagram-vertical.svg?raw";
 
 const features = [
   {
@@ -108,7 +109,8 @@ const features = [
     <section class="diagram">
       <div class="container">
         <figure class="engine-diagram-wrap">
-          <Fragment set:html={engineDiagram} />
+          <div class="engine-diagram-wide"><Fragment set:html={engineDiagram} /></div>
+          <div class="engine-diagram-tall"><Fragment set:html={engineDiagramVertical} /></div>
         </figure>
       </div>
     </section>

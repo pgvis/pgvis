@@ -3,105 +3,80 @@ title: Architecture
 description: How pgvis is structured internally.
 ---
 
-# Architecture
-
 pgvis is a seven-crate Rust workspace. All dependencies point inward to the I/O-free core — the engine is embeddable, testable, and backend-agnostic.
 
 ## Crate Map
 
-```
-┌─────────────────────────────────────────────────┐
-│                  pgvis-server                     │ ← CLI binary
-├──────────────────────┬──────────────────────────┤
-│                  pgvis-lib                        │ ← Builder facade
-├──────────┬───────────┼───────────┬──────────────┤
-│pgvis-router│        │pgvis-mcp  │              │ ← Surfaces
-│(REST+OpenAPI)       │(tools+stdio+HTTP)         │
-├──────────┴───────────┴───────────┴──────────────┤
-│                  pgvis-core                       │ ← I/O-free engine
-├──────────────────────┬──────────────────────────┤
-│  pgvis-postgres      │  pgvis-sqlite            │ ← Backends
-└──────────────────────┴──────────────────────────┘
+Every crate depends on `pgvis-core`; nothing depends on the binary. `pgvis-lib` wires the surfaces and backends together, and its MCP, Postgres and SQLite dependencies are default-on Cargo features (dashed). `pgvis-lib` and `pgvis-server` also use `pgvis-core` directly; those edges are omitted for clarity.
+
+```mermaid
+flowchart TB
+    server["<b>pgvis-server</b><br/>the pgvis CLI"] --> lib["<b>pgvis-lib</b><br/>Builder facade"]
+    lib --> router["<b>pgvis-router</b><br/>REST + OpenAPI"]
+    lib -.-> mcp["<b>pgvis-mcp</b><br/>MCP tools"]
+    lib -.-> pg["<b>pgvis-postgres</b><br/>backend"]
+    lib -.-> sqlite["<b>pgvis-sqlite</b><br/>backend"]
+    router --> core["<b>pgvis-core</b><br/>I/O-free engine"]
+    mcp --> core
+    pg --> core
+    sqlite --> core
 ```
 
 | Crate | Role | Key modules |
 |-------|------|-------------|
-| `pgvis-core` | I/O-free engine: parser, planner, SQL builder, schema cache types, config, error codes | `query_params`, `plan`, `query`, `cache`, `config`, `dialect` |
-| `pgvis-postgres` | PostgreSQL backend: connection pool (rustls TLS), introspection queries, pipelined execution, read replicas, schema-change listener | `introspect`, `execute`, `replica`, `schema_watch`, `pubsub` |
-| `pgvis-sqlite` | SQLite backend: introspection from `sqlite_master`, execution via rusqlite | `introspect`, `execute` |
-| `pgvis-router` | axum REST router + OpenAPI 3.0 generator + read data cache | `routing`, `response`, `openapi`, `data_cache`, `pubsub` |
-| `pgvis-mcp` | MCP tool generation, execution, stdio + Streamable HTTP transport | `tools`, `server`, `transport` |
-| `pgvis-lib` | `Builder` API — the single way to assemble the stack | `Builder`, `Components`, `SchemaReloader`, `detect_db_kind` |
-| `pgvis-server` | The `pgvis` CLI: `serve`, `mcp`, `openapi`, `inspect` subcommands | `main` with clap + figment |
+| `pgvis-core` | Parser, planner, SQL builder, schema cache types, config, error codes | `query_params`, `plan`, `query`, `cache`, `config`, `dialect` |
+| `pgvis-postgres` | Pool (rustls TLS), introspection, pipelined execution, read replicas, schema-change listener | `introspect`, `execute`, `replica`, `schema_watch`, `pubsub` |
+| `pgvis-sqlite` | Introspection from `sqlite_master`, execution via rusqlite | `introspect`, `execute` |
+| `pgvis-router` | axum REST router, OpenAPI 3.0 generator, read data cache | `routing`, `response`, `openapi`, `data_cache`, `pubsub` |
+| `pgvis-mcp` | MCP tool generation and execution, stdio + Streamable HTTP | `tools`, `server`, `transport` |
+| `pgvis-lib` | `Builder` API — the single way to assemble the stack | `Builder`, `Components`, `SchemaReloader` |
+| `pgvis-server` | The `pgvis` CLI: `serve`, `mcp`, `openapi`, `inspect` | `main` (clap + figment) |
 
 ## Request Lifecycle
 
 ### REST path
 
+An axum handler authenticates first, then lowers the request through the shared core pipeline. Two exits skip the database: a `GET`/`HEAD` on a plan that writes (a volatile function) is a `405`, and a data cache hit is served from memory.
+
+```mermaid
+flowchart TB
+    req(["HTTP request"]) --> auth["<b>Prefer + verify_jwt</b><br/>preferences, role, claims"]
+    auth -->|"bad or missing token"| e401(["401"])
+    auth --> parse["<b>Parse</b><br/>→ ApiRequest"]
+    parse --> plan["<b>plan_request</b><br/>→ ActionPlan"]
+    plan --> writes{"writes on GET?"}
+    writes -->|yes| e405(["405"])
+    writes -->|no| render["<b>query::render</b><br/>SQL + params"]
+    render --> hit{"cache hit?"}
+    hit -->|no| exec["<b>Backend::execute</b><br/>one transaction"]
+    hit -->|hit| fmt["<b>format_response</b><br/>body + headers"]
+    exec --> fmt
+    fmt --> resp(["HTTP response"])
 ```
-HTTP Request (axum handler)
-    │
-    ├─ Prefer header → Preferences (handling=strict: unknown → 400)
-    ├─ verify_jwt → role + claims (before any planning work)
-    │
-    ├─ Parse query params → ApiRequest
-    │    ├─ query string kept as ordered pairs (repeated keys preserved)
-    │    ├─ select= → SelectItems (winnow parser)
-    │    ├─ column=op.val → Filter[]
-    │    ├─ and=/or= → LogicTree[]
-    │    ├─ order= → OrderTerm[]
-    │    ├─ limit/offset → RangeSpec
-    │    ├─ cursor_column/cursor_value → CursorSpec
-    │    └─ JSON body → RequestBody
-    │
-    ├─ plan_request(ApiRequest, SchemaCache, Dialect, Config)
-    │    ├─ Validate table/columns exist; validate mutation bodies
-    │    ├─ Resolve foreign-key joins (embedding)
-    │    ├─ Resolve RPC overload by argument names
-    │    ├─ Resolve cursor → keyset WHERE condition
-    │    ├─ Check dialect capabilities (filter rewrites)
-    │    └─ → ActionPlan (ReadPlan | MutatePlan | CallPlan | InspectPlan)
-    │
-    ├─ GET/HEAD on a plan that writes (volatile function) → 405
-    │
-    ├─ query::render(ActionPlan, Dialect)
-    │    ├─ Build CTE-wrapped SELECT/INSERT/UPDATE/DELETE
-    │    ├─ Parameterized ($1, $2, ...) — never string interpolation
-    │    └─ → (sql: String, params: Vec<Value>)
-    │
-    ├─ Data cache lookup (reads only, when enabled and no pre_request hook)
-    │    ├─ Hit → serve cached bytes, skip Backend::execute
-    │    └─ Miss → continue (store after execution)
-    │
-    ├─ Backend::execute(ExecContext, sql, params)
-    │    ├─ one pipelined flight: BEGIN; set_config(role, request.jwt.claims,
-    │    │  statement_timeout); pre_request hook; main query
-    │    ├─ mutation guards (max-affected, singular) checked on the row count
-    │    ├─ COMMIT, or ROLLBACK on error / guard violation / Prefer: tx=rollback
-    │    └─ → QueryResult { body or raw JSON text, page_total, total_count, … }
-    │    (read → store in cache; mutation → bump table generation;
-    │     volatile RPC → bump global generation)
-    │
-    └─ format_response(QueryResult, preferences)
-         ├─ JSON body (table reads: Postgres's JSON text, forwarded as bytes)
-         ├─ Content-Range header (206 when more rows remain)
-         ├─ Location header (single-row insert)
-         ├─ X-Next-Cursor header (if cursor pagination)
-         ├─ response.status / response.headers GUC overrides
-         └─ → HTTP Response
-```
+
+| Step | Details |
+|------|---------|
+| Prefer + JWT | Unknown preferences are a `400` under `handling=strict`; the JWT is verified before any planning work |
+| Parse | The query string is kept as ordered pairs (repeated keys preserved) and parsed into `SelectItem`s, `Filter`s, `LogicTree`s, `OrderTerm`s, a `RangeSpec`, a `CursorSpec` and the JSON `RequestBody` |
+| Plan | Tables, columns and mutation bodies validated; embeds, RPC overloads and the cursor resolved; dialect capabilities checked → `ReadPlan`, `MutatePlan`, `CallPlan` or `InspectPlan` |
+| Render | `$1, $2, …` placeholders — never string interpolation |
+| Data cache | Reads only, when enabled and no `pre_request` hook is set. After execution a read is stored, a mutation bumps its table's generation, a volatile RPC bumps the global generation |
+| Execute | One pipelined flight, mutation guards checked on the row count, then `COMMIT` or `ROLLBACK` — see [The Postgres Executor](#the-postgres-executor) |
+| Format | JSON body (table reads forward Postgres's JSON text as bytes), `Content-Range` (`206` when more rows remain), `Location`, `X-Next-Cursor`, and the `response.status` / `response.headers` overrides |
 
 ### MCP path
 
-```
-MCP Tool Call (stdio JSON-RPC or Streamable HTTP)
-    │
-    ├─ parse_tool_name → (schema, verb, table/function)
-    ├─ parse tool arguments → ApiRequest (same struct as REST)
-    ├─ plan_request → ActionPlan (same planner)
-    ├─ query::render → SQL (same builder)
-    ├─ Backend::execute → QueryResult (same execution)
-    └─ Format as MCP tool result (JSON content)
+An MCP tool call takes the same parse → plan → render → execute route, entering through the tool name instead of a URL. It never consults the data cache and always runs as `anon_role` (see [MCP authentication](/guides/mcp#authentication)): anonymous access is refused when `jwt_secret` is set without an `anon_role`, and each call is bounded by `statement_timeout_ms` plus one second.
+
+```mermaid
+flowchart TB
+    call(["MCP tool call<br/>stdio or Streamable HTTP"]) --> name["<b>parse_tool_name</b><br/>schema, verb, target"]
+    name --> args["<b>Arguments → ApiRequest</b><br/>same struct as REST"]
+    args --> shared["<b>plan + render</b><br/>same as REST"]
+    shared --> anon{"anon allowed?"}
+    anon -->|no| refused(["PGRST302 tool error"])
+    anon -->|yes| exec["<b>Backend::execute</b><br/>as anon_role, bounded"]
+    exec --> result(["MCP tool result<br/>JSON content"])
 ```
 
 ## The Core Pipeline
@@ -171,6 +146,23 @@ The cache is loaded at startup and stored in an `Arc<ArcSwap<SchemaCache>>`. Han
 - the `pgvis serve` process receives `SIGUSR1`;
 - an embedder calls `reload()` (fire-and-forget) or `reload_now()` (awaits the swap).
 
+The three triggers converge on one reload task. `reload_now()` introspects immediately; everything else waits out the debounce first:
+
+```mermaid
+flowchart TB
+    notify(["NOTIFY pgrst"]) --> watch["<b>schema_watch</b><br/>LISTEN pgrst, own connection"]
+    watch --> wake["<b>SchemaReloader task</b><br/>wakes up"]
+    sig(["SIGUSR1"]) --> wake
+    api(["reload()"]) --> wake
+    wake --> debounce["<b>Debounce 200 ms</b><br/>drain queued changes"]
+    debounce --> intro["<b>Backend::introspect</b><br/>fresh SchemaCache"]
+    now(["reload_now()"]) --> intro
+    intro --> ok{"succeeded?"}
+    ok -->|yes| swap["<b>ArcSwap::store</b><br/>atomic swap"]
+    ok -->|no| keep["<b>Keep current cache</b><br/>log the error"]
+    swap -.-> lazy["<b>Next request</b><br/>OpenAPI regenerated,<br/>stale data cache dropped"]
+```
+
 Bursts of changes are debounced (200 ms) into one introspection. A failed introspection keeps the current cache. The OpenAPI document is regenerated lazily for the new cache, and the data cache drops every entry built against the old one (it compares the cache's `built_at` stamp).
 
 ## The `Dialect` System
@@ -221,7 +213,31 @@ Implementations:
 
 ## The Postgres Executor
 
-`execute_query` (`pgvis-postgres/src/execute.rs`) runs each request in one transaction with **two round trips**, regardless of how many JWT claims there are:
+`execute_query` (`pgvis-postgres/src/execute.rs`) runs each request in one transaction with **two round trips**, regardless of how many JWT claims there are. The statements of the first flight are sent back to back without waiting for each reply:
+
+```mermaid
+sequenceDiagram
+    participant B as Backend::execute
+    participant X as execute_query
+    participant P as Postgres
+    B->>X: ExecContext, sql, params
+    X->>X: check out a connection
+    Note over X,P: round trip 1: one pipelined flight
+    X->>P: BEGIN
+    X->>P: set_config(role, claims, timeout)
+    X->>P: pre_request(), if set
+    X->>P: main statement (CTE envelope)
+    P-->>X: results, in order
+    X->>X: check mutation guards
+    Note over X,P: round trip 2
+    alt all ok
+        X->>P: COMMIT
+    else error, guard violated or tx=rollback
+        X->>P: ROLLBACK
+    end
+    X->>X: decode the result row
+    X-->>B: QueryResult
+```
 
 1. One pipelined flight: `BEGIN`, a single batched `SELECT set_config('role', …, true), set_config('request.jwt.claims', …, true), set_config('statement_timeout', …, true)`, the optional `pre_request` function call, and the main statement.
 2. `COMMIT` — or `ROLLBACK` if anything failed, a mutation guard was violated, or `Prefer: tx=rollback` was honoured.
@@ -247,6 +263,20 @@ Pool and listener connections negotiate TLS per the DSN's `sslmode` (`disable`, 
 ## Read Replicas
 
 `PgReplicaBackend` (`replica.rs`) sends mutations and volatile function calls to the primary and round-robins reads across **eligible readers** (the replicas, plus the primary when `primary_reads` is on). With no eligible reader, reads fall back to the primary.
+
+```mermaid
+flowchart TB
+    q(["Backend::execute"]) --> mut{"is_mutation?"}
+    mut -->|yes| primary[("Primary")]
+    mut -->|no| pick{"reader left?"}
+    pick -->|no| primary
+    pick -->|yes| co{"checkout ok?"}
+    co -->|yes| reader[("Reader<br/>replica, or primary<br/>with primary_reads")]
+    co -->|"no: retry once"| pick
+    health["<b>Health monitor</b><br/>reachability + lag"] -.->|"eligible bitfield"| pick
+```
+
+`is_mutation` is set for table writes and for volatile function calls. A failed checkout on a reader is retried once on the next eligible reader before falling back to the primary.
 
 A background health monitor runs every `health_check_interval_ms`. It probes over its own one-connection pools with short timeouts — never the request pools, so a saturated but healthy replica is not mistaken for a dead one — and checks every replica concurrently, each under a deadline. A replica is excluded when unreachable or when its replication lag exceeds `max_replication_lag_bytes` (0 disables the lag check). Eligibility lives in an atomic bitfield, read lock-free on the request path; `eligible_readers()` exposes the current count.
 

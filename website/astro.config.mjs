@@ -2,6 +2,7 @@ import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
 import mdx from "@astrojs/mdx";
 import sitemap from "@astrojs/sitemap";
+import mermaid from "astro-mermaid";
 
 const SITE = "https://pgvis.io";
 
@@ -9,6 +10,23 @@ const SITE = "https://pgvis.io";
 export default defineConfig({
   site: SITE,
   integrations: [
+    // Must precede starlight so ```mermaid fences are claimed before Expressive Code.
+    mermaid({
+      theme: "default",
+      autoTheme: true,
+      enableLog: false,
+      mermaidConfig: {
+        fontFamily: "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+        flowchart: {
+          curve: "basis",
+          padding: 14,
+          nodeSpacing: 36,
+          rankSpacing: 44,
+          subGraphTitleMargin: { top: 6, bottom: 10 },
+        },
+        sequence: { mirrorActors: false, messageAlign: "center" },
+      },
+    }),
     starlight({
       title: "pgvis",
       description:
@@ -63,6 +81,14 @@ export default defineConfig({
         { tag: "meta", attrs: { name: "twitter:card", content: "summary_large_image" } },
         { tag: "meta", attrs: { name: "twitter:image", content: `${SITE}/og-image.png` } },
         { tag: "link", attrs: { rel: "preconnect", href: "https://fonts.googleapis.com" } },
+        {
+          // Mermaid measures labels when it first renders, often before Inter has
+          // loaded, which clips text. astro-mermaid re-renders on a data-theme
+          // change, so re-assert the theme once the web fonts are ready.
+          tag: "script",
+          content:
+            "document.fonts && document.fonts.ready.then(function(){if(document.querySelector('pre.mermaid')){var e=document.documentElement;e.setAttribute('data-theme',e.getAttribute('data-theme')||'dark');}});",
+        },
         { tag: "link", attrs: { rel: "preconnect", href: "https://fonts.gstatic.com", crossorigin: true } },
         {
           tag: "link",

@@ -1,6 +1,6 @@
 # Data Cache
 
-`[Implemented]` — opt-in; keyed by role + claims + rendered query + table generation; table-scoped invalidation on writes
+`[Implemented]` — opt-in; keyed by role + claims + rendered query + table generation; table-scoped invalidation on writes, global on volatile RPC and schema reload
 
 An optional **in-memory response cache** for read queries. When enabled, a
 read whose response is cacheable is stored under a key that hashes the security
@@ -17,7 +17,7 @@ no per-request cost beyond a single `Option` check.
 - Cache module: [pgvis-router/src/data_cache.rs](../crates/pgvis-router/src/data_cache.rs)
 - Dispatch integration: [pgvis-router/src/routing.rs](../crates/pgvis-router/src/routing.rs)
 - Config struct: [pgvis-core/src/config.rs](../crates/pgvis-core/src/config.rs) (`CacheConfig`)
-- Underlying store: the [`svcache`](https://crates.io/crates/svcache) crate (TTL + LRU over `DashMap`)
+- Underlying store: the [`svcache`](https://crates.io/crates/svcache) crate, 0.1.1 (TTL + SIEVE eviction over a sharded `DashMap`)
 
 ## Where it sits in the request lifecycle
 
@@ -28,22 +28,27 @@ the finished `ReadPlan` plus the rendered SQL, so it never alters what would be
 executed on a miss.
 
 ```mermaid
-flowchart TD
-    REQ[Incoming request] --> PLAN[parse → plan → render SQL]
-    PLAN --> KIND{Read or mutate?}
+flowchart TB
+    req(["Request, planned and rendered"])
+    kind{"plan type?"}
+    key{"cacheable read?<br/>compute_key"}
+    hit{"cache hit?"}
+    fmt["<b>format_response</b><br/>from cached bytes"]
+    exec["<b>Backend::execute</b><br/>cache miss"]
+    store["<b>store</b><br/>body bytes under key"]
+    plain["<b>Backend::execute</b><br/>not cached"]
+    wexec["<b>Backend::execute</b><br/>write"]
+    inv["<b>invalidate</b><br/>table or global generation"]
+    resp(["HTTP response"])
 
-    KIND -->|Read| KEY[compute_key plan, sql, params, role, generation]
-    KEY --> CACHEABLE{Key returned?}
-    CACHEABLE -->|No| EXEC
-    CACHEABLE -->|Yes| LOOKUP{cache hit?}
-    LOOKUP -->|Hit| FMT[format_response from cached body] --> RESP[HTTP response]
-    LOOKUP -->|Miss| EXEC[Backend::execute]
-    EXEC --> STORE[store body under key] --> RESP
-
-    KIND -->|Mutate| MEXEC[Backend::execute]
-    MEXEC --> INVAL[bump table generation] --> RESP
-    KIND -->|Volatile RPC| VRPC[Backend::execute]
-    VRPC --> GINVAL[bump global generation] --> RESP
+    req --> kind
+    kind -->|Read| key
+    kind -->|"Mutate or volatile RPC"| wexec --> inv --> resp
+    kind -->|"other RPC"| plain
+    key -->|"no, or pre_request set"| plain --> resp
+    key -->|yes| hit
+    hit -->|yes| fmt --> resp
+    hit -->|no| exec --> store --> resp
 ```
 
 Source: the read lookup, store, and invalidate blocks are steps 4b / 5b / 5c in
@@ -64,6 +69,7 @@ cacheability and returns `Some(key)` or `None`:
 | List / collection query | Only when `cache_lists = true` |
 | Any query with embeds | Never |
 | Mutations (`POST`/`PATCH`/`PUT`/`DELETE`), RPC | Never read-cached |
+| Any read while `pre_request` is configured | Never (the hook must see every request) |
 
 Embeds are excluded because a join pulls rows from multiple tables; only the
 top-level table is tracked.
@@ -77,9 +83,10 @@ Every cacheable read gets the same key form:
 {role}:{pk|list}:{schema}.{table}:g{generation}:{hash}
 ```
 
-where `generation` is the current per-table generation counter (incremented on
-each write to that table, or the global generation on volatile RPCs — whichever
-is higher), and `hash` is a 64-bit keyed SipHash (random per-process key) of, in order:
+where `generation` is the table's generation counter plus the global one
+(`table_generation()`; the table counter is bumped by writes to that table, the
+global one by volatile RPCs and schema reloads), and `hash` is a 64-bit keyed
+SipHash (random per-process key) of, in order:
 
 1. the JWT **claims** (streamed directly from the `serde_json::Value` tree
    without allocating an intermediate String), then
@@ -116,17 +123,21 @@ stored in `table_generations: RwLock<HashMap<String, u64>>`. Since the generatio
 is embedded in every cache key, bumping it causes all subsequent
 `compute_key()` calls for that table to produce keys that don't match any
 existing stored entry — effectively a cache miss without clearing the store. Old
-entries are eventually evicted by LRU pressure or TTL expiry.
+entries are eventually evicted by SIEVE pressure or TTL expiry.
 
-Two write paths trigger invalidation, in step 5c of `dispatch_request`
-([routing.rs](../crates/pgvis-router/src/routing.rs)):
+Three events trigger invalidation; the first two in step 5c of
+`dispatch_request` ([routing.rs](../crates/pgvis-router/src/routing.rs)):
 
 - **Mutations** (`ActionPlan::Mutate` — INSERT/UPDATE/DELETE) call
   `invalidate_table(target)`, which bumps only that table's generation.
 - **Volatile RPC** (`ActionPlan::Call` whose `function_info.volatility ==
   Volatile`) calls `invalidate_all`, which bumps a global generation counter
   (`AtomicU64`). Since `table_generation()` returns
-  `max(table_gen, global_gen)`, this effectively invalidates all tables.
+  `global_gen + table_gen`, this invalidates all tables.
+- **Schema reload** — before each lookup the router calls
+  `sync_schema(cache.built_at)`; when the `SchemaCache` was rebuilt since the
+  last call it runs `invalidate_all`, so no response cached against the old
+  schema is served ([05-schema-cache.md](05-schema-cache.md)).
 
 This approach avoids the thundering-herd problem of whole-store clearing: a write
 to table `T` only invalidates entries for `T`, while entries for unrelated tables
@@ -141,14 +152,21 @@ the catalog will not trigger invalidation (only `VOLATILE` does). That is a
 schema-definition error on the database side; `ttl_seconds` still bounds the
 resulting staleness.
 
+The cache is also per process: writes made through another pgvis instance, or
+directly in the database (triggers, jobs, `psql`), do not bump this instance's
+generations. Only `ttl_seconds` bounds that staleness.
+
 ## TTL and capacity
 
 Backed by `svcache::SvCache::with_ttl_and_limit(ttl, max_entries)`:
 
-- **TTL** (`ttl_seconds`, default 60) — entries expire lazily on read after the
-  duration. A miss on an expired entry re-queries the backend.
-- **Capacity** (`max_entries`, default 10000) — when full, least-recently-used
-  entries are evicted.
+- **TTL** (`ttl_seconds`, default 60) — an entry older than the TTL is
+  invisible to lookups at once and reclaimed lazily (by a lookup, the eviction
+  hand, or a bounded sweep). A miss on an expired entry re-queries the backend.
+- **Capacity** (`max_entries`, default 10000) — when full, svcache evicts with
+  SIEVE: a hand sweeps from the oldest entry, clearing the "visited" bit set by
+  hits and evicting the first entry whose bit is clear (an expired entry
+  regardless). O(1) amortized; without hits it is plain FIFO.
 
 TTL is the backstop for every staleness gap: even when an invalidation is
 missed (the mislabeled-volatility edge above), no entry outlives `ttl_seconds`.
@@ -168,21 +186,23 @@ missed (the mislabeled-volatility edge above), no entry outlives `ttl_seconds`.
 
 ## Observability
 
-`GET /pgvis/cache` returns the current settings plus a stats snapshot
-(handler: `handle_cache_info` in
+`GET /pgvis/cache` returns the current settings, a stats snapshot, and the
+backend's pool occupancy (handler: `handle_cache_info` in
 [routing.rs](../crates/pgvis-router/src/routing.rs)). The endpoint is always
-registered; `stats` is `null` when caching is disabled.
+registered and authenticates like the data API; `stats` is `null` when caching
+is disabled, and `pool` is `null` for a backend without a pool (SQLite).
 
 ```json
 {
   "settings": { "enabled": true, "ttl_seconds": 60, "max_entries": 10000, "cache_lists": false },
-  "stats":    { "hits": 1280, "misses": 240, "invalidations": 12, "entries": 305, "hit_rate": 84.21 }
+  "stats":    { "hits": 1280, "misses": 240, "invalidations": 12, "entries": 305, "hit_rate": 84.21 },
+  "pool":     { "max_size": 16, "size": 4, "available": 3, "waiting": 0 }
 }
 ```
 
 `entries` is read live from `SvCache::len()`, so it reflects the actual stored
 set rather than a running counter; it may briefly include entries that are
-expired-but-not-yet-evicted, since svcache expires lazily.
+expired-but-not-yet-reclaimed.
 `hits`/`misses`/`hit_rate`/`invalidations` are exact counters.
 
 ## Configuration
@@ -190,13 +210,15 @@ expired-but-not-yet-evicted, since svcache expires lazily.
 See [06-errors-and-config.md](06-errors-and-config.md) for the config system as a
 whole. The cache is the `[cache]` table / `CacheConfig` struct:
 
-| Field | Env | Default | Meaning |
+| Field | Env (any command) | Default | Meaning |
 | ------- | ----- | --------- | --------- |
-| `cache.enabled` | `PGVIS_CACHE_ENABLED` | `false` | Master switch. Nothing is allocated when off. |
-| `cache.ttl_seconds` | `PGVIS_CACHE_TTL` | `60` | Entry lifetime before expiry. |
-| `cache.max_entries` | `PGVIS_CACHE_MAX_ENTRIES` | `10000` | LRU capacity. |
-| `cache.cache_lists` | `PGVIS_CACHE_LISTS` | `false` | Cache list queries, not just PK lookups. |
+| `cache.enabled` | `PGVIS_CACHE__ENABLED` | `false` | Master switch. Nothing is allocated when off. |
+| `cache.ttl_seconds` | `PGVIS_CACHE__TTL_SECONDS` | `60` | Entry lifetime before expiry. |
+| `cache.max_entries` | `PGVIS_CACHE__MAX_ENTRIES` | `10000` | Capacity; SIEVE eviction beyond it. |
+| `cache.cache_lists` | `PGVIS_CACHE__CACHE_LISTS` | `false` | Cache list queries, not just PK lookups. |
 
 CLI flags on `pgvis serve` (`--cache-enabled`, `--cache-ttl`,
-`--cache-max-entries`, `--cache-lists`) override the loaded config
-([pgvis-server/src/main.rs](../crates/pgvis-server/src/main.rs)).
+`--cache-max-entries`, `--cache-lists`) override the loaded config; each flag
+also reads its own env var (`PGVIS_CACHE_ENABLED`, `PGVIS_CACHE_TTL`,
+`PGVIS_CACHE_MAX_ENTRIES`, `PGVIS_CACHE_LISTS`), which therefore applies to
+`serve` only ([pgvis-server/src/main.rs](../crates/pgvis-server/src/main.rs)).

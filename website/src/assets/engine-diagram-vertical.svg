@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 36 800 288" preserveAspectRatio="xMidYMid meet" role="img" aria-label="pgvis introspects a Postgres or SQLite database and serves it three ways: as MCP tools, a REST API, and an OpenAPI 3.0 spec, through one parse, plan, SQL pipeline.">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 452" preserveAspectRatio="xMidYMid meet" role="img" aria-label="pgvis introspects a Postgres or SQLite database and serves it three ways: as MCP tools, a REST API, and an OpenAPI 3.0 spec, through one parse, plan, SQL pipeline.">
   <defs>
-    <linearGradient id="ed-line" x1="200" y1="0" x2="600" y2="0" gradientUnits="userSpaceOnUse">
+    <linearGradient id="edm-line" x1="0" y1="76" x2="0" y2="356" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#6366f1" stop-opacity="0.55" />
       <stop offset="100%" stop-color="#a78bfa" stop-opacity="0.55" />
     </linearGradient>
@@ -102,26 +102,6 @@
         opacity: 0;
       }
 
-      .ed-dot-pg {
-        offset-path: path('M 200 104 C 245 104 270 165 300 175');
-        animation: ed-flow-req-a 4s linear infinite;
-      }
-      .ed-dot-sqlite {
-        offset-path: path('M 200 256 C 245 256 270 195 300 185');
-        animation: ed-flow-req-b 4s linear infinite;
-      }
-      .ed-dot-mcp {
-        offset-path: path('M 500 165 C 540 165 565 86 600 86');
-        animation: ed-flow-resp-mcp 4s linear infinite;
-      }
-      .ed-dot-rest {
-        offset-path: path('M 500 180 L 600 180');
-        animation: ed-flow-resp-rest 4s linear infinite;
-      }
-      .ed-dot-openapi {
-        offset-path: path('M 500 195 C 540 195 565 274 600 274');
-        animation: ed-flow-resp-openapi 4s linear infinite;
-      }
 
       /* Single 4s cycle:
          0–25% : request from Postgres
@@ -177,6 +157,31 @@
         }
       }
 
+      .edm-dot-pg {
+        offset-path: path('M 95 76 C 95 124 170 122 170 170');
+        animation: ed-flow-req-a 4s linear infinite;
+      }
+      .edm-dot-sqlite {
+        offset-path: path('M 265 76 C 265 124 190 122 190 170');
+        animation: ed-flow-req-b 4s linear infinite;
+      }
+      .edm-dot-mcp {
+        offset-path: path('M 165 262 C 165 312 64 308 64 356');
+        animation: ed-flow-resp-mcp 4s linear infinite;
+      }
+      .edm-dot-rest {
+        offset-path: path('M 180 262 L 180 356');
+        animation: ed-flow-resp-rest 4s linear infinite;
+      }
+      .edm-dot-openapi {
+        offset-path: path('M 195 262 C 195 312 296 308 296 356');
+        animation: ed-flow-resp-openapi 4s linear infinite;
+      }
+      .edm-surface .ed-label {
+        font-size: 14px;
+        text-anchor: middle;
+      }
+
       /* Respect motion preferences: park each dot mid-path, freeze the engine. */
       @media (prefers-reduced-motion: reduce) {
         .ed-dot,
@@ -192,81 +197,73 @@
   </defs>
 
   <!-- Connection lines (decorative; dots ride on top) -->
-  <g class="ed-lines" aria-hidden="true" fill="none" stroke="url(#ed-line)" stroke-width="1.6" stroke-linecap="round">
-    <path d="M 200 104 C 245 104 270 165 300 175" />
-    <path d="M 200 256 C 245 256 270 195 300 185" />
-    <path d="M 500 165 C 540 165 565 86 600 86" />
-    <path d="M 500 180 L 600 180" />
-    <path d="M 500 195 C 540 195 565 274 600 274" />
+  <g class="ed-lines" aria-hidden="true" fill="none" stroke="url(#edm-line)" stroke-width="1.6" stroke-linecap="round">
+    <path d="M 95 76 C 95 124 170 122 170 170" />
+    <path d="M 265 76 C 265 124 190 122 190 170" />
+    <path d="M 165 262 C 165 312 64 308 64 356" />
+    <path d="M 180 262 L 180 356" />
+    <path d="M 195 262 C 195 312 296 308 296 356" />
   </g>
 
   <!-- Animated request/response dots -->
   <g class="ed-dots" aria-hidden="true">
-    <circle r="4.5" class="ed-dot ed-dot-pg" />
-    <circle r="4.5" class="ed-dot ed-dot-sqlite" />
-    <circle r="4.5" class="ed-dot ed-dot-mcp" />
-    <circle r="4.5" class="ed-dot ed-dot-rest" />
-    <circle r="4.5" class="ed-dot ed-dot-openapi" />
+    <circle r="4.5" class="ed-dot edm-dot-pg" />
+    <circle r="4.5" class="ed-dot edm-dot-sqlite" />
+    <circle r="4.5" class="ed-dot edm-dot-mcp" />
+    <circle r="4.5" class="ed-dot edm-dot-rest" />
+    <circle r="4.5" class="ed-dot edm-dot-openapi" />
   </g>
 
-  <!-- Source: Postgres -->
-  <g class="ed-pill ed-pill-pg" transform="translate(40 70)">
-    <rect width="160" height="68" rx="14" />
-    <g transform="translate(20 18)" class="ed-icon" aria-hidden="true">
+  <g class="ed-pill ed-pill-pg" transform="translate(20 20)">
+    <rect width="150" height="56" rx="14" />
+    <g transform="translate(16 13)" class="ed-icon" aria-hidden="true">
       <ellipse cx="14" cy="6" rx="11" ry="4" />
       <path d="M3 6v20c0 2.2 4.9 4 11 4s11-1.8 11-4V6" />
       <path d="M3 14c0 2.2 4.9 4 11 4s11-1.8 11-4" />
       <path d="M3 22c0 2.2 4.9 4 11 4s11-1.8 11-4" />
     </g>
-    <text x="60" y="34" class="ed-label">Postgres</text>
+    <text x="54" y="28" class="ed-label">Postgres</text>
   </g>
-
-  <!-- Source: SQLite -->
-  <g class="ed-pill ed-pill-sqlite" transform="translate(40 222)">
-    <rect width="160" height="68" rx="14" />
-    <g transform="translate(20 18)" class="ed-icon" aria-hidden="true">
+  <g class="ed-pill ed-pill-sqlite" transform="translate(190 20)">
+    <rect width="150" height="56" rx="14" />
+    <g transform="translate(16 13)" class="ed-icon" aria-hidden="true">
       <ellipse cx="14" cy="6" rx="11" ry="4" />
       <path d="M3 6v20c0 2.2 4.9 4 11 4s11-1.8 11-4V6" />
       <path d="M3 14c0 2.2 4.9 4 11 4s11-1.8 11-4" />
       <path d="M3 22c0 2.2 4.9 4 11 4s11-1.8 11-4" />
     </g>
-    <text x="60" y="34" class="ed-label">SQLite</text>
+    <text x="54" y="28" class="ed-label">SQLite</text>
   </g>
 
   <!-- Engine -->
-  <g class="ed-engine" transform="translate(300 130)">
-    <rect class="ed-engine-rect" width="200" height="100" rx="16" />
-    <text x="100" y="38" class="ed-engine-title">pgvis engine</text>
-    <text x="100" y="66" class="ed-engine-sub">parse → plan → SQL</text>
+  <g class="ed-engine" transform="translate(80 170)">
+    <rect class="ed-engine-rect" width="200" height="92" rx="16" />
+    <text x="100" y="35" class="ed-engine-title">pgvis engine</text>
+    <text x="100" y="62" class="ed-engine-sub">parse → plan → SQL</text>
   </g>
 
-  <!-- Surface: MCP -->
-  <g class="ed-pill ed-pill-mcp" transform="translate(600 60)">
-    <rect width="160" height="52" rx="12" />
-    <g transform="translate(18 16)" class="ed-icon" aria-hidden="true">
+  <g class="ed-pill ed-pill-mcp edm-surface" transform="translate(12 356)">
+    <rect width="104" height="76" rx="14" />
+    <g transform="translate(40 12)" class="ed-icon" aria-hidden="true">
       <path d="M12 0a4 4 0 0 0-4 4v1a4 4 0 0 0-4 4v1a4 4 0 0 0 4 4v1a4 4 0 0 0 4 4 4 4 0 0 0 4-4v-1a4 4 0 0 0 4-4v-1a4 4 0 0 0-4-4V4a4 4 0 0 0-4-4z" />
       <path d="M12 6v12M6 12h12" />
     </g>
-    <text x="56" y="26" class="ed-label">MCP</text>
+    <text x="52" y="56" class="ed-label">MCP</text>
   </g>
-
-  <!-- Surface: REST -->
-  <g class="ed-pill ed-pill-rest" transform="translate(600 154)">
-    <rect width="160" height="52" rx="12" />
-    <g transform="translate(18 14)" class="ed-icon" aria-hidden="true">
+  <g class="ed-pill ed-pill-rest edm-surface" transform="translate(128 356)">
+    <rect width="104" height="76" rx="14" />
+    <g transform="translate(40 12)" class="ed-icon" aria-hidden="true">
       <path d="M2 6h20M2 12h20M2 18h12" />
       <circle cx="20" cy="18" r="2.5" />
     </g>
-    <text x="56" y="26" class="ed-label">REST</text>
+    <text x="52" y="56" class="ed-label">REST</text>
   </g>
-
-  <!-- Surface: OpenAPI -->
-  <g class="ed-pill ed-pill-openapi" transform="translate(600 248)">
-    <rect width="160" height="52" rx="12" />
-    <g transform="translate(18 14)" class="ed-icon" aria-hidden="true">
+  <g class="ed-pill ed-pill-openapi edm-surface" transform="translate(244 356)">
+    <rect width="104" height="76" rx="14" />
+    <g transform="translate(41 12)" class="ed-icon" aria-hidden="true">
       <path d="M14 0H4a2 2 0 0 0-2 2v20a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6z" />
       <path d="M14 0v6h6M8 12h6M8 16h4" />
     </g>
-    <text x="56" y="26" class="ed-label">OpenAPI</text>
+    <text x="52" y="56" class="ed-label">OpenAPI</text>
   </g>
 </svg>

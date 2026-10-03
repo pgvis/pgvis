@@ -6,23 +6,22 @@ The core pipeline is the heart of pgvis and lives entirely in the I/O-free
 [pgvis-core](../crates/pgvis-core) crate. It has three stages:
 
 ```mermaid
-flowchart LR
-    subgraph parse[1. Parse]
-      QS[query string fragments] --> P1["query_params::parse_select / parse_filter / parse_order / parse_logic_tree"]
-      P1 --> AST["select_ast::SelectItem<br/>query_params::types::{Filter, OrderTerm, LogicTree, RangeSpec}"]
-    end
-    subgraph plan[2. Plan]
-      AST --> AR[ApiRequest]
-      AR --> PRq["plan_request()"]
-      SC[(SchemaCache)] --> PRq
-      DL[Dialect] --> PRq
-      PRq --> AP[ActionPlan]
-    end
-    subgraph build[3. SQL Build]
-      AP --> R["query::render()"]
-      DL --> R
-      R --> OUT[SQL string + Vec&lt;Value&gt; params]
-    end
+flowchart TB
+    qs(["query string, headers, body"])
+    parse["<b>1. Parse</b><br/>query_params: select, filter, order, logic"]
+    ast["<b>Syntax tree</b><br/>SelectItem, Filter, OrderTerm, LogicTree"]
+    ar["<b>ApiRequest</b><br/>surface-neutral request"]
+    plan["<b>2. Plan</b><br/>plan_request()"]
+    sc[("SchemaCache")]
+    dl["<b>Dialect</b><br/>capability flags"]
+    ap["<b>ActionPlan</b><br/>fully resolved"]
+    build["<b>3. SQL build</b><br/>query::render()"]
+    out(["SQL string + Vec&lt;Value&gt; params"])
+
+    qs --> parse --> ast --> ar --> plan --> ap --> build --> out
+    sc --> plan
+    dl --> plan
+    dl --> build
 ```
 
 The strict ordering matters: **the parser knows nothing about the schema, the
@@ -108,7 +107,7 @@ nodes ([plan/resolve.rs](../crates/pgvis-core/src/plan/resolve.rs),
   (`Direct` FK, `Junction` M2M, or `Computed` function-based) and a recursive
   child `ReadPlan` — embedding is the recursion point of the whole pipeline.
 - **Filters** become `ResolvedFilter` with an optional `FilterRewrite` hint
-  (e.g. `ILikeViaLower`, `JsonArrayContains`, `GlobPattern`) pre-computed *here*
+  (e.g. `InstrFallback`, `JsonArrayContains`, `GlobPattern`) pre-computed *here*
   so the SQL builder never branches on dialect capability.
 - **Range** is capped by `PlanConfig.max_rows` (derived from `Config`) so a
   client cannot exceed the server limit.
@@ -121,25 +120,27 @@ the plan, deliberately avoiding a borrow of the `SchemaCache` so a resolved
 
 ### Output: `ActionPlan`
 
+Each `ActionPlan` variant carries everything its renderer needs; embedding
+is the one recursive edge.
+
 ```mermaid
-flowchart TD
-    AP{ActionPlan} --> RP[ReadPlan]
-    AP --> MP[MutatePlan]
-    AP --> CP[CallPlan]
-    AP --> IP[InspectPlan]
+flowchart TB
+    ap["<b>ActionPlan</b>"]
+    rp["<b>ReadPlan</b><br/>select, filters, order, range, embeds"]
+    mp["<b>MutatePlan</b><br/>mutation, filters, range, returning, embeds"]
+    cp["<b>CallPlan</b><br/>params, returning, filters, is_singular"]
+    ip["<b>InspectPlan</b><br/>no SQL"]
+    mt["<b>MutationType</b><br/>Insert / Update / Delete"]
+    emb["<b>EmbeddedResource</b><br/>ResolvedJoin + child ReadPlan"]
 
-    RP --> RPsel[select: Vec&lt;ResolvedSelect&gt;]
-    RP --> RPemb["embeds: Vec&lt;EmbeddedResource&gt;"]
-    RPemb --> RPchild["each holds a child ReadPlan (recursive)"]
-    RPchild -.embedding recursion.-> RP
-
-    MP --> MT{MutationType}
-    MT --> INS["Insert {payload_columns, is_bulk, on_conflict}"]
-    MT --> UPD["Update {payload_columns}"]
-    MT --> DEL[Delete]
-
-    CP --> CPp[params: matched to routine signature]
-    CP --> CPr[returning + is_singular]
+    ap --> rp
+    ap --> mp
+    ap --> cp
+    ap --> ip
+    mp --> mt
+    rp --> emb
+    mp --> emb
+    emb -.->|"child plan"| rp
 ```
 
 All `ActionPlan` types are defined in
@@ -151,10 +152,16 @@ All `ActionPlan` types are defined in
   `Insert { on_conflict: Some(ResolvedConflict { columns, resolution }) }`.
 - `CallPlan` resolves parameters against the routine signature
   (`resolve_call_params`) and sets `is_singular` from whether the routine
-  returns a set. **TODO seam:** overload resolution currently takes the first
-  matching routine (`plan_call` in
-  [plan/planner.rs](../crates/pgvis-core/src/plan/planner.rs)) — a scoring
-  algorithm is future work; see [08-future-scope.md](08-future-scope.md).
+  returns a set. Overloads are resolved by argument names, as PostgREST does
+  (`resolve_overload` in
+  [plan/planner.rs](../crates/pgvis-core/src/plan/planner.rs)): a candidate
+  must declare every supplied argument and receive every parameter without a
+  default. No candidate is `PGRST202` (404), so an unknown argument is an error
+  rather than silently dropped; more than one is `PGRST203` (300).
+- `MutatePlan.range` (from `limit`/`offset` + `order`) bounds the rows a
+  PATCH/DELETE changes, rendered as `WHERE <row id> IN (SELECT <row id> …
+  LIMIT n)` with `Dialect::row_identifier` (`ctid` / `rowid`); it is rejected
+  on views, which have no row identifier.
 
 ## Stage 3 — The SQL builder
 
@@ -206,14 +213,17 @@ Every inner query is wrapped by `wrap_cte`
 decodes one row of one shape:
 
 ```sql
-WITH pgrst_source AS (
-  <inner_sql>
-)
+WITH
+  -- only when count=exact and the plan has a pre-LIMIT count source:
+  pgrst_count AS (SELECT count(*) AS total FROM (<count_source_sql>) _count_src),
+  pgrst_source AS (
+    <inner_sql>
+  )
 SELECT
   COALESCE(json_agg(_pgvis_t), '[]') AS body,
   (SELECT count(*) FROM pgrst_source) AS page_total,
-  -- only when count=exact:
-  (SELECT count(*) FROM pgrst_source) AS total_count,
+  -- only when count=exact (from pgrst_count when present):
+  (SELECT total FROM pgrst_count) AS total_count,
   -- Postgres only (dialect.supports_set_local):
   current_setting('response.status', true)  AS response_status,
   current_setting('response.headers', true) AS response_headers
@@ -223,9 +233,15 @@ FROM (SELECT * FROM pgrst_source) _pgvis_t
 `json_agg` becomes `json_group_array` on SQLite (`dialect.json_array_agg`), and
 the `current_setting(...)` GUC-readback columns are omitted when
 `dialect.supports_set_local` is false. The decoded shape is
-[`QueryResult`](../crates/pgvis-core/src/backend.rs). The exact-count strategy
-here is intentionally simplified (page count reused as total) and is a refinement
-item in [08-future-scope.md](08-future-scope.md).
+[`QueryResult`](../crates/pgvis-core/src/backend.rs). For `count=exact`, reads
+count every matching row before LIMIT through `pgrst_count`
+(`render_read_count_source`); without a separate count source (e.g. a
+mutation) the page count is reported as the total. `count=planned` /
+`count=estimated` are not implemented yet
+([08-future-scope.md](08-future-scope.md)).
+
+The SQLite path does not use this envelope: the router calls
+`query::render_inner` and the SQLite executor assembles `QueryResult` in Rust.
 
 ## Why this shape
 

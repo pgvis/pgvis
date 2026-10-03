@@ -5,23 +5,36 @@ split between them is the central design idea:
 
 - **`Backend` trait** — the *async I/O boundary*. Connection pooling, query
   execution, schema introspection, change notifications. One trait, implemented
-  per database. **Status: `[Implemented]` for Postgres** — `introspect` and
-  `execute` are complete; `watch_schema` (LISTEN/NOTIFY) is the remaining seam.
+  per database. **Status: `[Implemented]`** for Postgres (`introspect`,
+  `execute`, `watch_schema` via `LISTEN pgrst`, `pool_status`) and SQLite
+  (`introspect`, `execute`; no schema watch).
 - **`Dialect` struct** — *pure data* describing SQL syntax and capability
   differences. No I/O, no trait, no dynamic dispatch. **Status: `[Implemented]`**
   (`POSTGRES` and `SQLITE` constants both defined).
 
+The planner and SQL builder only read the `Dialect` data; surfaces only see
+`Arc<dyn Backend>`, never a concrete driver.
+
 ```mermaid
-flowchart TD
-    SQLB[query::render] -->|reads flags| DLT[Dialect struct]
-    PLAN[plan layer] -->|capability gate| DLT
-    ADP[adapters] -->|hold| AB["Arc&lt;dyn Backend&gt;"]
-    AB --> PGB[PgBackend]
-    AB -. planned .-> LITEB[SqliteBackend]
-    PGB -->|dialect&#40;&#41;| POSTGRES[&amp;POSTGRES]
-    LITEB -. dialect&#40;&#41; .-> SQLITE[&amp;SQLITE]
-    PGB --> POOL[deadpool-postgres pool]
-    POOL --> DB[(PostgreSQL)]
+flowchart TB
+    plan["<b>plan layer</b><br/>capability gate + FilterRewrite"]
+    sqlb["<b>query::render</b><br/>syntax fields"]
+    dl["<b>Dialect</b><br/>&amp;'static data, no I/O"]
+    adp["<b>Surfaces</b><br/>hold Arc&lt;dyn Backend&gt;"]
+    pgb["<b>PgBackend</b><br/>one pool"]
+    rep["<b>PgReplicaBackend</b><br/>primary + replica pools"]
+    lite["<b>SqliteBackend</b><br/>writer + reader connections"]
+    pg[("PostgreSQL")]
+    sq[("SQLite")]
+
+    plan --> dl
+    sqlb --> dl
+    adp --> pgb
+    adp --> rep
+    adp --> lite
+    pgb --> pg
+    rep --> pg
+    lite --> sq
 ```
 
 ## The `Backend` trait
@@ -39,6 +52,8 @@ pub trait Backend: Send + Sync + 'static {
     fn watch_schema(&self) -> BoxFuture<'_, Option<SchemaChangeStream>> { /* None */ }
 
     fn dialect(&self) -> &'static Dialect;
+
+    fn pool_status(&self) -> Option<PoolStatus> { /* None */ }
 }
 ```
 
@@ -65,14 +80,18 @@ All in [backend.rs](../crates/pgvis-core/src/backend.rs):
 | Type | Role |
 | ------ | ------ |
 | `IntrospectConfig` | which schemas to expose + `extra_search_path` for type/function resolution |
-| `ExecContext` | per-request session setup: `role`, JWT `claims`, `pre_request`, `statement_timeout`, `tx_end` |
-| `QueryResult` | decoded CTE result: `body`, `total_count`, `page_total`, `response_status`, `response_headers`, `was_insert` |
+| `ExecContext` | per-request session setup: `role`, JWT `claims`, `pre_request`, `statement_timeout`, `tx_end`; routing hint `is_mutation`; `raw_body`; mutation guards `max_affected` and `single_row` |
+| `QueryResult` | decoded CTE result: `body` (or `raw_body`, the database's JSON text), `total_count`, `page_total`, `response_status`, `response_headers`, `was_insert` |
 | `SchemaChangeStream` | `Pin<Box<dyn Stream<Item=()> + Send>>` — push schema-reload signal |
+| `PoolStatus` | pool occupancy (`max_size`, `size`, `available`, `waiting`), reported by `pool_status()` |
 
 `ExecContext` is how row-level security and PostgREST-style GUC behaviour reach
-the database: on Postgres the backend opens a transaction, `SET LOCAL role`,
-sets `request.jwt.claims`, optionally calls the pre-request function, then runs
-the statement. On a backend without `SET LOCAL` these fields are informational.
+the database: on Postgres the backend opens a transaction and sets `role`,
+`request.jwt.claims` and `statement_timeout` with transaction-local
+`set_config(..., true)` (the same effect as `SET LOCAL`), optionally calls the
+pre-request function, then runs the statement. Per-claim
+`request.jwt.claim.<key>` GUCs are not set; `request.jwt.claims` carries every
+claim, as in current PostgREST. On SQLite the role and claims are ignored.
 
 ### The Postgres implementations
 
@@ -83,17 +102,57 @@ the statement. On a backend without `SET LOCAL` these fields are informational.
 
 - `introspect()` — gets a pooled client and calls
   `introspect::load_schema_cache` ([05-schema-cache.md](05-schema-cache.md)).
-- `execute()` — **`[Implemented]`**: gets a pooled client and calls
+- `execute()` — checks out a connection as a `Checkout` guard and calls
   `execute::execute_query`
-  ([execute.rs](../crates/pgvis-postgres/src/execute.rs)), which opens a
-  transaction, applies `ExecContext` (`SET LOCAL role` / `request.jwt.claims` /
-  `statement_timeout` / pre-request), binds `serde_json::Value` params via a
-  `TextParam` `ToSql` wrapper (text-protocol; Postgres coerces by inferred
-  type), runs the CTE-wrapped statement, decodes the single row into
-  `QueryResult`, and COMMITs/ROLLBACKs per `tx_end`.
-- `watch_schema()` — returns `None` today; `LISTEN/NOTIFY` is a TODO
-  ([08-future-scope.md](08-future-scope.md)).
+  ([execute.rs](../crates/pgvis-postgres/src/execute.rs)); see the sequence
+  below. A failed checkout (pool exhausted or database unreachable) is 503
+  `PGRST000`, as in PostgREST.
+- `watch_schema()` — `LISTEN pgrst` on a dedicated connection
+  ([schema_watch.rs](../crates/pgvis-postgres/src/schema_watch.rs)); see
+  [05-schema-cache.md](05-schema-cache.md).
 - `dialect()` — returns `&pgvis_core::dialect::POSTGRES`.
+- `pool_status()` — occupancy of the request pool.
+
+**The pipelined executor.** `execute_query` sends BEGIN, one batched
+`SELECT set_config($1, $2, true), …` for every GUC, the optional pre-request
+call and the CTE-wrapped statement as one pipelined flight (`futures::join!`
+over unnamed `query_typed` statements: no per-request PREPARE, safe behind
+transaction-mode poolers). Parameters are bound by a `TextParam` `ToSql`
+wrapper in the text format, so Postgres coerces them by inferred type. The
+mutation guards are checked against the CTE's `page_total` before the
+transaction ends, so a violation rolls the writes back. That makes two round
+trips per request regardless of how many claims the JWT carries.
+
+```mermaid
+sequenceDiagram
+    participant B as PgBackend
+    participant C as Checkout
+    participant PG as Postgres
+    B->>C: pool.get() (503 PGRST000 on failure)
+    Note over C,PG: one pipelined flight
+    C->>PG: BEGIN
+    C->>PG: SELECT set_config(role, claims, timeout)
+    C->>PG: SELECT pre_request() (if configured)
+    C->>PG: CTE-wrapped statement
+    PG-->>C: results (the first error wins)
+    C->>C: guards: max-affected, singular row
+    alt error, guard violated, or tx=rollback
+        C->>PG: ROLLBACK
+    else success
+        C->>PG: COMMIT
+    end
+    C->>C: decode the CTE row into QueryResult
+    C-->>B: QueryResult or Error
+```
+
+There is no RAII transaction, so `Checkout` guards the connection instead: if
+the request future is dropped mid-flight (client disconnect, timeout), its
+`Drop` detaches the connection from the pool and closes it, and the server
+rolls the open transaction back. A connection still inside a transaction, with
+the caller's role set, is never handed to the next request. The body is
+decoded only after COMMIT/ROLLBACK, so locks and the connection are not held
+while JSON is parsed; table reads skip parsing entirely and forward the
+database's JSON text (`ExecContext::raw_body`).
 
 **Pool lifecycle configuration:** Pool creation is centralized in
 [`create_pool()`](../crates/pgvis-postgres/src/lib.rs) which applies all
@@ -106,34 +165,78 @@ settings from [`PoolConfig`](../crates/pgvis-core/src/config.rs):
 | Manager-level | `recycling_method` (Fast/Verified/Clean) | Validate connections on checkout; trade latency for safety |
 
 Both `PgBackend` and `PgReplicaBackend` share the same `create_pool` function,
-so identical pool settings apply uniformly to the primary and all replica pools.
+so identical pool settings apply uniformly to the primary and all replica pools
+(the replica health probes reuse it with `size = 1` and short timeouts).
 
 #### `PgReplicaBackend` — primary + read replicas `[Implemented]`
 
 [`PgReplicaBackend`](../crates/pgvis-postgres/src/replica.rs) extends the
 single-server model with replica-aware routing:
 
+Every read picks an eligible reader from the health bitfield; writes, and
+anything that may write, stay on the primary.
+
 ```mermaid
-flowchart TD
-    EXEC["Backend::execute(ctx, sql, params)"] --> ROUTE{ctx.is_mutation?}
-    ROUTE -->|Yes| PRIMARY[Primary Pool]
-    ROUTE -->|No| LB[Round-Robin Load Balancer]
-    LB --> HC{Lag Check}
-    HC -->|Healthy| R1[Replica Pool 1..N]
-    HC -->|Healthy| PRIMARY
-    HC -->|Lagging/Down| SKIP[Excluded]
+flowchart TB
+    exec(["Backend::execute(ctx, sql, params)"])
+    write{"ctx.is_mutation?"}
+    pick{"eligible reader?"}
+    get{"reader checkout ok?"}
+    reader["<b>Reader pool</b><br/>replica, or primary if primary_reads"]
+    primary["<b>Primary pool</b>"]
+
+    exec --> write
+    write -->|"yes: write, volatile RPC, pub/sub"| primary
+    write -->|no| pick
+    pick -->|"yes: round-robin"| get
+    pick -->|none| primary
+    get -->|yes| reader
+    get -.->|"no: try the next reader once"| pick
+    get -->|"no, twice"| primary
 ```
 
 **Routing logic:**
-- `is_mutation = true` → always primary pool
-- `is_mutation = false` → round-robin across eligible readers (replicas + optionally primary)
-- All replicas down/lagging → falls back to primary
+- `is_mutation = true` → always the primary pool. The router sets it for
+  mutations *and* for calls to `VOLATILE` functions (`plan_writes`), and the
+  pub/sub handlers set it for their statements (NOTIFY, the authorize
+  function), so nothing that may write reaches a standby.
+- `is_mutation = false` → round-robin across eligible readers (replicas +
+  optionally the primary); on a checkout failure the next eligible reader is
+  tried once.
+- No eligible reader, or both tries failed → the primary.
 
 **Health monitoring:** A background task runs every `health_check_interval_ms`
-(default 5 s). It queries `pg_current_wal_lsn()` on the primary and
-`pg_last_wal_receive_lsn()` on each replica, computes lag in bytes, and
-excludes replicas exceeding `max_replication_lag_bytes` (default 10 MB). State
-is stored in an atomic bitfield for lock-free routing decisions.
+(default 5 s). It probes over its **own one-connection pools** with short
+timeouts (the interval clamped to 0.5–5 s), never the request pools: probing
+through a saturated request pool made a healthy but busy replica look
+unreachable, excluding it and piling its load onto the rest. Each tick reads
+`pg_current_wal_lsn()` on the primary, then checks every replica concurrently,
+each under its own deadline, comparing `pg_last_wal_replay_lsn()` (the
+position visible to queries) with the primary's. Replicas more than
+`max_replication_lag_bytes` (default 10 MB) behind, unreachable, or not in
+recovery are excluded. When lag checking is disabled or the primary cannot be
+read, the check falls back to connectivity only (`SELECT 1`). The result is
+stored in an atomic `u64` bitfield (at most 64 readers) for lock-free routing.
+
+```mermaid
+flowchart TB
+    tick(["every health_check_interval_ms"])
+    lsn["<b>Primary WAL position</b><br/>own 1-connection probe pool"]
+    probe["<b>Probe every replica</b><br/>concurrently, each with a deadline"]
+    lag{"reachable, in recovery,<br/>lag within the limit?"}
+    ok["<b>eligible</b>"]
+    out["<b>excluded</b><br/>lagging or unreachable"]
+    bits[("AtomicU64 eligibility bits")]
+
+    tick --> lsn --> probe --> lag
+    lag -->|yes| ok --> bits
+    lag -->|no| out --> bits
+```
+
+`PgReplicaBackend::eligible_readers()` reports how many readers passed the last
+check; `pool_status()` reports the primary's pool, which takes every write.
+Introspection runs on the primary, and `watch_schema()` listens on the
+primary, where DDL is made and announced.
 
 **Failover:** pgvis does NOT handle promotion. External tools (Patroni,
 pg_auto_failover, DNS/VIP) handle that. `deadpool-postgres` evicts broken
@@ -196,6 +299,12 @@ From the `POSTGRES` and `SQLITE` constants in
 | `supports_quantifiers` | ✓ | ✗ | `op(any)`/`op(all)` rejected or fanned out |
 | `supports_set_timezone` | ✓ | ✗ | `Prefer: timezone` ignored |
 | `supports_is_distinct` | ✓ | ✗ (conservative) | `IS DISTINCT FROM` avoided |
+| `supports_row_to_json` | ✓ | ✗ | embeds serialize with explicit `json_object(...)` |
+| `supports_json_recordset` | ✓ | ✗ | INSERT binds one parameter per value instead of one JSON parameter (`json_populate_recordset`) |
+| `escape_string_literals` | ✓ | ✗ | JSON-path keys rendered as plain `'...'` instead of `E'...'` |
+
+`row_identifier` (`ctid` on Postgres, `rowid` on SQLite) is the system column
+used for limited PATCH/DELETE (`WHERE <id> IN (SELECT <id> … LIMIT n)`).
 
 ### How dialect gating works
 
@@ -208,8 +317,9 @@ Two phases, never re-checked in the SQL builder:
    `/rpc/*` call when `has_routines` is false.
 2. **Plan-time rewrite annotation.** When an operator is *expressible
    differently* rather than impossible, the planner attaches a `FilterRewrite`
-   to the `ResolvedFilter` (e.g. `ILikeViaLower`, `JsonArrayContains`,
-   `GlobPattern`, `JsonExtractFunction`, `InstrFallback`). The SQL builder reads
+   to the `ResolvedFilter` (`InstrFallback` for ILIKE as
+   `LOWER() LIKE LOWER()`, `JsonArrayContains`, `GlobPattern`,
+   `JsonExtractFunction`, `LikePattern`). The SQL builder reads
    the hint and emits the dialect-appropriate fragment with no capability
    logic of its own.
 
@@ -218,20 +328,22 @@ Two phases, never re-checked in the SQL builder:
 bridge that keeps the plan layer and SQL builder decoupled while still producing
 correct multi-dialect SQL.
 
-## SQLite backend `[Planned]`
+## SQLite backend `[Implemented]`
 
-The `SQLITE` dialect constant already exists and the SQL builder + CTE wrapper
-already special-case it (see the SQLite unit tests in
-[query/cte.rs](../crates/pgvis-core/src/query/cte.rs)). What is missing is a
-`pgvis-sqlite` driver crate implementing `Backend`. Expected differences a
-SQLite implementation must handle, all already anticipated by flags/rewrites:
+[`SqliteBackend`](../crates/pgvis-sqlite/src/lib.rs) (`rusqlite` +
+`tokio-rusqlite`) opens one writer connection, serialized by a mutex, plus a
+set of reader connections in WAL mode; `ExecContext::is_mutation` picks the
+writer. It differs from Postgres along the lines the flags anticipate:
 
 - single namespace (`schema_namespacing = false`; cache uses `"main"` by
   convention — see [05-schema-cache.md](05-schema-cache.md))
-- no roles / GUCs (`ExecContext` role+claims informational; no response GUCs)
+- no CTE envelope: the router renders with `query::render_inner` and the
+  executor assembles the JSON body in Rust
+  ([execute.rs](../crates/pgvis-sqlite/src/execute.rs))
+- no roles / GUCs (`ExecContext` role and claims are ignored; no response GUCs)
 - `ILIKE`/regex/array/range/quantifier rewrites or rejections per the matrix
-- schema-change detection via `PRAGMA schema_version` polling or file-watching
-  rather than `LISTEN/NOTIFY` (`watch_schema()` returns `None`)
+- no push schema reload: `watch_schema()` returns `None`, so a reload comes
+  from `SchemaReloader::reload()` / `reload_now()`
 
 ## Adding a new database (e.g. MySQL/DuckDB) `[Planned]`
 

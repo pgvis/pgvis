@@ -3,7 +3,7 @@ title: Introduction
 description: What is pgvis, what it does, and why it exists.
 ---
 
-# What is pgvis?
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
 
 **pgvis** turns any PostgreSQL or SQLite database into a fully-featured API — a PostgREST-compatible REST endpoint, Model Context Protocol (MCP) tools for AI agents, and an OpenAPI 3.0 document — from a single Rust engine with zero glue code.
 
@@ -55,24 +55,29 @@ Point pgvis at a database. It introspects the schema at startup, reloads it when
 
 ## Architecture at a Glance
 
+```mermaid
+flowchart TB
+    req(["HTTP request · MCP tool call"])
+    subgraph core ["pgvis-core · I/O-free"]
+        direction LR
+        parse["<b>Parse</b><br/>ApiRequest"] --> plan["<b>Plan</b><br/>ActionPlan"] --> render["<b>Render</b><br/>parameterized SQL"]
+    end
+    subgraph edge ["backend + surface"]
+        direction LR
+        exec["<b>Execute</b><br/>Backend::execute"] --> fmt["<b>Format</b><br/>JSON + headers"]
+    end
+    cache[("Schema cache")] -.-> plan
+    req --> parse
+    render --> exec
+    exec <--> db[("Postgres / SQLite")]
+    fmt --> resp(["Response"])
 ```
-HTTP Request / MCP Tool Call
-        │
-        ▼
-   Parse → ApiRequest (query DSL, filters, cursor, preferences)
-        │
-        ▼
-   Plan  → ActionPlan (validate against schema cache, resolve joins)
-        │
-        ▼
-   Render → Parameterized SQL (dialect-aware, CTE-wrapped)
-        │
-        ▼
-   Execute → Backend::execute (Postgres pool / SQLite connection)
-        │
-        ▼
-   Format → JSON response + headers (Content-Range, X-Next-Cursor)
-```
+
+1. **Parse** — the query DSL, filters, cursor and `Prefer` header become an `ApiRequest`.
+2. **Plan** — validated against the schema cache, joins resolved, into an `ActionPlan`.
+3. **Render** — dialect-aware, CTE-wrapped SQL with every value bound as a parameter.
+4. **Execute** — the backend runs it (a pipelined Postgres transaction, or a SQLite connection).
+5. **Format** — JSON body plus `Content-Range`, `X-Next-Cursor` and the other response headers.
 
 Seven crates, all dependencies pointing inward to the I/O-free core:
 
@@ -88,8 +93,11 @@ Seven crates, all dependencies pointing inward to the I/O-free core:
 
 ## Next Steps
 
-- [Quick Start](/quickstart) — get running in 5 minutes
-- [Installation](/installation) — Cargo, Nix, Docker
-- [REST API Guide](/guides/rest-api) — full query DSL reference
-- [MCP Guide](/guides/mcp) — using pgvis with LLM agents
-- [Configuration](/reference/configuration) — all settings and environment variables
+<CardGrid>
+  <LinkCard title="Quick Start" href="/quickstart" description="Get running in 5 minutes" />
+  <LinkCard title="Installation" href="/installation" description="Cargo, Nix, and the CLI reference" />
+  <LinkCard title="REST API Guide" href="/guides/rest-api" description="The full query DSL reference" />
+  <LinkCard title="MCP Guide" href="/guides/mcp" description="Using pgvis with LLM agents" />
+  <LinkCard title="Configuration" href="/reference/configuration" description="All settings and environment variables" />
+  <LinkCard title="Architecture" href="/reference/architecture" description="Crates, pipeline, executor and replicas" />
+</CardGrid>

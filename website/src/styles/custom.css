@@ -43,3 +43,178 @@
 :root[data-theme="dark"] .pgvis-wordmark .vis {
   color: #a78bfa;
 }
+
+/* ── Mermaid diagrams ────────────────────────────────────────────────────
+   astro-mermaid switches between mermaid's default/dark themes; these
+   overrides map both onto the pgvis indigo palette. Mermaid scopes its own
+   rules to the diagram's #id, so the overrides need !important. */
+:root pre.mermaid {
+  display: flex;
+  min-height: 0;
+  justify-content: center;
+  margin-block: 1.5rem;
+  padding: 1.25rem 1rem;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.75rem;
+  background: var(--pgvis-diagram-bg);
+  overflow-x: auto;
+}
+
+:root pre.mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
+
+:root {
+  --pgvis-diagram-bg: #fbfbff;
+  --pgvis-node-fill: #eef2ff;
+  --pgvis-node-stroke: #818cf8;
+  --pgvis-node-text: #1e1b4b;
+  --pgvis-store-fill: #ecfeff;
+  --pgvis-store-stroke: #22d3ee;
+  --pgvis-cluster-fill: #f8fafc;
+  --pgvis-cluster-stroke: #c7d2fe;
+  --pgvis-cluster-text: #4338ca;
+  --pgvis-edge: #6366f1;
+  --pgvis-edge-label-bg: #ffffff;
+  --pgvis-note-fill: #fefce8;
+  --pgvis-note-stroke: #facc15;
+}
+
+:root[data-theme="dark"] {
+  --pgvis-diagram-bg: #14142b;
+  --pgvis-node-fill: #1e1b4b;
+  --pgvis-node-stroke: #6366f1;
+  --pgvis-node-text: #e2e8f0;
+  --pgvis-store-fill: #0c2a33;
+  --pgvis-store-stroke: #22d3ee;
+  --pgvis-cluster-fill: rgba(99, 102, 241, 0.07);
+  --pgvis-cluster-stroke: #2d2d5a;
+  --pgvis-cluster-text: #a5b4fc;
+  --pgvis-edge: #818cf8;
+  --pgvis-edge-label-bg: #14142b;
+  --pgvis-note-fill: #2a2410;
+  --pgvis-note-stroke: #a16207;
+}
+
+/* Flowchart nodes */
+pre.mermaid .node rect,
+pre.mermaid .node polygon,
+pre.mermaid .node circle,
+pre.mermaid .node ellipse {
+  fill: var(--pgvis-node-fill) !important;
+  stroke: var(--pgvis-node-stroke) !important;
+  stroke-width: 1.25px !important;
+}
+
+/* Cylinders (databases, caches) */
+pre.mermaid .node path {
+  fill: var(--pgvis-store-fill) !important;
+  stroke: var(--pgvis-store-stroke) !important;
+}
+
+pre.mermaid .nodeLabel,
+pre.mermaid .node .label,
+pre.mermaid .node text {
+  color: var(--pgvis-node-text) !important;
+  fill: var(--pgvis-node-text) !important;
+}
+
+/* Subgraphs */
+pre.mermaid .cluster rect {
+  fill: var(--pgvis-cluster-fill) !important;
+  stroke: var(--pgvis-cluster-stroke) !important;
+  stroke-dasharray: 4 3;
+  rx: 10px;
+}
+
+pre.mermaid .cluster-label .nodeLabel,
+pre.mermaid .cluster text {
+  color: var(--pgvis-cluster-text) !important;
+  fill: var(--pgvis-cluster-text) !important;
+}
+
+/* Edges */
+pre.mermaid .flowchart-link,
+pre.mermaid .edgePath .path {
+  stroke: var(--pgvis-edge) !important;
+}
+
+pre.mermaid .marker,
+pre.mermaid marker path {
+  fill: var(--pgvis-edge) !important;
+  stroke: var(--pgvis-edge) !important;
+}
+
+pre.mermaid .edgeLabel,
+pre.mermaid .edgeLabel p,
+pre.mermaid .edgeLabel rect {
+  background-color: var(--pgvis-edge-label-bg) !important;
+  fill: var(--pgvis-edge-label-bg) !important;
+  color: var(--pgvis-node-text) !important;
+}
+
+/* Sequence diagrams */
+pre.mermaid .actor {
+  fill: var(--pgvis-node-fill) !important;
+  stroke: var(--pgvis-node-stroke) !important;
+}
+
+pre.mermaid text.actor > tspan,
+pre.mermaid .messageText,
+pre.mermaid .loopText > tspan,
+pre.mermaid .labelText > tspan {
+  fill: var(--pgvis-node-text) !important;
+}
+
+pre.mermaid .messageLine0,
+pre.mermaid .messageLine1,
+pre.mermaid .actor-line {
+  stroke: var(--pgvis-edge) !important;
+}
+
+pre.mermaid #arrowhead path,
+pre.mermaid .arrowheadPath {
+  fill: var(--pgvis-edge) !important;
+  stroke: var(--pgvis-edge) !important;
+}
+
+pre.mermaid .note {
+  fill: var(--pgvis-note-fill) !important;
+  stroke: var(--pgvis-note-stroke) !important;
+}
+
+pre.mermaid .noteText > tspan {
+  fill: var(--pgvis-node-text) !important;
+}
+
+pre.mermaid .loopLine,
+pre.mermaid .labelBox {
+  stroke: var(--pgvis-cluster-stroke) !important;
+  fill: var(--pgvis-cluster-fill) !important;
+}
+
+pre.mermaid .activation0,
+pre.mermaid .activation1,
+pre.mermaid .activation2 {
+  fill: var(--pgvis-cluster-fill) !important;
+  stroke: var(--pgvis-node-stroke) !important;
+}
+
+/* Phones: wide diagrams would scale to ~35% and become unreadable; keep a
+   legible minimum and let the frame scroll sideways instead. */
+@media (max-width: 50rem) {
+  :root pre.mermaid {
+    justify-content: flex-start;
+  }
+
+  :root pre.mermaid svg {
+    min-width: 480px;
+  }
+}
+
+/* Identifiers in tables (env vars, routes, config keys) must not break
+   mid-token; Starlight tables scroll horizontally instead. */
+.sl-markdown-content td code {
+  white-space: nowrap;
+}
