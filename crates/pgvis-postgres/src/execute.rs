@@ -88,108 +88,109 @@ impl ToSql for TextParam<'_> {
 
 /// Execute a CTE-wrapped SQL statement within a transaction.
 ///
-/// This is the full execution pipeline:
-/// 1. BEGIN transaction
-/// 2. SET LOCAL role (if provided)
-/// 3. SET LOCAL claims GUCs (if provided)
-/// 4. SET LOCAL statement_timeout (if provided)
-/// 5. Call pre-request function (if configured)
-/// 6. Execute the main SQL with parameters
-/// 7. Extract result from the CTE row
-/// 8. COMMIT or ROLLBACK based on preference
-pub async fn execute_query(
-    client: &mut Client,
-    ctx: &ExecContext,
-    sql: &str,
-    params: &[Value],
-) -> Result<QueryResult, Error> {
-    // Open a RAII transaction. If this future is dropped (e.g. client
-    // cancellation) before we explicitly commit/rollback, `Transaction`'s Drop
-    // impl issues a ROLLBACK, so the pooled connection never returns to the pool
-    // with an open transaction or a lingering SET LOCAL role.
-    //
-    // READ COMMITTED is the default isolation level in Postgres; the previous
-    // explicit `BEGIN ISOLATION LEVEL READ COMMITTED` was a no-op relative to
-    // the default, so `transaction()` preserves the same semantics.
-    let tx = client
-        .transaction()
-        .await
-        .map_err(|e| execution_error("BEGIN failed", &e))?;
-
-    // Run the inner execution; on error the transaction is rolled back on drop.
-    let result = execute_inner(&tx, ctx, sql, params).await;
-
-    // Determine transaction end. On error, or when the caller requested
-    // `Prefer: tx=rollback`, roll back explicitly; otherwise commit.
-    let should_rollback = match &result {
-        Err(_) => true,
-        Ok(_) => matches!(ctx.tx_end, Some(TxEnd::Rollback)),
-    };
-
-    if should_rollback {
-        if let Err(tx_err) = tx.rollback().await {
-            tracing::error!(error = %tx_err, command = "ROLLBACK", "transaction end failed");
-            // Original result already carries the real error (or the caller
-            // asked for rollback) — preserve it.
-        }
-    } else if let Err(tx_err) = tx.commit().await {
-        tracing::error!(error = %tx_err, command = "COMMIT", "transaction end failed");
-        return Err(execution_error("COMMIT failed", &tx_err));
-    }
-
-    result
-}
-
-/// Inner execution logic (within the transaction).
+/// BEGIN, the session setup (role, claims, statement_timeout), the optional
+/// pre-request call and the main query go out as one pipelined flight — a
+/// single round trip — followed by COMMIT or ROLLBACK. Statements are unnamed
+/// (`query_typed`): no per-request PREPARE round trip, and safe behind
+/// transaction-mode poolers. The result is decoded after the transaction ends.
 ///
-/// Applies all session setup via parameterized `set_config` statements, then
-/// executes the main query with a prepared statement.
-async fn execute_inner(
-    tx: &tokio_postgres::Transaction<'_>,
+/// There is no RAII transaction here: if this future is dropped mid-way, the
+/// connection may still be inside the transaction. Callers must not return
+/// such a connection to the pool — see [`crate::Checkout`].
+pub async fn execute_query(
+    client: &Client,
     ctx: &ExecContext,
     sql: &str,
     params: &[Value],
 ) -> Result<QueryResult, Error> {
-    apply_session_setup(tx, ctx).await?;
-
-    // Execute the main query with parameters.
-    // Using prepare() enables per-connection statement caching in tokio-postgres,
-    // avoiding repeated parse cycles for identical SQL on the same connection.
-    let text_params: Vec<TextParam> = params.iter().map(TextParam).collect();
-    let param_refs: Vec<&(dyn ToSql + Sync)> = text_params
+    let settings = collect_guc_settings(ctx);
+    let setup_sql = set_config_sql(settings.len());
+    let setup_params: Vec<(&(dyn ToSql + Sync), Type)> = settings
         .iter()
-        .map(|p| p as &(dyn ToSql + Sync))
+        .flat_map(|(name, value)| [name, value])
+        .map(|s| (s as &(dyn ToSql + Sync), Type::TEXT))
+        .collect();
+    let pre_request_sql = ctx.pre_request.as_deref().map(pre_request_sql);
+
+    let text_params: Vec<TextParam> = params.iter().map(TextParam).collect();
+    let main_params: Vec<(&(dyn ToSql + Sync), Type)> = text_params
+        .iter()
+        .map(|p| (p as &(dyn ToSql + Sync), Type::UNKNOWN))
         .collect();
 
-    let stmt = tx
-        .prepare(sql)
-        .await
-        .map_err(|e| execution_error("prepare failed", &e))?;
-    let rows = tx
-        .query(&stmt, &param_refs)
-        .await
-        .map_err(|e| execution_error("query execution failed", &e))?;
+    // `join!` polls the futures in order; each sends its request on its first
+    // poll, so all four go out in one flight, in this order. After a failure
+    // the server rejects the rest of the transaction, so the first error is
+    // the real one.
+    let (begin, setup, pre_request, main) = futures::join!(
+        client.batch_execute("BEGIN"),
+        async {
+            match &setup_sql {
+                Some(sql) => client.query_typed(sql, &setup_params).await.map(drop),
+                None => Ok(()),
+            }
+        },
+        async {
+            match &pre_request_sql {
+                Some(sql) => client.batch_execute(sql).await,
+                None => Ok(()),
+            }
+        },
+        client.query_typed(sql, &main_params),
+    );
+    let result = begin
+        .map_err(|e| execution_error("BEGIN failed", &e))
+        .and(setup.map_err(|e| execution_error("session setup failed", &e)))
+        .and(pre_request.map_err(|e| execution_error("pre-request function failed", &e)))
+        .and(main.map_err(|e| execution_error("query execution failed", &e)));
 
-    // Extract result from the CTE row
-    extract_cte_result(&rows)
+    // On error, or when the caller asked for `Prefer: tx=rollback`, roll back.
+    let rollback = result.is_err() || matches!(ctx.tx_end, Some(TxEnd::Rollback));
+    if rollback {
+        if let Err(e) = client.batch_execute("ROLLBACK").await {
+            // The result already carries the real error (or the caller asked
+            // for rollback); the connection is discarded if it's broken.
+            tracing::error!(error = %e, command = "ROLLBACK", "transaction end failed");
+        }
+    } else if let Err(e) = client.batch_execute("COMMIT").await {
+        tracing::error!(error = %e, command = "COMMIT", "transaction end failed");
+        return Err(execution_error("COMMIT failed", &e));
+    }
+
+    // Decode only now, with the transaction (and its locks) already released.
+    extract_cte_result(&result?)
 }
 
-/// Apply all session setup (role, JWT claims, statement_timeout, pre-request)
-/// to the open transaction.
+/// `SELECT set_config($1, $2, true), set_config($3, $4, true), …` for `n`
+/// settings: one statement instead of one round trip per GUC.
+fn set_config_sql(n: usize) -> Option<String> {
+    if n == 0 {
+        return None;
+    }
+    let calls: Vec<String> = (0..n)
+        .map(|i| format!("set_config(${}, ${}, true)", 2 * i + 1, 2 * i + 2))
+        .collect();
+    Some(format!("SELECT {}", calls.join(", ")))
+}
+
+/// `SELECT "schema"."fn"()` for the configured pre-request function. Each
+/// part is quoted so a config value can't inject SQL.
+fn pre_request_sql(name: &str) -> String {
+    let quoted = name
+        .split('.')
+        .map(quote_ident)
+        .collect::<Vec<_>>()
+        .join(".");
+    format!("SELECT {quoted}()")
+}
+
+/// The ordered `(guc_name, value)` pairs applied via `set_config(…, true)`
+/// (local to the transaction, like `SET LOCAL`).
 ///
-/// GUC values are applied via `set_config($1, $2, true)` (the `true` third
-/// argument makes the setting local to the transaction, equivalent to
-/// `SET LOCAL`). Using bound parameters avoids SQL-injection surface and, for
-/// the bulk `request.jwt.claims` JSON, sidesteps GUC-name restrictions such as
-/// hyphenated or leading-digit claim keys.
-/// Collect the ordered list of `(guc_name, value)` pairs to apply via
-/// `set_config($1, $2, true)`.
-///
-/// - `role` is set first so subsequent settings run under the target role.
-/// - The bulk `request.jwt.claims` JSON is always included; individual
-///   `request.jwt.claim.<key>` GUCs are included only for keys that form valid
-///   GUC names and have no null bytes.
-/// - `statement_timeout` is included last.
+/// - `role` first, so the later settings run under the target role.
+/// - `request.jwt.claims`: every claim as one JSON value, as current PostgREST
+///   does. (Per-claim `request.jwt.claim.<key>` GUCs are no longer set.)
+/// - `statement_timeout` last.
 fn collect_guc_settings(ctx: &ExecContext) -> Vec<(String, String)> {
     let mut settings: Vec<(String, String)> = Vec::new();
 
@@ -198,87 +199,15 @@ fn collect_guc_settings(ctx: &ExecContext) -> Vec<(String, String)> {
         settings.push(("role".to_string(), role.clone()));
     }
 
-    // claims — always set the bulk JSON GUC, plus individual claim GUCs for keys
-    // that form valid GUC names.
     if let Some(claims) = &ctx.claims {
         settings.push(("request.jwt.claims".to_string(), claims.to_string()));
-
-        if let Value::Object(map) = claims {
-            for (key, val) in map {
-                // Only set an individual GUC when the key is a valid GUC name.
-                // The bulk request.jwt.claims JSON always carries every claim.
-                if !is_safe_guc_key(key) {
-                    tracing::debug!(key = %key, "skipping JWT claim with unsafe GUC key");
-                    continue;
-                }
-                let val_str = match val {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                if val_str.contains('\0') {
-                    tracing::debug!(key = %key, "skipping JWT claim with null byte in value");
-                    continue;
-                }
-                settings.push((format!("request.jwt.claim.{key}"), val_str));
-            }
-        }
     }
 
-    // statement_timeout
     if let Some(timeout_ms) = ctx.statement_timeout {
         settings.push(("statement_timeout".to_string(), format!("{timeout_ms}ms")));
     }
 
     settings
-}
-
-async fn apply_session_setup(
-    tx: &tokio_postgres::Transaction<'_>,
-    ctx: &ExecContext,
-) -> Result<(), Error> {
-    for (name, value) in collect_guc_settings(ctx) {
-        tx.execute("SELECT set_config($1, $2, true)", &[&name, &value])
-            .await
-            .map_err(|e| execution_error("session setup failed", &e))?;
-    }
-
-    // Pre-request function call.
-    // pre_request is a qualified function name like "auth.check_request".
-    // Quote each identifier part to prevent SQL injection via config values.
-    if let Some(pre_req) = &ctx.pre_request {
-        let quoted = pre_req
-            .split('.')
-            .map(|part| quote_ident(part))
-            .collect::<Vec<_>>()
-            .join(".");
-        let stmt = format!("SELECT {quoted}()");
-        tx.batch_execute(&stmt)
-            .await
-            .map_err(|e| execution_error("pre-request function failed", &e))?;
-    }
-
-    Ok(())
-}
-
-/// Check if a JWT claim key is safe to use as a GUC name component.
-///
-/// Postgres GUC names are dot-separated identifiers. Each dot-separated part
-/// must be a valid identifier (`[A-Za-z_][A-Za-z0-9_]*`) — hyphens and
-/// leading digits are rejected by the server. Keys that fail this check are
-/// still carried in the bulk `request.jwt.claims` JSON; only the per-claim GUC
-/// is skipped.
-fn is_safe_guc_key(key: &str) -> bool {
-    if key.is_empty() || key.len() > 128 {
-        return false;
-    }
-    key.split('.').all(|part| {
-        let mut chars = part.chars();
-        match chars.next() {
-            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-            _ => return false,
-        }
-        chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -520,32 +449,16 @@ mod tests {
     }
 
     #[test]
-    fn collect_guc_settings_with_claims() {
+    fn collect_guc_settings_sets_claims_as_one_json_value() {
         let ctx = ExecContext {
-            claims: Some(json!({"sub": "user123", "role": "admin"})),
+            claims: Some(json!({"sub": "user123", "my-claim": "x"})),
             ..Default::default()
         };
         let settings = collect_guc_settings(&ctx);
-        assert!(guc(&settings, "request.jwt.claims").is_some());
-        assert_eq!(guc(&settings, "request.jwt.claim.sub"), Some("user123"));
-        assert_eq!(guc(&settings, "request.jwt.claim.role"), Some("admin"));
-    }
-
-    #[test]
-    fn collect_guc_settings_skips_null_byte_in_individual_claims() {
-        // Null bytes in claim values cause individual GUC settings to be skipped
-        // (the bulk JSON is still safe because it is a bound parameter).
-        let mut map = serde_json::Map::new();
-        map.insert("safe".to_string(), Value::String("good".to_string()));
-        map.insert("bad".to_string(), Value::String("user\x00evil".to_string()));
-        let ctx = ExecContext {
-            claims: Some(Value::Object(map)),
-            ..Default::default()
-        };
-        let settings = collect_guc_settings(&ctx);
-        assert!(guc(&settings, "request.jwt.claims").is_some());
-        assert!(guc(&settings, "request.jwt.claim.safe").is_some());
-        assert!(guc(&settings, "request.jwt.claim.bad").is_none());
+        let claims: Value = serde_json::from_str(guc(&settings, "request.jwt.claims").unwrap()).unwrap();
+        assert_eq!(claims["sub"], "user123");
+        // No per-claim `request.jwt.claim.<key>` GUCs any more.
+        assert!(settings.iter().all(|(k, _)| !k.starts_with("request.jwt.claim.")));
     }
 
     #[test]
@@ -572,52 +485,22 @@ mod tests {
         // role must come first so subsequent settings run under the target role.
         assert_eq!(settings[0].0, "role");
         assert!(guc(&settings, "request.jwt.claims").is_some());
-        assert_eq!(guc(&settings, "request.jwt.claim.sub"), Some("abc"));
         assert_eq!(guc(&settings, "statement_timeout"), Some("30000ms"));
     }
 
-    // -----------------------------------------------------------------------
-    // GUC key safety tests
-    // -----------------------------------------------------------------------
-
     #[test]
-    fn is_safe_guc_key_normal() {
-        assert!(is_safe_guc_key("sub"));
-        assert!(is_safe_guc_key("user_id"));
-        assert!(is_safe_guc_key("org.name"));
-        assert!(is_safe_guc_key("_leading_underscore"));
+    fn set_config_sql_batches_every_setting_into_one_statement() {
+        assert_eq!(set_config_sql(0), None);
+        assert_eq!(
+            set_config_sql(2).unwrap(),
+            "SELECT set_config($1, $2, true), set_config($3, $4, true)"
+        );
     }
 
     #[test]
-    fn is_safe_guc_key_unsafe() {
-        assert!(!is_safe_guc_key("")); // empty
-        assert!(!is_safe_guc_key("foo bar")); // space
-        assert!(!is_safe_guc_key("foo'bar")); // quote
-        assert!(!is_safe_guc_key("foo;bar")); // semicolon
-        assert!(!is_safe_guc_key("my-claim")); // hyphen (invalid GUC name)
-        assert!(!is_safe_guc_key("1abc")); // leading digit
-        assert!(!is_safe_guc_key("org.1abc")); // leading digit in a part
-        assert!(!is_safe_guc_key(".foo")); // empty first part
-        assert!(!is_safe_guc_key(&"a".repeat(200))); // too long
-    }
-
-    #[test]
-    fn collect_guc_settings_skips_unsafe_claim_keys() {
-        let ctx = ExecContext {
-            claims: Some(json!({
-                "safe_key": "value1",
-                "unsafe key": "value2",
-                "also;bad": "value3"
-            })),
-            ..Default::default()
-        };
-        let settings = collect_guc_settings(&ctx);
-        // The safe key should have its individual GUC set.
-        assert!(guc(&settings, "request.jwt.claim.safe_key").is_some());
-        // Unsafe keys should NOT get individual GUC settings (they still appear
-        // in the bulk request.jwt.claims JSON — that's fine).
-        assert!(guc(&settings, "request.jwt.claim.unsafe key").is_none());
-        assert!(guc(&settings, "request.jwt.claim.also;bad").is_none());
+    fn pre_request_sql_quotes_each_part() {
+        assert_eq!(pre_request_sql("auth.check"), "SELECT \"auth\".\"check\"()");
+        assert_eq!(pre_request_sql("a\"b"), "SELECT \"a\"\"b\"()");
     }
 
     // -----------------------------------------------------------------------

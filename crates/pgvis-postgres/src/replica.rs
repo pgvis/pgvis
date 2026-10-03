@@ -32,7 +32,7 @@ use pgvis_core::dialect::{self, Dialect};
 use pgvis_core::error::Error;
 use serde_json::Value;
 
-use crate::execute;
+use crate::Checkout;
 use crate::introspect;
 
 // ---------------------------------------------------------------------------
@@ -89,16 +89,6 @@ fn all_eligible_bits(count: u32) -> u64 {
         u64::MAX
     } else {
         (1u64 << count) - 1
-    }
-}
-
-/// Convert a pool checkout error into an execution [`Error`].
-fn pool_exec_error(e: deadpool_postgres::PoolError) -> Error {
-    Error::Execution {
-        message: format!("pool error: {e}"),
-        db_code: None,
-        detail: None,
-        hint: None,
     }
 }
 
@@ -252,8 +242,10 @@ impl Backend for PgReplicaBackend {
         Box::pin(async move {
             // Mutations always go to the primary.
             if ctx.is_mutation {
-                let mut client = self.primary.get().await.map_err(pool_exec_error)?;
-                return execute::execute_query(&mut client, &ctx, &sql, &params).await;
+                return Checkout::get(&self.primary)
+                    .await?
+                    .execute(&ctx, &sql, &params)
+                    .await;
             }
 
             // Reads: try an eligible reader, then retry once with the next
@@ -262,9 +254,9 @@ impl Backend for PgReplicaBackend {
                 let Some(idx) = self.pick_read_pool() else {
                     break;
                 };
-                match self.readers[idx].get().await {
-                    Ok(mut client) => {
-                        return execute::execute_query(&mut client, &ctx, &sql, &params).await;
+                match Checkout::get(&self.readers[idx]).await {
+                    Ok(checkout) => {
+                        return checkout.execute(&ctx, &sql, &params).await;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -277,8 +269,10 @@ impl Backend for PgReplicaBackend {
             }
 
             // Fall back to the primary.
-            let mut client = self.primary.get().await.map_err(pool_exec_error)?;
-            execute::execute_query(&mut client, &ctx, &sql, &params).await
+            Checkout::get(&self.primary)
+                .await?
+                .execute(&ctx, &sql, &params)
+                .await
         })
     }
 

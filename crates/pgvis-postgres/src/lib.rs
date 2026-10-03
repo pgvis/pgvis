@@ -112,14 +112,10 @@ impl Backend for PgBackend {
         let params = params.to_vec();
         let ctx = ctx.clone();
         Box::pin(async move {
-            let mut client = self.pool.get().await.map_err(|e| Error::Execution {
-                message: format!("pool error: {e}"),
-                db_code: None,
-                detail: None,
-                hint: None,
-            })?;
-
-            execute::execute_query(&mut client, &ctx, &sql, &params).await
+            Checkout::get(&self.pool)
+                .await?
+                .execute(&ctx, &sql, &params)
+                .await
         })
     }
 
@@ -133,6 +129,54 @@ impl Backend for PgBackend {
     fn dialect(&self) -> &'static Dialect {
         &dialect::POSTGRES
     }
+}
+
+// ---------------------------------------------------------------------------
+// Checkout — one pooled connection for one request
+// ---------------------------------------------------------------------------
+
+/// A pooled connection checked out to run one request.
+///
+/// The executor pipelines BEGIN … COMMIT without an RAII transaction, so a
+/// request dropped mid-flight (client disconnect, timeout) can leave the
+/// connection inside the transaction, with the caller's role still set. Such
+/// a connection is detached from the pool and closed — the server then rolls
+/// the transaction back — instead of being handed to the next request.
+pub(crate) struct Checkout(Option<deadpool_postgres::Object>);
+
+impl Checkout {
+    pub(crate) async fn get(pool: &Pool) -> Result<Self, Error> {
+        pool.get().await.map(|c| Self(Some(c))).map_err(pool_error)
+    }
+
+    /// Run one request; the connection goes back to the pool only once its
+    /// transaction has ended.
+    pub(crate) async fn execute(
+        mut self,
+        ctx: &ExecContext,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult, Error> {
+        let client = self.0.as_ref().expect("checked out");
+        let result = execute::execute_query(client, ctx, sql, params).await;
+        drop(self.0.take());
+        result
+    }
+}
+
+impl Drop for Checkout {
+    fn drop(&mut self) {
+        if let Some(conn) = self.0.take() {
+            drop(deadpool_postgres::Object::take(conn));
+        }
+    }
+}
+
+/// A failed checkout: the pool is exhausted (wait timeout) or the database is
+/// unreachable. Reported as 503 `PGRST000`, the same as PostgREST, rather than
+/// a 500 — callers can retry.
+pub(crate) fn pool_error(e: deadpool_postgres::PoolError) -> Error {
+    Error::Introspection(format!("database connection unavailable: {e}"))
 }
 
 // ---------------------------------------------------------------------------
