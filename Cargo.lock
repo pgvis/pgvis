@@ -1646,6 +1646,7 @@ dependencies = [
  "axum",
  "clap",
  "figment",
+ "jsonwebtoken",
  "pgvis-core",
  "pgvis-lib",
  "reqwest",

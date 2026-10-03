@@ -38,8 +38,11 @@ use pgvis_core::backend::Backend;
 use pgvis_core::pubsub::PubSubBackend;
 use pgvis_core::{Config, Dialect, SchemaCache};
 
-use crate::tools::{build_mcp_resources, build_mcp_tools, handle_tool_call};
-use crate::types::McpToolCall;
+use crate::tools::{
+    anonymous_exec_context, build_mcp_resources, build_mcp_tools, handle_tool_call,
+    require_anonymous_access,
+};
+use crate::types::{McpToolCall, McpToolResult};
 
 // ---------------------------------------------------------------------------
 // McpServer
@@ -207,20 +210,7 @@ impl ServerHandler for McpServer {
             let result =
                 handle_tool_call(&call, &cache, &self.dialect, &self.config, &*self.backend).await;
 
-            // Convert our McpToolResult to rmcp's CallToolResult
-            let content: Vec<Content> = result
-                .content
-                .into_iter()
-                .map(|c| match c {
-                    crate::types::McpContent::Text { text } => Content::text(text),
-                })
-                .collect();
-
-            if result.is_error {
-                Ok(CallToolResult::error(content))
-            } else {
-                Ok(CallToolResult::success(content))
-            }
+            Ok(into_call_tool_result(result))
         }
     }
 
@@ -378,6 +368,11 @@ impl McpServer {
             )]));
         }
 
+        // Same anonymous-access guard as every other tool.
+        if let Err(denied) = require_anonymous_access(&self.config) {
+            return Ok(into_call_tool_result(denied));
+        }
+
         match tool_name {
             "pubsub_publish" => {
                 let args = arguments.as_ref();
@@ -396,15 +391,18 @@ impl McpServer {
                     )]));
                 }
 
-                // Validate channel and payload
-                if let Err(e) = self.config.pubsub.validate_channel(channel) {
-                    return Ok(CallToolResult::error(vec![Content::text(e.to_string())]));
-                }
-                if let Err(e) = self.config.pubsub.validate_payload(payload) {
-                    return Ok(CallToolResult::error(vec![Content::text(e.to_string())]));
-                }
-
-                match pubsub.publish(channel, payload).await {
+                // Validates, runs the authorize function, and NOTIFYs as the
+                // MCP caller's role — the same path as REST publish.
+                let ctx = anonymous_exec_context(&self.config, true);
+                match pgvis_core::pubsub::publish(
+                    &*self.backend,
+                    &ctx,
+                    &self.config.pubsub,
+                    channel,
+                    payload,
+                )
+                .await
+                {
                     Ok(()) => Ok(CallToolResult::success(vec![Content::text(
                         serde_json::json!({
                             "ok": true,
@@ -430,5 +428,22 @@ impl McpServer {
                 "Unknown pub/sub tool: {tool_name}"
             ))])),
         }
+    }
+}
+
+/// Convert our [`McpToolResult`] to rmcp's [`CallToolResult`].
+fn into_call_tool_result(result: McpToolResult) -> CallToolResult {
+    let content: Vec<Content> = result
+        .content
+        .into_iter()
+        .map(|c| match c {
+            crate::types::McpContent::Text { text } => Content::text(text),
+        })
+        .collect();
+
+    if result.is_error {
+        CallToolResult::error(content)
+    } else {
+        CallToolResult::success(content)
     }
 }

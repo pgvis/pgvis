@@ -320,6 +320,9 @@ async fn main() -> anyhow::Result<()> {
 | `max_payload_bytes` | usize | `7500` | Maximum payload size (Postgres limit is ~8000) |
 | `channel_buffer_size` | usize | `64` | In-process broadcast buffer per channel |
 | `allowed_channels` | string[] | `[]` | Channel allowlist (empty = allow all). Supports glob patterns: `chat.*`, `events.*` |
+| `authorize_function` | string | none | SQL function `fn(channel text, op text) returns boolean` that authorizes each subscribe/publish as the caller's role |
+| `max_subscribers` | usize | `1000` | Maximum concurrent SSE subscribers on this instance |
+| `max_subscribers_per_identity` | usize | `100` | Maximum concurrent SSE subscribers per JWT role + `sub` (`0` = no limit) |
 
 ### Environment Variables
 
@@ -416,6 +419,26 @@ allowed_channels = ["chat.*", "notifications", "events.*"]
 ```
 
 Only channels matching these patterns will be accepted. Attempts to subscribe or publish to other channels return `403 Forbidden`.
+
+### Per-Channel Authorization (Security)
+
+The allowlist applies to every caller alike. To decide per caller, let the database decide, as it does for tables:
+
+```toml
+[pubsub]
+authorize_function = "auth.pubsub_authorize"
+```
+
+```sql
+CREATE FUNCTION auth.pubsub_authorize(channel text, op text) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+  SELECT channel = 'user.' || (nullif(current_setting('request.jwt.claims', true), '')::json->>'sub')
+$$;
+```
+
+pgvis calls it with `op` = `'subscribe'` or `'publish'` in a transaction running as the caller's role with their JWT claims set, exactly like a data API request. Anything but `true` (false, NULL, or an error) returns `403 Forbidden`. Publishing always runs `pg_notify` as the caller's role, in the same statement as the check. Subscriptions are authorized once, when the stream opens.
+
+Without `authorize_function`, any caller that passes JWT verification may subscribe to or publish on every allowed channel.
 
 ### Cross-Instance Coordination
 

@@ -406,6 +406,8 @@ PGVIS_MAX_ROWS=500 pgvis --config pgvis.toml serve
 | `pubsub.max_payload_bytes` | integer | `7500` | Maximum message payload size |
 | `pubsub.buffer_capacity` | integer | `256` | In-process broadcast buffer per channel |
 | `pubsub.allowed_channels` | string[] | `[]` | Channel allowlist (empty = allow all). Supports globs: `chat.*` |
+| `pubsub.authorize_function` | string | none | SQL function `fn(channel text, op text)` deciding subscribe/publish as the caller's role; unset = allowlist only |
+| `pubsub.max_subscribers_per_identity` | integer | `100` | Concurrent SSE subscribers per JWT role + `sub` (`0` = no limit) |
 
 TOML example:
 

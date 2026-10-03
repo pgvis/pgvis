@@ -236,3 +236,57 @@ CREATE FUNCTION test.sum_variadic(label text, VARIADIC nums integer[])
 RETURNS text
 LANGUAGE sql STABLE
 AS $$ SELECT label || (SELECT sum(n) FROM unnest(nums) AS n) $$;
+
+-- ============================================================================
+-- Pub/sub authorization (tests/pubsub.rs)
+-- ============================================================================
+-- Kept out of the exposed `test` schema so it is not an RPC endpoint.
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgvis_test_anon') THEN
+        CREATE ROLE pgvis_test_anon NOLOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgvis_test_user') THEN
+        CREATE ROLE pgvis_test_user NOLOGIN;
+    END IF;
+END
+$$;
+
+DROP SCHEMA IF EXISTS test_pubsub CASCADE;
+CREATE SCHEMA test_pubsub;
+GRANT USAGE ON SCHEMA test_pubsub TO pgvis_test_anon, pgvis_test_user;
+
+-- Every authorization check, recorded as the role and `sub` it ran under.
+CREATE TABLE test_pubsub.audit (
+    channel text NOT NULL,
+    op text NOT NULL,
+    role name NOT NULL DEFAULT current_user,
+    sub text DEFAULT nullif(current_setting('request.jwt.claims', true), '')::json->>'sub'
+);
+GRANT INSERT ON test_pubsub.audit TO pgvis_test_anon, pgvis_test_user;
+
+-- public.*         anyone may subscribe; only pgvis_test_user may publish
+-- private.<sub>.*  only the caller whose JWT `sub` is <sub>
+-- raise.*          raises (an error denies)
+-- anything else    NULL (denied)
+CREATE FUNCTION test_pubsub.authorize(channel text, op text)
+RETURNS boolean
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    sub text := nullif(current_setting('request.jwt.claims', true), '')::json->>'sub';
+BEGIN
+    INSERT INTO test_pubsub.audit (channel, op) VALUES (channel, op);
+    IF channel LIKE 'raise.%' THEN
+        RAISE EXCEPTION 'pubsub authorize: forbidden';
+    ELSIF channel LIKE 'public.%' THEN
+        RETURN op = 'subscribe' OR current_user = 'pgvis_test_user';
+    ELSIF channel LIKE 'private.%' THEN
+        RETURN split_part(channel, '.', 2) = sub;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+REVOKE EXECUTE ON FUNCTION test_pubsub.authorize(text, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION test_pubsub.authorize(text, text) TO pgvis_test_anon, pgvis_test_user;

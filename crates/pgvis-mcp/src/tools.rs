@@ -432,42 +432,13 @@ pub async fn handle_tool_call(
         Err(err) => return McpToolResult::from_core_error(&err),
     };
 
-    // 6. Resolve the execution role and refuse anonymous access when the
-    //    deployment requires auth.
-    //
-    // The MCP surface currently has no token-passing / CallerIdentity
-    // mechanism (see the fn-level "Auth model" doc), so every call is
-    // anonymous. If a `jwt_secret` is configured the operator has opted into
-    // auth; when there is ALSO no `anon_role`, REST rejects anonymous requests
-    // (PGRST300/302) rather than running as the pool's connection role. MCP
-    // must do the same — otherwise it would execute as the DSN role (often the
-    // table owner, bypassing RLS), a privilege escalation. Mirror REST and
-    // refuse with the anonymous-access-disabled code (PGRST302).
-    if config.jwt_secret.is_some() && config.anon_role.is_none() {
-        return McpToolResult::error_structured(
-            pgvis_core::error::ErrorCode::JwtMissing.as_str(),
-            "Anonymous access is disabled: this server requires authentication \
-             (jwt_secret is set) and no anon_role is configured.",
-            None,
-            Some(
-                "Configure an anon_role to allow unauthenticated MCP tool calls, \
-                 or place an auth proxy in front of the MCP endpoint."
-                    .to_string(),
-            ),
-        );
+    // 6. Refuse anonymous access when the deployment requires auth.
+    if let Err(denied) = require_anonymous_access(config) {
+        return denied;
     }
 
-    // 7. Build ExecContext. Role is the configured anon_role (may be None when
-    // no jwt_secret is set — the guard above ensures we never fall through to
-    // the connection role while auth is required).
-    let exec_ctx = ExecContext {
-        role: config.anon_role.clone(),
-        claims: None,
-        pre_request: config.pre_request.clone(),
-        statement_timeout: config.statement_timeout_ms,
-        tx_end: None,
-        is_mutation,
-    };
+    // 7. Build ExecContext.
+    let exec_ctx = anonymous_exec_context(config, is_mutation);
 
     // 8. Execute via backend, bounded by a per-call deadline.
     //
@@ -525,6 +496,48 @@ pub async fn handle_tool_call(
             }
         }
         Err(err) => McpToolResult::from_core_error(&err),
+    }
+}
+
+/// Refuse an MCP call when the deployment requires auth.
+///
+/// The MCP surface currently has no token-passing / CallerIdentity
+/// mechanism (see [`handle_tool_call`]'s "Auth model" doc), so every call is
+/// anonymous. If a `jwt_secret` is configured the operator has opted into
+/// auth; when there is ALSO no `anon_role`, REST rejects anonymous requests
+/// (PGRST300/302) rather than running as the pool's connection role. MCP
+/// must do the same — otherwise it would execute as the DSN role (often the
+/// table owner, bypassing RLS), a privilege escalation. Mirror REST and
+/// refuse with the anonymous-access-disabled code (PGRST302).
+pub(crate) fn require_anonymous_access(config: &Config) -> Result<(), McpToolResult> {
+    if config.jwt_secret.is_some() && config.anon_role.is_none() {
+        return Err(McpToolResult::error_structured(
+            pgvis_core::error::ErrorCode::JwtMissing.as_str(),
+            "Anonymous access is disabled: this server requires authentication \
+             (jwt_secret is set) and no anon_role is configured.",
+            None,
+            Some(
+                "Configure an anon_role to allow unauthenticated MCP tool calls, \
+                 or place an auth proxy in front of the MCP endpoint."
+                    .to_string(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The [`ExecContext`] every MCP call runs under. Role is the configured
+/// anon_role (may be None when no jwt_secret is set —
+/// [`require_anonymous_access`] ensures we never fall through to the
+/// connection role while auth is required).
+pub(crate) fn anonymous_exec_context(config: &Config, is_mutation: bool) -> ExecContext {
+    ExecContext {
+        role: config.anon_role.clone(),
+        claims: None,
+        pre_request: config.pre_request.clone(),
+        statement_timeout: config.statement_timeout_ms,
+        tx_end: None,
+        is_mutation,
     }
 }
 

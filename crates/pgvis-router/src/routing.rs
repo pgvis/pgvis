@@ -1163,9 +1163,9 @@ fn build_api_request(
 /// The result of JWT verification — either authenticated claims or anonymous.
 pub(crate) struct AuthResult {
     /// The role to SET LOCAL to (from JWT claim or anon_role).
-    role: Option<String>,
+    pub(crate) role: Option<String>,
     /// The full JWT claims as a JSON value (for GUC propagation).
-    claims: Option<serde_json::Value>,
+    pub(crate) claims: Option<serde_json::Value>,
 }
 
 /// Verify the JWT from the Authorization header and extract role + claims.
@@ -1330,7 +1330,7 @@ pub(crate) fn verify_jwt(headers: &HeaderMap, config: &Config) -> Result<AuthRes
 }
 
 /// Build an [`ExecContext`] from configuration, auth result, and request preferences.
-fn build_exec_context(
+pub(crate) fn build_exec_context(
     config: &Config,
     auth: &AuthResult,
     preferences: &Preferences,
