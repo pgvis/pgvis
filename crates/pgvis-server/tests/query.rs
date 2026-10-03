@@ -197,6 +197,29 @@ async fn test_filter_neq() {
 // ============================================================================
 
 #[tokio::test]
+async fn test_repeated_filter_key_applies_every_value() {
+    // A map kept only the last value, widening this to `id <= 5` (ids 1-5).
+    let body = assert_json(
+        get("/api/test/items?id=gte.3&id=lte.5&order=id.asc").await,
+        StatusCode::OK,
+    )
+    .await;
+    let ids: Vec<i64> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, [3, 4, 5]);
+}
+
+#[tokio::test]
+async fn test_repeated_reserved_key_is_rejected() {
+    let resp = get("/api/test/items?limit=1&limit=5").await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn test_filter_gt() {
     let body = assert_json(get("/api/test/items?price=gt.100").await, StatusCode::OK).await;
     let arr = body.as_array().unwrap();

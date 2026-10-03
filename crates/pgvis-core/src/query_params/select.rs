@@ -20,7 +20,7 @@ use winnow::combinator::{alt, delimited, opt, preceded, separated, terminated};
 use winnow::token::take_while;
 use winnow::{Parser, Result};
 
-use super::common::{alias_sep, field_name, json_path};
+use super::common::{alias_sep, check_nesting, field_name, json_path};
 use crate::select_ast::{
     AggregateFunction, FieldSelect, JoinType, RelationSelect, SelectItem, SpreadSelect,
 };
@@ -36,6 +36,7 @@ pub fn parse_select(input: &str) -> Result<Vec<SelectItem>, String> {
     if input.is_empty() {
         return Ok(vec![]);
     }
+    check_nesting(input).map_err(|e| format!("failed to parse select: {e}"))?;
     select_list
         .parse(input)
         .map_err(|e| format!("failed to parse select: {e}"))
@@ -217,6 +218,22 @@ mod tests {
     #[test]
     fn parse_empty() {
         assert_eq!(parse_select("").unwrap(), vec![]);
+    }
+
+    #[test]
+    fn deep_nesting_is_rejected_not_a_stack_overflow() {
+        // 100k levels used to recurse until the stack overflowed (process abort).
+        let deep = format!("{}*{}", "a(".repeat(100_000), ")".repeat(100_000));
+        assert!(parse_select(&deep).is_err());
+        let ok = format!("{}*{}", "a(".repeat(8), ")".repeat(8));
+        assert!(parse_select(&ok).is_ok());
+    }
+
+    #[test]
+    fn oversized_json_index_is_an_error_not_a_panic() {
+        // Used to panic in `digits.parse().unwrap()`.
+        let _ = parse_select("data->99999999999999999999");
+        assert!(parse_select("data->1").is_ok());
     }
 
     #[test]

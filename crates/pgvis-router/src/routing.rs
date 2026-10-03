@@ -288,6 +288,7 @@ impl AppState {
         caller: &CallerIdentity,
     ) -> Result<QueryResult, Error> {
         let cache = self.cache.load();
+        let params = &QueryParams::from(params);
 
         let select = params
             .get("select")
@@ -518,7 +519,7 @@ async fn handle_table_with_schema(
     method: axum::http::Method,
     Path(params): Path<HashMap<String, String>>,
     headers: HeaderMap,
-    Query(query_params): Query<HashMap<String, String>>,
+    Query(query_params): Query<Vec<(String, String)>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Response {
     let schema = params.get("schema").cloned().unwrap_or_default();
@@ -532,7 +533,7 @@ async fn handle_table_with_schema(
         request_method,
         false,
         &headers,
-        &query_params,
+        &QueryParams(query_params),
         body.map(|b| b.0),
     )
     .await
@@ -544,7 +545,7 @@ async fn handle_rpc_with_schema(
     method: axum::http::Method,
     Path(params): Path<HashMap<String, String>>,
     headers: HeaderMap,
-    Query(query_params): Query<HashMap<String, String>>,
+    Query(query_params): Query<Vec<(String, String)>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Response {
     let schema = params.get("schema").cloned().unwrap_or_default();
@@ -559,7 +560,7 @@ async fn handle_rpc_with_schema(
         request_method,
         true,
         &headers,
-        &query_params,
+        &QueryParams(query_params),
         body.map(|b| b.0),
     )
     .await
@@ -575,7 +576,7 @@ async fn handle_table_no_schema(
     method: axum::http::Method,
     Path(params): Path<HashMap<String, String>>,
     headers: HeaderMap,
-    Query(query_params): Query<HashMap<String, String>>,
+    Query(query_params): Query<Vec<(String, String)>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Response {
     let target = params.get("target").cloned().unwrap_or_default();
@@ -589,7 +590,7 @@ async fn handle_table_no_schema(
         request_method,
         false,
         &headers,
-        &query_params,
+        &QueryParams(query_params),
         body.map(|b| b.0),
     )
     .await
@@ -601,7 +602,7 @@ async fn handle_rpc_no_schema(
     method: axum::http::Method,
     Path(params): Path<HashMap<String, String>>,
     headers: HeaderMap,
-    Query(query_params): Query<HashMap<String, String>>,
+    Query(query_params): Query<Vec<(String, String)>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Response {
     let function = params.get("function").cloned().unwrap_or_default();
@@ -616,7 +617,7 @@ async fn handle_rpc_no_schema(
         request_method,
         true,
         &headers,
-        &query_params,
+        &QueryParams(query_params),
         body.map(|b| b.0),
     )
     .await
@@ -735,7 +736,7 @@ async fn dispatch_request(
     method: RequestMethod,
     is_rpc: bool,
     headers: &HeaderMap,
-    params: &HashMap<String, String>,
+    params: &QueryParams,
     body: Option<serde_json::Value>,
 ) -> Response {
     let cache = state.cache.load();
@@ -1032,11 +1033,12 @@ fn build_api_request(
     method: RequestMethod,
     is_rpc: bool,
     _headers: &HeaderMap,
-    params: &HashMap<String, String>,
+    params: &QueryParams,
     body: Option<serde_json::Value>,
     preferences: &Preferences,
 ) -> Result<ApiRequest, Error> {
     let _ = preferences; // Will be used for count strategy, etc.
+    params.reject_repeated_reserved()?;
 
     // Parse select parameter — a malformed select is a 400 (PGRST100), NOT a
     // silent fall back to `SELECT *` (which would over-expose columns).
@@ -1328,30 +1330,68 @@ fn build_exec_context(
 // Helper functions
 // ---------------------------------------------------------------------------
 
+/// Query-string keys that configure the request rather than filter a column.
+const RESERVED: &[&str] = &[
+    "select",
+    "order",
+    "limit",
+    "offset",
+    "on_conflict",
+    "columns",
+    "cursor_column",
+    "cursor_value",
+];
+
+/// Query-string pairs in request order.
+///
+/// Not a map: a repeated key keeps every value, so `id=gte.5&id=lte.10` is two
+/// filters. A map kept only the last one, which silently widened a PATCH or
+/// DELETE to rows the caller had excluded.
+pub(crate) struct QueryParams(pub(crate) Vec<(String, String)>);
+
+impl QueryParams {
+    /// The value of a reserved key (see [`Self::reject_repeated_reserved`]).
+    fn get(&self, key: &str) -> Option<&String> {
+        self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.0.iter().map(|(k, v)| (k, v))
+    }
+
+    /// A reserved key given twice is ambiguous (which `limit` applies?): 400.
+    fn reject_repeated_reserved(&self) -> Result<(), Error> {
+        for key in RESERVED {
+            if self.0.iter().filter(|(k, _)| k == key).count() > 1 {
+                return Err(Error::invalid_filter(format!(
+                    "query parameter `{key}` given more than once"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl From<&HashMap<String, String>> for QueryParams {
+    fn from(map: &HashMap<String, String>) -> Self {
+        Self(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+    }
+}
+
 /// Parse filter expressions from query parameters.
 ///
-/// Any parameter whose key is not a reserved keyword (`select`, `order`, `limit`,
-/// `offset`, `on_conflict`, `columns`) is treated as a column filter.
+/// Any parameter whose key is not in [`RESERVED`] is treated as a column filter;
+/// a key repeated with different operators yields one filter per value.
 ///
 /// Filters are sorted by column name for deterministic SQL output,
 /// which improves Postgres prepared-statement cache hit rates and
 /// makes debugging/logging reproducible.
 fn parse_filters_from_params(
-    params: &HashMap<String, String>,
+    params: &QueryParams,
 ) -> Result<Vec<pgvis_core::query_params::Filter>, Error> {
-    const RESERVED: &[&str] = &[
-        "select",
-        "order",
-        "limit",
-        "offset",
-        "on_conflict",
-        "columns",
-        "cursor_column",
-        "cursor_value",
-    ];
     let mut filters = Vec::new();
 
-    for (key, value) in params {
+    for (key, value) in params.iter() {
         if RESERVED.contains(&key.as_str()) {
             continue;
         }
@@ -1377,26 +1417,17 @@ fn parse_filters_from_params(
 /// Every non-reserved query parameter becomes a named argument. Values are
 /// passed as JSON strings (the function's parameter types drive coercion in the
 /// database), except `select` which is reserved for the response projection.
-fn rpc_args_from_params(params: &HashMap<String, String>) -> serde_json::Value {
+fn rpc_args_from_params(params: &QueryParams) -> serde_json::Value {
     use serde_json::Value;
     let mut obj = serde_json::Map::new();
-    for (key, value) in params {
+    for (key, value) in params.iter() {
         if key == "select" {
             continue;
         }
-        // Coerce obvious scalar literals so bound parameters carry the right JSON
-        // type (e.g. an integer argument binds as a number, not text). Anything
-        // else stays a string; the function's parameter type drives final casting.
-        let coerced = if let Ok(i) = value.parse::<i64>() {
-            Value::from(i)
-        } else if let Ok(f) = value.parse::<f64>() {
-            Value::from(f)
-        } else if value == "true" || value == "false" {
-            Value::from(value == "true")
-        } else {
-            Value::String(value.clone())
-        };
-        obj.insert(key.clone(), coerced);
+        // Pass the text through untouched: parameters bind as text and the
+        // function's declared types cast them. Guessing a JSON type here
+        // corrupted values (`02134` → `2134`, `+15551234` → `15551234`).
+        obj.insert(key.clone(), Value::String(value.clone()));
     }
     Value::Object(obj)
 }
@@ -1412,11 +1443,11 @@ fn is_logic_filter_key(key: &str) -> bool {
 ///
 /// Returns parsed `LogicTree` nodes that express boolean combinations of leaf filters.
 fn parse_logic_filters_from_params(
-    params: &HashMap<String, String>,
+    params: &QueryParams,
 ) -> Result<Vec<LogicTree>, Error> {
     let mut trees = Vec::new();
 
-    for (key, value) in params {
+    for (key, value) in params.iter() {
         if !is_logic_filter_key(key) {
             continue;
         }
@@ -1450,10 +1481,10 @@ fn parse_logic_filters_from_params(
 /// silently ignored — silently ignoring an invalid `limit` would return the
 /// full unpaginated set.
 fn parse_range_from_params(
-    params: &HashMap<String, String>,
+    params: &QueryParams,
 ) -> Result<Option<pgvis_core::query_params::RangeSpec>, Error> {
     fn parse_u64(
-        params: &HashMap<String, String>,
+        params: &QueryParams,
         key: &str,
     ) -> Result<Option<u64>, Error> {
         match params.get(key) {
@@ -1480,7 +1511,7 @@ fn parse_range_from_params(
 ///
 /// Returns `Some(CursorSpec)` if either parameter is present, activating cursor mode.
 /// When `cursor_column` is omitted, the planner defaults to the table's primary key.
-fn parse_cursor_from_params(params: &HashMap<String, String>) -> Option<CursorSpec> {
+fn parse_cursor_from_params(params: &QueryParams) -> Option<CursorSpec> {
     let column = params.get("cursor_column").cloned();
     let value = params.get("cursor_value").cloned();
 
