@@ -26,14 +26,12 @@ categories = ["database", "web-programming::http-server", "api-bindings"]
 # async / http
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
-tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
 http = "1"
 
 # postgres
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-uuid-1", "with-chrono-0_4"] }
 deadpool-postgres = "0.14"
-tokio-postgres-rustls = "0.13"
+tokio-postgres-rustls = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"
 

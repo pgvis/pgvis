@@ -20,7 +20,6 @@ axum.workspace = true
 tokio.workspace = true
 arc-swap.workspace = true
 tracing.workspace = true
-thiserror.workspace = true
 
 [features]
 default = ["postgres", "sqlite", "mcp"]
