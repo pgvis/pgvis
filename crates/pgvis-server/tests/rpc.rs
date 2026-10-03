@@ -285,6 +285,16 @@ async fn test_out_argument_before_the_input_keeps_the_input_name() {
 }
 
 #[tokio::test]
+async fn test_raise_maps_to_client_status() {
+    // A plain RAISE EXCEPTION is the function rejecting the input, not a
+    // server fault; PTxyz picks the status explicitly.
+    let resp = rpc_post("raise_rejected", json!({})).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = rpc_post("raise_payment", json!({})).await;
+    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+}
+
+#[tokio::test]
 async fn test_get_on_a_volatile_function_is_405() {
     // A link, crawler or <img> must not be able to run a volatile function.
     let resp = rpc_get("void_function").await;

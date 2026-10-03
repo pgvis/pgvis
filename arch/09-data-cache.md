@@ -79,7 +79,7 @@ Every cacheable read gets the same key form:
 
 where `generation` is the current per-table generation counter (incremented on
 each write to that table, or the global generation on volatile RPCs — whichever
-is higher), and `hash` is a 64-bit FNV-1a hash of, in order:
+is higher), and `hash` is a 64-bit keyed SipHash (random per-process key) of, in order:
 
 1. the JWT **claims** (streamed directly from the `serde_json::Value` tree
    without allocating an intermediate String), then
@@ -99,8 +99,11 @@ different key — a cache miss — without needing to scan or clear the store.
 
 ### Hashing strategy
 
-The hash uses FNV-1a (`FnvHasher`), a fast non-cryptographic hash suitable for
-internal cache keys where adversarial collision resistance is not needed.
+The hash is SipHash keyed with a random per-process key (`std::hash::RandomState`,
+held by the `DataCache`). The hashed inputs include request data (bound
+parameters, claims), so an unkeyed hash such as FNV would let a caller construct
+inputs whose key collides with another caller's entry and read or plant it; with
+a secret key that can't be targeted.
 The `hash_json_value()` helper walks the JSON value tree recursively, feeding
 type-discriminant tags and raw bytes directly into the hasher, avoiding
 the allocation that a `claims.to_string()` + `DefaultHasher` approach would

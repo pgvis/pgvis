@@ -191,6 +191,16 @@ CREATE FUNCTION test.out_first(OUT doubled integer, IN x integer)
 LANGUAGE sql STABLE
 AS $$ SELECT x * 2 $$;
 
+-- Functions that reject the request: plain RAISE (P0001 → 400) and a
+-- PostgREST-style custom status (PT402 → 402).
+CREATE FUNCTION test.raise_rejected()
+RETURNS void LANGUAGE plpgsql
+AS $$ BEGIN RAISE EXCEPTION 'rejected'; END $$;
+
+CREATE FUNCTION test.raise_payment()
+RETURNS void LANGUAGE plpgsql
+AS $$ BEGIN RAISE EXCEPTION 'payment required' USING ERRCODE = 'PT402'; END $$;
+
 CREATE FUNCTION test.echo_params(name text DEFAULT 'world', greeting text DEFAULT 'hello')
 RETURNS text
 LANGUAGE sql STABLE

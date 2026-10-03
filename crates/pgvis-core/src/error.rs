@@ -344,8 +344,16 @@ impl Error {
                     "42883" => 404, // undefined_function
                     "57014" => 504, // query_canceled (statement timeout)
                     "25006" => 405, // read_only_sql_transaction
+                    "P0001" => 400, // raise_exception: a function rejected the request
                     // Connection-exception class (08xxx) → service unavailable.
                     c if c.starts_with("08") => 503,
+                    // PostgREST convention: `RAISE ... USING ERRCODE = 'PT402'`
+                    // lets a function choose the HTTP status.
+                    c if c.starts_with("PT") => c[2..]
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|s| (100..=599).contains(s))
+                        .unwrap_or(500),
                     _ => 500,
                 };
             }

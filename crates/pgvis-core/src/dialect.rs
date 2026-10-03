@@ -252,6 +252,14 @@ pub struct Dialect {
     /// - Postgres: `ctid`
     /// - SQLite: `rowid`
     pub row_identifier: &'static str,
+
+    /// Whether string constants can be written as escape strings (`E'...'`),
+    /// whose meaning doesn't depend on `standard_conforming_strings`. Used for
+    /// JSON path keys, which come from the request.
+    ///
+    /// - Postgres: true
+    /// - SQLite: false (plain `'...'` literals never treat `\` specially)
+    pub escape_string_literals: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +293,7 @@ pub static POSTGRES: Dialect = Dialect {
     supports_row_to_json: true,
     supports_json_recordset: true,
     row_identifier: "ctid",
+    escape_string_literals: true,
 };
 
 /// The SQLite dialect — limited feature set.
@@ -321,6 +330,7 @@ pub static SQLITE: Dialect = Dialect {
     supports_row_to_json: false,
     supports_json_recordset: false,
     row_identifier: "rowid",
+    escape_string_literals: false,
 };
 
 #[cfg(test)]

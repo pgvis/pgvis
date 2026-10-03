@@ -53,7 +53,7 @@ fn render_filter(
     // Apply any JSON path (`data->>'key'`) to the column reference.
     let mut col = qualified_column(table_alias, &filter.column, ctx);
     for json_op in &filter.json_path {
-        col = render_json_path(&col, json_op);
+        col = render_json_path(&col, json_op, ctx.dialect);
     }
 
     // Check for dialect-specific rewrite
@@ -356,7 +356,7 @@ pub fn render_order_clause(
         .map(|term| {
             let mut col = qualified_column(table_alias, &term.column, ctx);
             for json_op in &term.json_path {
-                col = render_json_path(&col, json_op);
+                col = render_json_path(&col, json_op, ctx.dialect);
             }
             let dir = match term.direction {
                 OrderDirection::Asc => "ASC",
@@ -406,7 +406,7 @@ pub fn render_select_list(
 
                 // Apply JSON path operations
                 for json_op in &col.json_path {
-                    expr = render_json_path(&expr, json_op);
+                    expr = render_json_path(&expr, json_op, ctx.dialect);
                 }
 
                 // Apply cast (`::type`)
@@ -429,7 +429,7 @@ pub fn render_select_list(
                 };
                 // JSON path + pre-aggregation cast apply to the column argument.
                 for json_op in &agg.json_path {
-                    inner = render_json_path(&inner, json_op);
+                    inner = render_json_path(&inner, json_op, ctx.dialect);
                 }
                 if let Some(cast) = &agg.cast {
                     inner = render_cast(&inner, cast, ctx);
@@ -457,14 +457,14 @@ pub fn render_select_list(
 }
 
 /// Render a JSON path operation on an expression.
-fn render_json_path(expr: &str, op: &JsonOperation) -> String {
+fn render_json_path(expr: &str, op: &JsonOperation, dialect: &crate::dialect::Dialect) -> String {
     match op {
         JsonOperation::Arrow(operand) => {
-            let key = json_operand_to_sql(operand);
+            let key = json_operand_to_sql(operand, dialect);
             format!("{expr}->{key}")
         }
         JsonOperation::DoubleArrow(operand) => {
-            let key = json_operand_to_sql(operand);
+            let key = json_operand_to_sql(operand, dialect);
             format!("{expr}->>{key}")
         }
     }
@@ -488,9 +488,15 @@ fn render_cast(expr: &str, cast_type: &str, _ctx: &RenderContext<'_>) -> String 
 }
 
 /// Convert a JSON operand to its SQL representation.
-fn json_operand_to_sql(operand: &JsonOperand) -> String {
+fn json_operand_to_sql(operand: &JsonOperand, dialect: &crate::dialect::Dialect) -> String {
     match operand {
-        // Escape single quotes to keep the key inside the string literal.
+        // The key comes from the request. A plain '...' literal is only safe
+        // while standard_conforming_strings is on (a role or database can turn
+        // it off, making `\'` close the literal), so Postgres gets an escape
+        // string, whose meaning never depends on that setting.
+        JsonOperand::Key(k) if dialect.escape_string_literals => {
+            format!("E'{}'", k.replace('\\', "\\\\").replace('\'', "\\'"))
+        }
         JsonOperand::Key(k) => format!("'{}'", k.replace('\'', "''")),
         JsonOperand::Index(i) => i.to_string(),
     }
@@ -655,6 +661,23 @@ mod tests {
         };
         let sql = render_filter(&filter, None, &mut ctx);
         assert_eq!(sql, "\"status\" IN ($1, $2)");
+    }
+
+    #[test]
+    fn json_path_keys_stay_inside_their_literal() {
+        // With standard_conforming_strings off, a backslash in '...' escapes
+        // the next quote, so `\'` would close the literal early. Postgres gets
+        // an escape string, whose meaning doesn't depend on that setting.
+        let key = JsonOperand::Key(r"a\'; DROP TABLE t; --".to_string());
+        assert_eq!(
+            json_operand_to_sql(&key, &POSTGRES),
+            r"E'a\\\'; DROP TABLE t; --'"
+        );
+        // SQLite literals never treat a backslash specially.
+        assert_eq!(
+            json_operand_to_sql(&key, &crate::dialect::SQLITE),
+            r"'a\''; DROP TABLE t; --'"
+        );
     }
 
     #[test]

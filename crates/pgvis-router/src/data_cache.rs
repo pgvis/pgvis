@@ -27,7 +27,7 @@
 //! axum handler tasks. The underlying `svcache` uses `DashMap` on native targets.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
@@ -131,6 +131,10 @@ pub struct DataCache {
     table_generations: RwLock<HashMap<String, u64>>,
     /// Global generation counter — bumped by volatile RPCs that can affect anything.
     global_generation: AtomicU64,
+    /// Per-process random SipHash key for cache keys: the hashed inputs
+    /// include request data, so an unkeyed hash would let a caller craft a
+    /// collision with another caller's entry.
+    key_hasher: RandomState,
     /// `built_at` (ns) of the schema cache the stored entries were made
     /// against; see [`DataCache::sync_schema`].
     schema_stamp: AtomicU64,
@@ -153,6 +157,7 @@ impl DataCache {
             cache_lists: config.cache_lists,
             table_generations: RwLock::new(HashMap::new()),
             global_generation: AtomicU64::new(0),
+            key_hasher: RandomState::new(),
             schema_stamp: AtomicU64::new(0),
             stat_hits: AtomicU64::new(0),
             stat_misses: AtomicU64::new(0),
@@ -238,7 +243,7 @@ impl DataCache {
 
         // Hash the security context (claims) + the executed query (sql + params).
         // Uses a streaming hash of the Value tree to avoid allocating a String.
-        let mut hasher = FnvHasher::new();
+        let mut hasher = self.key_hasher.build_hasher();
         if let Some(claims) = claims {
             hash_json_value(claims, &mut hasher);
         }
@@ -340,38 +345,6 @@ impl DataCache {
                     )
             })
         })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// FnvHasher — fast non-cryptographic hash for internal cache keys
-// ---------------------------------------------------------------------------
-
-/// A simple FNV-1a hasher — faster than SipHash for non-adversarial data.
-///
-/// Used only for internal cache key computation where DoS resistance is not
-/// needed (the inputs are server-generated SQL + trusted JWT claims).
-struct FnvHasher(u64);
-
-impl FnvHasher {
-    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x00000100000001B3;
-
-    fn new() -> Self {
-        Self(Self::OFFSET_BASIS)
-    }
-}
-
-impl Hasher for FnvHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 ^= u64::from(b);
-            self.0 = self.0.wrapping_mul(Self::PRIME);
-        }
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
     }
 }
 
