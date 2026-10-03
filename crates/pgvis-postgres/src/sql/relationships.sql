@@ -19,6 +19,10 @@ pks_uniques_cols AS (
   WHERE
     contype IN ('p', 'u')
     AND connamespace <> 'pg_catalog'::regnamespace
+    -- PG18 temporal keys (WITHOUT OVERLAPS / PERIOD) match the range column by
+    -- overlap, not equality: not usable as a plain key. to_jsonb keeps this valid
+    -- before PG18, where pg_constraint has no conperiod column.
+    AND NOT COALESCE((to_jsonb(pg_constraint)->>'conperiod')::bool, false)
   GROUP BY oid, conrelid
 )
 SELECT
@@ -49,5 +53,9 @@ JOIN pg_class other ON other.oid = traint.confrelid
 JOIN pg_namespace ns2 ON ns2.oid = other.relnamespace
 WHERE traint.contype = 'f'
 AND traint.conparentid = 0
+-- PG18 temporal keys (WITHOUT OVERLAPS / PERIOD) match the range column by
+-- overlap, not equality: not usable as a plain key. to_jsonb keeps this valid
+-- before PG18, where pg_constraint has no conperiod column.
+AND NOT COALESCE((to_jsonb(traint)->>'conperiod')::bool, false)
 AND (ns1.oid = ANY($1::regnamespace[]) OR ns2.oid = ANY($1::regnamespace[]))
 ORDER BY traint.conrelid, traint.conname

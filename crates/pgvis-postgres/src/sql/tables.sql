@@ -45,10 +45,18 @@ columns AS (
         CASE
           WHEN (t.typbasetype != 0) AND (ad.adbin IS NULL) THEN pg_get_expr(t.typdefaultbin, 0)
           WHEN a.attidentity  = 'd' THEN format('nextval(%L)', seq.objid::regclass)
-          WHEN a.attgenerated = 's' THEN null
+          WHEN a.attgenerated <> '' THEN null
           ELSE pg_get_expr(ad.adbin, ad.adrelid)::text
         END AS column_default,
-        NOT (a.attnotnull OR t.typtype = 'd' AND t.typnotnull) AS is_nullable,
+        -- PG18 NOT NULL constraints can be NOT VALID: existing rows may hold NULL.
+        NOT (
+          a.attnotnull AND NOT EXISTS (
+            SELECT 1 FROM pg_constraint nn
+            WHERE nn.contype = 'n' AND nn.conrelid = a.attrelid
+              AND nn.conkey[1] = a.attnum AND NOT nn.convalidated
+          )
+          OR t.typtype = 'd' AND t.typnotnull
+        ) AS is_nullable,
         CASE
             WHEN t.typtype = 'd' THEN
             CASE
@@ -66,9 +74,9 @@ columns AS (
             information_schema._pg_truetypid(a.*, t.*),
             information_schema._pg_truetypmod(a.*, t.*)
         )::integer AS character_maximum_length,
-        a.attgenerated = 's' AS is_generated,
+        a.attgenerated <> '' AS is_generated,
         -- A column is updatable if not generated and table permits it
-        a.attgenerated != 's' AND a.attidentity != 'a' AS is_updatable,
+        a.attgenerated = '' AND a.attidentity != 'a' AS is_updatable,
         bt.base_type,
         a.attnum::integer AS position
     FROM pg_attribute a
@@ -124,6 +132,10 @@ tbl_pk_cols AS (
     ON a.attrelid = r.oid AND a.attnum = ANY (c.conkey)
   WHERE
     c.contype IN ('p')
+    -- PG18 temporal keys (WITHOUT OVERLAPS / PERIOD) match the range column by
+    -- overlap, not equality: not usable as a plain key. to_jsonb keeps this valid
+    -- before PG18, where pg_constraint has no conperiod column.
+    AND NOT COALESCE((to_jsonb(c)->>'conperiod')::bool, false)
     AND r.relkind IN ('r', 'p')
     AND r.relnamespace NOT IN ('pg_catalog'::regnamespace, 'information_schema'::regnamespace)
     AND NOT pg_is_other_temp_schema(r.relnamespace)

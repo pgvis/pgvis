@@ -290,3 +290,35 @@ END;
 $$;
 REVOKE EXECUTE ON FUNCTION test_pubsub.authorize(text, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION test_pubsub.authorize(text, text) TO pgvis_test_anon, pgvis_test_user;
+
+-- ============================================================================
+-- PostgreSQL 18+ catalog features (tests/pg18.rs). Skipped on older servers.
+-- ============================================================================
+DO $$
+BEGIN
+    IF current_setting('server_version_num')::int < 180000 THEN
+        RETURN;
+    END IF;
+    CREATE EXTENSION IF NOT EXISTS btree_gist;
+    -- Virtual generated columns are the PG18 default kind (attgenerated 'v').
+    EXECUTE $ddl$
+        CREATE TABLE test.pg18_items (
+            id serial PRIMARY KEY,
+            price integer NOT NULL,
+            doubled integer GENERATED ALWAYS AS (price * 2) VIRTUAL,
+            note text
+        )
+    $ddl$;
+    -- A NOT VALID not-null constraint: existing rows may still hold NULL.
+    EXECUTE 'INSERT INTO test.pg18_items (price, note) VALUES (1, NULL)';
+    EXECUTE 'ALTER TABLE test.pg18_items ADD CONSTRAINT note_nn NOT NULL note NOT VALID';
+    -- A temporal primary key: rows match by overlap on the range column.
+    EXECUTE $ddl$
+        CREATE TABLE test.pg18_bookings (
+            room integer,
+            during tstzrange,
+            PRIMARY KEY (room, during WITHOUT OVERLAPS)
+        )
+    $ddl$;
+END
+$$;
