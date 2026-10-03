@@ -9,20 +9,15 @@ adapter layer talks to the database catalog directly.
 
 ## Lifecycle
 
-```mermaid
-flowchart LR
-    START[startup or reload] --> INTRO["Backend::introspect&#40;cfg&#41;"]
-    INTRO --> CAT[(database catalog)]
-    CAT --> ASM[assemble SchemaCache]
-    ASM --> PP[post-process:<br/>M2M + inverse rels + FK marking + relationship index]
-    PP --> SWAP["ArcSwap&lt;SchemaCache&gt;.store"]
-    SWAP --> USE[plan layer, routes, OpenAPI, MCP tools<br/>read latest snapshot per request]
-    NOTIFY[schema change signal] --> START
-```
+The cache is built once at startup (`Builder::build_components` calls
+`Backend::introspect`) and rebuilt whenever a reload is triggered; see
+[Hot reload](#hot-reload) below for the sequence. Each build runs the catalog
+queries, assembles a `SchemaCache`, post-processes it (M2M and inverse
+relationships, FK marking, relationship index) and stamps `built_at`.
 
 The cache is held behind `ArcSwap<SchemaCache>` in the REST `AppState`
-([04-surfaces.md](04-surfaces.md)) so a reload swaps it atomically without
-rebuilding routes or blocking readers.
+([04-surfaces.md](04-surfaces.md)) and in `McpServer`, so a reload swaps it
+atomically without rebuilding routes or blocking readers.
 
 ## Cache types
 
@@ -31,19 +26,23 @@ types use *string* type names (not Postgres OIDs) so they are valid for both
 Postgres (`int4`, `jsonb`) and SQLite (`INTEGER`, `TEXT`).
 
 ```mermaid
-flowchart TD
-    SCC[SchemaCache] --> T["tables: IndexMap&lt;QualifiedIdentifier, Table&gt;"]
-    SCC --> R["relationships: Vec&lt;Relationship&gt;"]
-    SCC --> RI["relationship_index: HashMap&lt;QI, Vec&lt;usize&gt;&gt;"]
-    SCC --> CR["computed_relationships: Vec&lt;ComputedRelationship&gt;"]
-    SCC --> RT["routines: IndexMap&lt;QI, Vec&lt;Routine&gt;&gt;"]
-    SCC --> RP["representations: map (DataRepresentation)"]
-    SCC --> MH["media_handlers: map (MediaHandler)"]
-    T --> C["columns: IndexMap&lt;String, Column&gt;"]
-    T --> UC["unique_constraints: Vec&lt;UniqueConstraint&gt;"]
-    R --> CARD{Cardinality:<br/>M2O / O2M / O2O / M2M}
-    RI -.->|"O(1) lookup into"| R
-    RT --> RPm[params + return_type + volatility]
+flowchart TB
+    scc["<b>SchemaCache</b><br/>built_at, schema_version"]
+    t["<b>tables</b><br/>IndexMap&lt;QI, Table&gt;"]
+    tbl["<b>Table</b><br/>columns, pk_cols, unique_constraints"]
+    r["<b>relationships</b><br/>Vec&lt;Relationship&gt;"]
+    card["<b>Cardinality</b><br/>M2O / O2M / O2O / M2M"]
+    ri["<b>relationship_index</b><br/>table to relationship indices"]
+    rt["<b>routines</b><br/>IndexMap&lt;QI, Vec&lt;Routine&gt;&gt;"]
+    rtn["<b>Routine</b><br/>params, return type, volatility"]
+    extra["<b>Postgres-only extras</b><br/>computed rels, representations, media handlers"]
+
+    scc --> t --> tbl
+    scc --> r --> card
+    scc --> ri
+    ri -.->|"O(1) lookup into"| r
+    scc --> rt --> rtn
+    scc --> extra
 ```
 
 | Type | Purpose | Notes |
@@ -63,8 +62,8 @@ flowchart TD
 `SchemaCache` exposes lookup helpers used by the planner: `find_table`,
 `find_relationships` (O(1) HashMap lookup via the pre-built `relationship_index`
 — direction filtering happens in the planner), and `find_routines` (returns *all*
-overloads under a name; the planner narrows by arguments — see the overload TODO
-in [02-core-pipeline.md](02-core-pipeline.md)).
+overloads under a name; the planner picks one by argument names — see
+[02-core-pipeline.md](02-core-pipeline.md)).
 
 `Column` and `Table` carry rich metadata specifically so the SQL builder and
 OpenAPI generator never need to re-introspect: e.g. `is_generated` excludes a
@@ -110,29 +109,60 @@ After the raw queries, four passes run in
 
 `[Planned]` introspection gaps (the fields exist on the types but are populated
 empty today): computed relationships (`allComputedRels`), media handlers,
-`schema_version`, and view primary-key dependency tracing. These are enumerated
+`schema_version`, and view primary-key dependency tracing. `built_at` is set on
+every build; reload consumers use it to notice a new cache. These are enumerated
 in [08-future-scope.md](08-future-scope.md).
 
 ## Hot reload
 
 `Backend::watch_schema()` ([03-backends-and-dialects.md](03-backends-and-dialects.md))
-is the push channel. On Postgres it is `LISTEN pgrst` on a dedicated connection
+is the push channel. On Postgres it is `LISTEN pgrst` on a dedicated
+connection outside the request pool
 ([schema_watch.rs](../crates/pgvis-postgres/src/schema_watch.rs)), following
 PostgREST: `NOTIFY pgrst, 'reload schema'` (or an empty payload) from a
-migration or a DDL event trigger asks every instance to reload. After a
-reconnect it reports one change, in case a notification was missed. SQLite has
-no push channel.
+migration or a DDL event trigger asks every instance to reload; other payloads
+are ignored. The listener reconnects with backoff (0.5 s doubling to 30 s) and
+reports one change after a reconnect, in case a notification was missed. The
+replica backend listens on its primary. SQLite has no push channel.
 
 [`SchemaReloader`](../crates/pgvis-lib/src/reload.rs) (spawned by the
 `Builder`, exposed as `Components::reloader`, and usable on its own by
-embedders) runs the sequence: change notification or `reload()` → debounce
-(200 ms, so a migration's burst of DDL reloads once) → `introspect()` →
-`ArcSwap::store`. A failed introspection keeps the current cache.
-`reload_now()` reloads and waits, e.g. right after running migrations; the
-`pgvis` binary also reloads on `SIGUSR1`.
+embedders) turns those signals into an atomic swap:
+
+```mermaid
+flowchart TB
+    notify(["NOTIFY pgrst, 'reload schema'"])
+    sig(["SIGUSR1 or reload()"])
+    now(["reload_now()"])
+    deb["<b>Debounce 200 ms</b><br/>drain queued changes"]
+    intro["<b>Backend::introspect()</b><br/>catalog queries + post-process"]
+    ok{"introspection ok?"}
+    swap["<b>ArcSwap::store</b><br/>new Arc&lt;SchemaCache&gt;"]
+    keep["<b>Keep the current cache</b><br/>error logged or returned"]
+    next["<b>Next request</b><br/>routes, OpenAPI, MCP tools"]
+    dc["<b>Data cache</b><br/>sync_schema(built_at) invalidates all"]
+
+    notify -->|"watch_schema stream"| deb
+    sig --> deb
+    deb --> intro
+    now -->|"no debounce; caller waits"| intro
+    intro --> ok
+    ok -->|yes| swap --> next
+    ok -->|no| keep
+    next -.->|"new built_at on the next read"| dc
+```
+
+`reload()` returns at once, and requests that arrive together are coalesced
+into one introspection; the debounce lets a migration's burst of DDL reload
+once. `reload_now()` reloads and waits, e.g. right after running migrations,
+and returns the error if introspection fails. The `pgvis` binary calls
+`reload()` on `SIGUSR1`. In every case a failed introspection keeps the
+current cache, and in-flight requests finish on the snapshot they started
+with.
 
 Because surfaces use wildcard routes and read the cache snapshot per request,
 no routes, OpenAPI document, or MCP tool list need to be rebuilt structurally —
-they reflect the new cache on the next request. The data cache notices the new
-`SchemaCache::built_at` and invalidates every entry, so no response cached
+they reflect the new cache on the next request. The data cache compares
+`SchemaCache::built_at` with the one its entries were made against before each
+lookup and invalidates every entry when it changed, so no response cached
 against the old schema is served.

@@ -3,8 +3,6 @@ title: REST API
 description: Complete reference for the PostgREST-compatible REST API.
 ---
 
-# REST API Guide
-
 pgvis exposes a PostgREST-compatible REST API. If you've used PostgREST before, the query DSL is identical — existing clients work unchanged.
 
 ## Route Structure
@@ -13,16 +11,16 @@ Routes are determined by the [`routing`](/reference/configuration#routing) confi
 
 ### Schema-in-path mode (default)
 
-```
-GET  /api/{schema}/{table}          — list rows (HEAD: headers only)
-POST /api/{schema}/{table}          — insert rows
-PATCH /api/{schema}/{table}         — update rows
-DELETE /api/{schema}/{table}        — delete rows
-POST /api/{schema}/rpc/{function}   — call a function
-GET  /api/{schema}/rpc/{function}   — call a non-volatile function
-GET  /api/                          — exposed schemas, or the OpenAPI 3.0 spec
-GET  /pgvis/cache                   — data cache stats/settings and pool occupancy
-```
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/api/{schema}/{table}` | List rows (`HEAD`: headers only) |
+| `POST` | `/api/{schema}/{table}` | Insert rows |
+| `PATCH` | `/api/{schema}/{table}` | Update rows |
+| `DELETE` | `/api/{schema}/{table}` | Delete rows |
+| `POST` | `/api/{schema}/rpc/{function}` | Call a function |
+| `GET` | `/api/{schema}/rpc/{function}` | Call a non-volatile function |
+| `GET` | `/api/` | Exposed schemas, or the OpenAPI 3.0 spec |
+| `GET` | `/pgvis/cache` | Data cache stats/settings and pool occupancy |
 
 `GET /api/` returns `{"schemas": [...], "hint": ...}` by default; send `Accept: application/openapi+json` to get the OpenAPI 3.0 document instead (`404 PGRST404` when `openapi_mode` is disabled). Both `GET /api/` and `GET /pgvis/cache` authenticate exactly like the data API: when a `jwt_secret` is configured and there is no `anon_role`, an anonymous request gets `401`.
 
@@ -406,6 +404,22 @@ curl "/api/public/items?order=id.desc&cursor_column=id&cursor_value=100&limit=10
 ## Resource Embedding
 
 Traverse foreign-key relationships and embed related resources as nested JSON using the `select` parameter.
+
+The examples below use this schema. Solid arrows are foreign keys; an embed can follow one in either direction, and the dashed edge is the many-to-many relationship pgvis derives from the `order_items` junction table:
+
+```mermaid
+flowchart LR
+    orders["<b>orders</b>"] -->|user_id| users["<b>users</b>"]
+    oi["<b>order_items</b>"] -->|order_id| orders
+    oi -->|item_id| items["<b>items</b>"]
+    orders -.->|"items(...)"| items
+```
+
+| From | Embed | Direction | Shape in the JSON |
+|------|-------|-----------|-------------------|
+| `orders` | `users(...)` | many-to-one | object (or `null`) |
+| `users` | `orders(...)` | one-to-many | array |
+| `orders` | `items(...)` | many-to-many | array |
 
 ### Many-to-one (child → parent)
 

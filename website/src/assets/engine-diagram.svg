@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 360" preserveAspectRatio="xMidYMid meet" role="img" aria-label="pgvis introspects a Postgres or SQLite database and serves it three ways: as MCP tools, a REST API, and an OpenAPI 3.0 spec, through one parse, plan, SQL pipeline.">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 36 800 288" preserveAspectRatio="xMidYMid meet" role="img" aria-label="pgvis introspects a Postgres or SQLite database and serves it three ways: as MCP tools, a REST API, and an OpenAPI 3.0 spec, through one parse, plan, SQL pipeline.">
   <defs>
-    <linearGradient id="ed-line" x1="0" y1="0" x2="1" y2="0">
+    <linearGradient id="ed-line" x1="200" y1="0" x2="600" y2="0" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#6366f1" stop-opacity="0.55" />
       <stop offset="100%" stop-color="#a78bfa" stop-opacity="0.55" />
     </linearGradient>

@@ -6,22 +6,24 @@ into one `ApiRequest` and runs the same `plan_request` → `render` →
 `Backend::execute` pipeline.** A surface is an adapter, never a fork of the
 engine.
 
+Each surface is generated from the same `SchemaCache` and `Config`, and
+every request it accepts converges on one `ApiRequest`.
+
 ```mermaid
-flowchart TD
-    SC[(SchemaCache)] --> RB[pgvis-router::build_app]
-    SC --> MB[pgvis-mcp::build_mcp_tools]
-    SC --> OA[pgvis-router::openapi::generate_spec]
-    CFG[Config] --> RB
-    CFG --> MB
-    CFG --> OA
+flowchart TB
+    sc[("SchemaCache + Config")]
+    rb["<b>pgvis-router::build_app</b><br/>wildcard axum routes"]
+    oa["<b>openapi::generate_spec</b><br/>OpenAPI 3.0 document"]
+    mb["<b>pgvis-mcp::build_mcp_tools</b><br/>tools + resources"]
+    ar["<b>ApiRequest</b>"]
+    pipe["<b>shared pipeline</b><br/>plan_request → render → execute"]
 
-    RB --> ROUTER[axum Router]
-    MB --> TOOLS["Vec&lt;McpToolDefinition&gt; + resources"]
-    OA --> SPEC[OpenAPI 3.0 doc]
-
-    ROUTER -->|build_api_request| AR[ApiRequest]
-    TOOLS -->|handle_tool_call| AR
-    AR --> PIPE["plan_request → render → execute"]
+    sc --> rb
+    sc --> oa
+    sc --> mb
+    rb -->|"build_api_request"| ar
+    mb -->|"handle_tool_call"| ar
+    ar --> pipe
 ```
 
 ## REST `[Implemented]`
@@ -44,27 +46,35 @@ Routes come from `RoutingConfig`
 Rather than registering one route per table (which would force a router rebuild
 on every schema reload), `build_app` registers a small set of **wildcard
 routes** and resolves the concrete target at request time against the current
-cache snapshot. `GET /` is the root: it returns the OpenAPI document when the
-`Accept` header asks for it, otherwise a list of exposed schemas
-(`handle_root`).
+cache snapshot. `GET /` (or `GET /{prefix}/`) is the root: it returns the OpenAPI document
+when the `Accept` header asks for it, otherwise a list of exposed schemas
+(`handle_root`). Like `GET /pgvis/cache`, it authenticates exactly as the data
+API does, so an anonymous caller cannot enumerate tables on a deployment that
+requires a JWT.
 
 ### State and hot reload
 
 `AppState` ([routing.rs](../crates/pgvis-router/src/routing.rs)) holds
-`Arc<ArcSwap<SchemaCache>>`, `Arc<Config>`, `Arc<Dialect>`, and
-`Arc<dyn Backend>`. The
-`ArcSwap<SchemaCache>` lets a schema reload atomically replace the cache without
-rebuilding the router or interrupting in-flight requests; handlers call
-`state.cache.load()` per request to get the latest snapshot.
+`Arc<ArcSwap<SchemaCache>>`, `Arc<Config>`, `Arc<Dialect>`,
+`Arc<dyn Backend>`, the optional data cache, and the serialized OpenAPI
+document of the current snapshot. The `ArcSwap<SchemaCache>` lets a schema
+reload ([05-schema-cache.md](05-schema-cache.md)) atomically replace the cache
+without rebuilding the router or interrupting in-flight requests; handlers call
+`state.cache.load()` per request to get the latest snapshot. The same
+`AppState` also serves in-process calls (`call_rpc`, `call_read`) with a
+`CallerIdentity` in place of a JWT.
 
 ### Request handling
 
-`dispatch_request` → `build_api_request` parses HTTP into an `ApiRequest`:
+`dispatch_request` first verifies the JWT (`verify_jwt`: signature,
+`jwt_aud`, role claim or `anon_role`), so an unauthenticated request never
+reaches the planner. `build_api_request` then parses HTTP into an `ApiRequest`:
 `select=`/`order=` via the `query_params` parsers, column filters via
 `parse_filter` for any non-reserved query key, `limit`/`offset` into a
 `RangeSpec`, the `Prefer` header via `Preferences::parse`, and the JSON body
 into `RequestBody::Single`/`Bulk`. It then calls `plan_request`,
-`query::render`, and `Backend::execute`, and maps the resulting `QueryResult`
+`query::render`, and `Backend::execute` (after a lookup in the optional data
+cache, [09-data-cache.md](09-data-cache.md)), and maps the resulting `QueryResult`
 to an HTTP response; errors are mapped to `err.http_status()` with the `PGRST*`
 code body (see [06-errors-and-config.md](06-errors-and-config.md)). This path is
 exercised end-to-end by the integration suite in
@@ -73,8 +83,10 @@ exercised end-to-end by the integration suite in
 into `ResolvedLogicTree` nodes. Cursor-based pagination
 (`cursor_column`/`cursor_value`) is also wired through `CursorSpec` →
 `ResolvedCursor` → a keyset `WHERE` clause with an `X-Next-Cursor` response
-header. **Remaining gaps** ([08-future-scope.md](08-future-scope.md)): JWT claim
-extraction into `ExecContext`, relation ordering, and content negotiation.
+header. A `GET`/`HEAD` that would call a `VOLATILE` function is rejected with
+405, since a link or crawler could otherwise run it. **Remaining gaps**
+([08-future-scope.md](08-future-scope.md)): relation ordering and content
+negotiation.
 
 ## OpenAPI `[In progress]`
 
@@ -94,7 +106,7 @@ operations, summaries, tags, and descriptions are emitted; rich request/response
 JSON Schemas and per-column query parameters are not yet filled in
 ([08-future-scope.md](08-future-scope.md)).
 
-## MCP `[In progress]`
+## MCP `[Implemented]`
 
 Crate [pgvis-mcp](../crates/pgvis-mcp). `build_mcp_tools(cache, config)` is the
 deliberate parallel of `build_app` — same inputs, different surface
@@ -109,7 +121,10 @@ tool. Tool names come from `RoutingConfig::mcp_tool_name` —
 prefix omitted only for the default schema in non-schema-in-path mode. Each
 tool's `input_schema` mirrors the query DSL (`select`, `filters`, `order`,
 `limit`, `offset`; `rows` for create; `values`+`filters` for update; routine
-params for call).
+params for call). With `read_only` (`pgvis mcp --read-only`) only the `list`
+tools are generated, and write calls are refused. When pub/sub is enabled,
+`pubsub_publish` and `pubsub_channels` are added
+([10-pubsub.md](10-pubsub.md)).
 
 ### Resources
 
@@ -126,7 +141,12 @@ tool name into `(schema, verb, target)`, maps the verb to a `RequestMethod`
 `plan_request`. `McpServer` holds an `Arc<dyn Backend>`, so `handle_tool_call`
 renders SQL and executes it end-to-end, returning real rows just like REST.
 Filter parsing reuses `query_params::parse_filter` (the exact parser REST uses),
-so the operator grammar is shared rather than a hand-rolled subset.
+so the operator grammar is shared rather than a hand-rolled subset; `update`
+and `delete` fail closed on missing or malformed filters. There is no
+per-caller token on MCP yet: every call runs as `anon_role`, and when a
+`jwt_secret` is set without an `anon_role` the tools refuse to run. Transports
+are stdio (`serve_stdio`) and Streamable HTTP (`streamable_http_service`,
+mounted at `/mcp`) ([transport.rs](../crates/pgvis-mcp/src/transport.rs)).
 
 ## Delivery wrappers
 
@@ -134,20 +154,25 @@ so the operator grammar is shared rather than a hand-rolled subset.
 
 [pgvis-lib](../crates/pgvis-lib/src/lib.rs) is a fluent `Builder` for host
 Rust apps: `Builder::new(dsn).schemas([...]).build().await -> axum::Router`.
-`build_components()` constructs a `PgBackend`, introspects into an
-`ArcSwap<SchemaCache>`, calls `pgvis-router::build_app`, and optionally merges
-the MCP Streamable-HTTP service at `/mcp` (`with_mcp_http()`); `build()` returns
-just the router and `build_mcp_server()` returns a stdio `McpServer`. It is the
+`build_components()` picks the backend from the DSN (`PgBackend`, or
+`PgReplicaBackend` when `replica.replica_dsns` is set, or `SqliteBackend`),
+introspects into an `ArcSwap<SchemaCache>`, spawns the `SchemaReloader`, calls
+`pgvis-router::build_app`, nests the pub/sub router at `/pubsub` when enabled
+(Postgres only), and optionally merges the MCP Streamable-HTTP service at
+`/mcp` (`with_mcp_http()`); `build()` returns just the router and
+`build_mcp_server()` returns a stdio `McpServer`. It is the
 single authoritative way to assemble the stack — the binary uses it too.
 
 ### `pgvis-server` `[Implemented]`
 
 [pgvis-server](../crates/pgvis-server/src/main.rs) is the `pgvis` binary. It
 parses a `clap` CLI (`--dsn`, `--config`, env-var fallbacks) with subcommands
-`serve` (default), `mcp`, `openapi`, and `inspect`, initializes JSON tracing,
-and runs each command through `pgvis-lib`. Remaining gap: `load_config` still
-returns `Config::default()` — TOML/figment file layering is stubbed
-([08-future-scope.md](08-future-scope.md)).
+`serve` (default), `mcp`, `openapi`, and `inspect`, initializes JSON tracing on
+stderr, and runs each command through `pgvis-lib`. `load_config` layers the
+configuration with figment ([06-errors-and-config.md](06-errors-and-config.md)).
+`serve` refuses to start without `jwt_secret` or `anon_role` unless given
+`--insecure-no-auth`, reloads the schema cache on `SIGUSR1`, and finishes
+in-flight requests on SIGTERM / Ctrl-C.
 
 ## Why surfaces are this thin
 

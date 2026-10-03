@@ -46,21 +46,32 @@ regardless of traffic.
 
 ## Architecture
 
+Proposed data flow: event sites push into the facade and a small registry; a
+sampler polls the database; one snapshot API serves every reader.
+
 ```mermaid
-flowchart LR
-    subgraph pgvis
-      REQ[dispatch / MCP / pubsub] -- "counter!/histogram!" --> FACADE[metrics facade]
-      REQ -- record --> REG[MetricsRegistry<br/>atomics + histograms]
-      POOL[Backend::pool_status] --> REG
-      SAMPLER[DbSampler task<br/>every interval] -- "pg_stat_* on its own connection" --> PG[(Postgres)]
-      SAMPLER --> SNAP[ArcSwap DbSnapshot]
-    end
-    FACADE --> HOSTEXP[host's exporter<br/>e.g. Prometheus]
-    REG --> API[Metrics::snapshot]
-    SNAP --> API
-    API --> HTTP[GET /pgvis/metrics<br/>JSON or Prometheus text]
-    API --> RUST[Rust callers / svstudio]
-    API --> READY[GET /pgvis/ready]
+flowchart TB
+    ev["<b>Event sites</b><br/>dispatch, MCP, pub/sub"]
+    facade["<b>metrics facade</b><br/>counter! / histogram!"]
+    reg["<b>MetricsRegistry</b><br/>atomics + histograms"]
+    pool["<b>Backend::pool_status</b>"]
+    sampler["<b>DbSampler task</b><br/>pg_stat_* on its own connection"]
+    pg[("Postgres")]
+    snap["<b>DbSnapshot</b><br/>behind ArcSwap"]
+    host(["Host exporter<br/>e.g. Prometheus"])
+    api["<b>Metrics::snapshot</b>"]
+    http(["GET /pgvis/metrics<br/>JSON or Prometheus text"])
+    rust(["Rust callers, e.g. svstudio"])
+    ready(["GET /pgvis/ready"])
+
+    ev --> facade --> host
+    ev --> reg --> api
+    pool --> reg
+    sampler -->|"every interval"| pg
+    sampler --> snap --> api
+    api --> http
+    api --> rust
+    api --> ready
 ```
 
 1. **Event sites** call the [`metrics`](https://docs.rs/metrics) crate macros

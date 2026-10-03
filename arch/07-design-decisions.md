@@ -62,8 +62,8 @@ Rationale · Consequences · Status.**
   builder only formats. Errors are raised before any SQL is generated.
 - **Consequences.** + Builder stays dialect-mechanical; clear error timing.
   − Every new rewrite needs a `FilterRewrite` variant + a builder arm.
-- **Status.** `[Implemented]` (rewrite variants defined; SQLite emission lands
-  with the SQLite backend).
+- **Status.** `[Implemented]` (the SQLite backend exercises the rewrites; their
+  SQL is emitted in [query/fragment.rs](../crates/pgvis-core/src/query/fragment.rs)).
 
 ## 5. One CTE-wrapped result shape
 
@@ -78,8 +78,8 @@ Rationale · Consequences · Status.**
   readback is free on Postgres and cleanly absent on SQLite via
   `supports_set_local`.
 - **Consequences.** + Uniform decode path. − Backends that cannot express the
-  CTE/GUC pattern need a translation; exact-count is currently simplified
-  ([08-future-scope.md](08-future-scope.md)).
+  CTE/GUC pattern need a translation: SQLite skips the envelope
+  (`render_inner`) and its executor builds the same `QueryResult` in Rust.
 - **Status.** `[Implemented]`.
 
 ## 6. Object-safe `Backend` via `BoxFuture`
@@ -136,8 +136,8 @@ Rationale · Consequences · Status.**
   self-documenting; compat mode preserves migration.
 - **Consequences.** + Clear multi-schema URLs. − Two routing modes to maintain
   and document.
-- **Status.** `[Implemented]` — routing modes and REST surface wiring are live;
-  MCP shares the modes but its execute path is still stubbed.
+- **Status.** `[Implemented]` — routing modes are live on REST, and MCP tool
+  names follow the same `RoutingConfig`.
 
 ## 10. Routes and OpenAPI from one source, one pass
 

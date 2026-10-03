@@ -3,8 +3,6 @@ title: Embedding in Rust
 description: Use pgvis as a library in your Rust application.
 ---
 
-# Embedding in Rust
-
 pgvis is not just a standalone server — it's a library you can embed in any Rust application. The `pgvis-lib` crate provides a `Builder` that assembles the full stack in one call.
 
 ## Add the Dependency
@@ -498,7 +496,26 @@ match Builder::new("postgres://localhost/mydb").build().await {
 
 ## Architecture
 
-The embed API (`pgvis-lib`) is the same code path the CLI uses. There is no "server-only" logic — the `Builder` assembles:
+The embed API (`pgvis-lib`) is the same code path the CLI uses. There is no "server-only" logic. `build_components()` picks the backend from the DSN, introspects once, then wires every surface to the same backend and schema cache (dashed parts are optional: `/pubsub` needs `pubsub.enabled` on Postgres, `/mcp` needs `with_mcp_http()`):
+
+```mermaid
+flowchart TB
+    b(["Builder::new(dsn)"]) --> kind{"detect_db_kind"}
+    kind -->|Postgres| pg["<b>PgBackend</b><br/>or PgReplicaBackend"]
+    kind -->|SQLite| sq["<b>SqliteBackend</b>"]
+    pg --> intro["<b>introspect</b><br/>SchemaCache"]
+    sq --> intro
+    intro --> rel["<b>SchemaReloader</b>"]
+    intro --> app["<b>build_app</b><br/>REST + OpenAPI"]
+    intro -.-> ps["<b>/pubsub</b><br/>if enabled"]
+    intro -.-> mcp["<b>/mcp</b><br/>with_mcp_http"]
+    rel --> comp(["Components"])
+    app --> comp
+    ps -.-> comp
+    mcp -.-> comp
+```
+
+In words, the `Builder` assembles:
 
 1. A database backend (connection pool + introspection; replica-aware when replicas are configured)
 2. A schema cache (tables, columns, relationships, routines, constraints) and its `SchemaReloader`

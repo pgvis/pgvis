@@ -18,7 +18,8 @@ is the map.
    builder.
 4. **Embeddable.** A host Rust application can mount the API in its own axum
    server with a few lines; the standalone binary is just one consumer.
-5. **Predictable performance.** One SQL round-trip per request. Embedding and
+5. **Predictable performance.** One SQL statement per request, sent in
+   one pipelined round trip (plus COMMIT) on Postgres. Embedding and
    aggregation happen inside the database via JSON aggregation, not by
    re-assembling rows in Rust.
 
@@ -37,10 +38,12 @@ is the map.
 - **Deterministic SQL.** The same `ActionPlan` + `Dialect` always produces
   byte-identical SQL, which makes the builder snapshot-testable
   ([query/mod.rs](../crates/pgvis-core/src/query/mod.rs)).
-- **Single result shape.** Every generated statement (read, mutate, call) is
-  wrapped in a CTE that yields one row with `body`, `page_total`, and
-  (Postgres) GUC-readback columns, so the driver decodes one uniform shape
-  ([query/cte.rs](../crates/pgvis-core/src/query/cte.rs)).
+- **Single result shape.** On Postgres every generated statement (read,
+  mutate, call) is wrapped in a CTE that yields one row with `body`,
+  `page_total`, and GUC-readback columns, so the driver decodes one uniform
+  shape ([query/cte.rs](../crates/pgvis-core/src/query/cte.rs)). SQLite runs
+  the unwrapped statement (`query::render_inner`) and its executor assembles
+  the same `QueryResult` in Rust.
 - **One request type.** REST handlers and MCP tool handlers both build the same
   [`ApiRequest`](../crates/pgvis-core/src/plan/types.rs) and call the same
   `plan_request`. New surfaces reuse the entire pipeline.
@@ -49,23 +52,26 @@ is the map.
 
 ## The pipeline
 
+Both surfaces lower their input into one `ApiRequest`; from there to the
+database the code path is shared.
+
 ```mermaid
-flowchart LR
-    REQ[HTTP request / MCP tool call] --> ADP[Adapter:<br/>pgvis-router or pgvis-mcp]
-    ADP -->|parse query string,<br/>headers, body| AR[ApiRequest]
-    AR --> PR["plan_request()<br/>(pgvis-core::plan)"]
-    SC[(SchemaCache)] --> PR
-    DL[Dialect] --> PR
-    CFG[Config] --> PR
-    PR --> AP[ActionPlan<br/>Read / Mutate / Call / Inspect]
-    AP --> RND["render()<br/>(pgvis-core::query)"]
-    DL --> RND
-    RND --> SQLP[SQL string + params]
-    SQLP --> BE["Backend::execute()"]
-    BE --> DB[(database)]
-    DB --> QR[QueryResult]
-    QR --> ADP2[Adapter encodes response]
-    ADP2 --> RESP[HTTP / MCP response]
+flowchart TB
+    req(["HTTP request / MCP tool call"])
+    adp["<b>Adapter</b><br/>pgvis-router or pgvis-mcp"]
+    ar["<b>ApiRequest</b><br/>parsed query, headers, body"]
+    plan["<b>plan_request()</b><br/>pgvis-core::plan, with Dialect + Config"]
+    sc[("SchemaCache")]
+    ap["<b>ActionPlan</b><br/>Read / Mutate / Call / Inspect"]
+    rnd["<b>render()</b><br/>SQL string + params"]
+    be["<b>Backend::execute()</b><br/>one transaction"]
+    db[("Database")]
+    enc["<b>Adapter</b><br/>encodes QueryResult or Error"]
+    resp(["HTTP / MCP response"])
+
+    req --> adp --> ar --> plan --> ap --> rnd --> be --> db
+    sc --> plan
+    be --> enc --> resp
 ```
 
 ### Lifecycle of a GET, step by step
@@ -76,7 +82,9 @@ Trace of `GET /api/public/users?select=id,name&age=gte.18&order=id.asc`:
    `RoutingConfig`. With `schema_in_path = true` and prefix `api`, the path
    `/api/{schema}/{target}` matches; `schema = "public"`, `target = "users"`
    ([routing.rs](../crates/pgvis-router/src/routing.rs)).
-2. **Build `ApiRequest`.** `build_api_request` parses query params and headers:
+2. **Authenticate, then build `ApiRequest`.** `verify_jwt` runs first, so an
+   unauthenticated request never reaches the planner. `build_api_request`
+   then parses query params and headers:
    `select=` via `query_params::parse_select`, `age=gte.18` via
    `query_params::parse_filter`, `order=` via `query_params::parse_order`, the
    `Prefer` header via `Preferences::parse`. The result is an adapter-agnostic
@@ -90,14 +98,19 @@ Trace of `GET /api/public/users?select=id,name&age=gte.18&order=id.asc`:
    then `wrap_cte` wraps it so the result is a single row with `body` /
    `page_total` (+ GUC columns on Postgres). Parameters are pushed positionally
    (`$1` Postgres, `?` SQLite) ([query/mod.rs](../crates/pgvis-core/src/query/mod.rs)).
+   If the optional data cache holds this read, the response is served from it
+   here ([09-data-cache.md](09-data-cache.md)).
 5. **Execute.** `Backend::execute` runs the statement on a pooled connection
    ([pgvis-postgres/src/lib.rs](../crates/pgvis-postgres/src/lib.rs) →
-   [execute.rs](../crates/pgvis-postgres/src/execute.rs)). For Postgres this is
-   implemented: it opens a transaction, applies `ExecContext` (`SET LOCAL role`
-   / `request.jwt.claims` / `statement_timeout` / pre-request), binds parameters
-   via the text protocol, runs the CTE-wrapped statement, and decodes the single
-   result row into `QueryResult`. The MCP surface executes the same way:
-   `McpServer` holds an `Arc<dyn Backend>` and runs render + execute end-to-end.
+   [execute.rs](../crates/pgvis-postgres/src/execute.rs)). On Postgres, BEGIN,
+   one batched `SELECT set_config(...)` (role, `request.jwt.claims`,
+   `statement_timeout`), the optional pre-request call and the CTE-wrapped
+   statement go out as one pipelined flight, followed by COMMIT or ROLLBACK;
+   parameters are bound via the text protocol and the single result row is
+   decoded into `QueryResult` (see
+   [03-backends-and-dialects.md](03-backends-and-dialects.md)). The MCP surface
+   executes the same way: `McpServer` holds an `Arc<dyn Backend>` and runs
+   render + execute end-to-end.
 6. **Respond.** The adapter maps `QueryResult` (or an `Error` via its
    `http_status()` / `PGRST*` code) to an HTTP response or an MCP tool result.
 
