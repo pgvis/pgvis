@@ -359,4 +359,24 @@ pub trait Backend: Send + Sync + 'static {
     /// - Postgres backends return [`&POSTGRES`](crate::dialect::POSTGRES)
     /// - SQLite backends return [`&SQLITE`](crate::dialect::SQLITE)
     fn dialect(&self) -> &'static Dialect;
+
+    /// A snapshot of the connection pool requests run on, for monitoring.
+    /// `None` when the backend has no such pool.
+    fn pool_status(&self) -> Option<PoolStatus> {
+        None
+    }
+}
+
+/// Connection-pool occupancy, as reported by [`Backend::pool_status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct PoolStatus {
+    /// The most connections the pool will open.
+    pub max_size: usize,
+    /// Connections currently open (idle or checked out).
+    pub size: usize,
+    /// Idle connections ready to be checked out.
+    pub available: usize,
+    /// Requests waiting for a connection. Persistently above zero means the
+    /// pool is too small for the load (or connections are held too long).
+    pub waiting: usize,
 }

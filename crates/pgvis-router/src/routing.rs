@@ -631,6 +631,13 @@ async fn handle_rpc_no_schema(
 
 /// Root endpoint handler — returns available schemas or the OpenAPI spec.
 async fn handle_root(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    // The OpenAPI spec and schema list describe every exposed table and
+    // function: authenticate like the data API, so an anonymous caller can't
+    // enumerate them on a deployment that requires auth.
+    if let Err(resp) = verify_jwt(&headers, &state.config) {
+        return resp;
+    }
+
     // Check if the client accepts OpenAPI JSON
     let accept = headers
         .get("accept")
@@ -697,11 +704,16 @@ async fn handle_root(State(state): State<AppState>, headers: HeaderMap) -> Respo
     }
 }
 
-/// Cache info endpoint — returns cache stats and current settings.
+/// Cache info endpoint — returns cache stats, current settings and pool status.
 ///
-/// `GET /pgvis/cache` → JSON with stats (hits, misses, hit_rate, entries, invalidations)
-/// and current settings (enabled, ttl_seconds, max_entries, cache_lists).
-async fn handle_cache_info(State(state): State<AppState>) -> Response {
+/// `GET /pgvis/cache` → JSON with stats (hits, misses, hit_rate, entries, invalidations),
+/// current settings (enabled, ttl_seconds, max_entries, cache_lists) and the
+/// connection pool's occupancy (`pool`: max_size, size, available, waiting).
+/// Authenticated like the data API.
+async fn handle_cache_info(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = verify_jwt(&headers, &state.config) {
+        return resp;
+    }
     let settings = serde_json::json!({
         "enabled": state.config.cache.enabled,
         "ttl_seconds": state.config.cache.ttl_seconds,
@@ -714,6 +726,7 @@ async fn handle_cache_info(State(state): State<AppState>) -> Response {
     let body = serde_json::json!({
         "settings": settings,
         "stats": stats,
+        "pool": state.backend.pool_status(),
     });
 
     (StatusCode::OK, Json(body)).into_response()

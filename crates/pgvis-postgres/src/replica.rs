@@ -177,11 +177,27 @@ impl PgReplicaBackend {
         let reader_count = readers.len() as u32;
         let health = Arc::new(HealthState::new(reader_count));
 
-        // Spawn the health monitor
+        // The health monitor probes over its own one-connection pools with
+        // short timeouts. Probing through the request pools made a saturated
+        // replica look unreachable and excluded it, piling its load onto the
+        // remaining readers.
+        let probe_ms = config.health_check_interval_ms.clamp(500, 5000);
+        let probe_cfg = PoolConfig {
+            size: 1,
+            timeout_ms: probe_ms,
+            create_timeout_ms: probe_ms,
+            recycle_timeout_ms: probe_ms,
+            ..pool_cfg.clone()
+        };
+        let monitor_primary = crate::create_pool(primary_dsn, &probe_cfg)?;
+        let mut monitor_readers = config.replica_dsns[..replica_count]
+            .iter()
+            .map(|dsn| crate::create_pool(dsn, &probe_cfg))
+            .collect::<Result<Vec<_>, _>>()?;
+        if config.primary_reads {
+            monitor_readers.push(monitor_primary.clone());
+        }
         let monitor_health = health.clone();
-        let monitor_primary = primary.clone();
-        // Clone the reader pools for the monitor (it needs separate pool refs)
-        let monitor_readers: Vec<Pool> = readers.clone();
         let monitor_config = config.clone();
         let monitor_replica_count = replica_count;
 
@@ -192,6 +208,7 @@ impl PgReplicaBackend {
                 monitor_replica_count,
                 monitor_health,
                 monitor_config,
+                Duration::from_millis(probe_ms),
             )
             .await;
         });
@@ -202,6 +219,12 @@ impl PgReplicaBackend {
             health,
             _monitor_handle: monitor_handle,
         })
+    }
+
+    /// How many readers are currently eligible for reads (reachable, and
+    /// within the replication-lag limit), as of the last health check.
+    pub fn eligible_readers(&self) -> u32 {
+        self.health.eligible.load(Ordering::Relaxed).count_ones()
     }
 
     /// Pick a reader pool for a read query, returning its reader index.
@@ -284,6 +307,12 @@ impl Backend for PgReplicaBackend {
     fn dialect(&self) -> &'static Dialect {
         &dialect::POSTGRES
     }
+
+    /// The primary's pool: it takes every write (and reads when no reader is
+    /// eligible). See [`PgReplicaBackend::eligible_readers`] for read health.
+    fn pool_status(&self) -> Option<pgvis_core::backend::PoolStatus> {
+        Some(crate::pool_status(&self.primary))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +326,7 @@ async fn health_monitor_loop(
     replica_count: usize,
     health: Arc<HealthState>,
     config: ReplicaConfig,
+    probe_timeout: Duration,
 ) {
     let interval = Duration::from_millis(config.health_check_interval_ms);
     let lag_disabled = config.max_replication_lag_bytes == 0;
@@ -313,7 +343,10 @@ async fn health_monitor_loop(
         let primary_lsn = if lag_disabled {
             None
         } else {
-            match get_primary_lsn(&primary).await {
+            let lsn = tokio::time::timeout(probe_timeout, get_primary_lsn(&primary))
+                .await
+                .unwrap_or_else(|_| Err("timed out".to_string()));
+            match lsn {
                 Ok(lsn) => Some(lsn),
                 Err(e) => {
                     tracing::error!(
@@ -326,15 +359,25 @@ async fn health_monitor_loop(
             }
         };
 
-        // Check each reader
-        for (i, pool) in readers.iter().enumerate() {
+        // Check every replica at once, each against a deadline, so one
+        // black-holed host can't stall the others' checks. When primary_lsn
+        // is None (lag checking disabled OR primary unreachable),
+        // check_replica only verifies connectivity.
+        let checks = readers[..replica_count].iter().map(|pool| async {
+            tokio::time::timeout(
+                probe_timeout,
+                check_replica(pool, primary_lsn, config.max_replication_lag_bytes),
+            )
+            .await
+            .unwrap_or_else(|_| ReplicaStatus::Unreachable("health check timed out".into()))
+        });
+        let mut statuses = futures::future::join_all(checks).await.into_iter();
+
+        for i in 0..readers.len() {
             let is_replica = i < replica_count;
 
             if is_replica {
-                // Check replica health and lag. When primary_lsn is None (lag
-                // checking disabled OR primary unreachable), check_replica only
-                // verifies connectivity.
-                match check_replica(pool, primary_lsn, config.max_replication_lag_bytes).await {
+                match statuses.next().expect("one status per replica") {
                     ReplicaStatus::Healthy => {
                         eligible |= 1u64 << i;
                     }

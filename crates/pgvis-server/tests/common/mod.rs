@@ -39,11 +39,21 @@ impl PgvisServer {
     ///
     /// The caller must ensure the test schema is already loaded in the DB.
     pub async fn start(dsn: &str, schema: &str) -> Self {
+        let config = pgvis_core::Config {
+            schemas: vec![schema.to_string()],
+            ..Default::default()
+        };
+        Self::start_with_config(dsn, config).await
+    }
+
+    /// Start a pgvis server in-process on a random port with the given config.
+    #[allow(dead_code)] // not every test binary uses it
+    pub async fn start_with_config(dsn: &str, config: pgvis_core::Config) -> Self {
         let port = free_port();
         let bind_addr = format!("127.0.0.1:{port}");
 
         let router = pgvis_lib::Builder::new(dsn)
-            .schemas(vec![schema.to_string()])
+            .config(config)
             .build()
             .await
             .expect("failed to build pgvis router");

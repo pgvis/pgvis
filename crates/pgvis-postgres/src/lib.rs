@@ -129,6 +129,21 @@ impl Backend for PgBackend {
     fn dialect(&self) -> &'static Dialect {
         &dialect::POSTGRES
     }
+
+    fn pool_status(&self) -> Option<pgvis_core::backend::PoolStatus> {
+        Some(pool_status(&self.pool))
+    }
+}
+
+/// [`PoolStatus`](pgvis_core::backend::PoolStatus) of a deadpool pool.
+pub(crate) fn pool_status(pool: &Pool) -> pgvis_core::backend::PoolStatus {
+    let s = pool.status();
+    pgvis_core::backend::PoolStatus {
+        max_size: s.max_size,
+        size: s.size,
+        available: s.available,
+        waiting: s.waiting,
+    }
 }
 
 // ---------------------------------------------------------------------------
