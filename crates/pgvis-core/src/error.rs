@@ -365,6 +365,15 @@ impl Error {
         }
     }
 
+    /// Create a parse error for a request body the operation can't apply.
+    pub fn invalid_body(message: impl Into<String>) -> Self {
+        Self::Parse {
+            message: message.into(),
+            detail: None,
+            code: ErrorCode::InvalidBody,
+        }
+    }
+
     /// Create a plan error for an ambiguous relationship.
     pub fn ambiguous_relationship(source: &str, target: &str, constraint_names: &[&str]) -> Self {
         Self::Plan {

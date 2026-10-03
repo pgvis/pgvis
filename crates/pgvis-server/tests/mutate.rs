@@ -128,6 +128,41 @@ async fn get(path: &str) -> reqwest::Response {
 }
 
 // ============================================================================
+// Body validation (before anything is rendered or executed)
+// ============================================================================
+
+#[tokio::test]
+async fn test_unknown_payload_column_is_rejected() {
+    let resp = post("/api/test/items", json!({ "name": "x", "price": 1, "nope": 1 })).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "PGRST204");
+}
+
+#[tokio::test]
+async fn test_malformed_bodies_are_rejected_not_defaulted() {
+    // `[]` and a bare scalar used to insert a row of column defaults.
+    for body in [json!([]), json!([{}]), json!(5), json!("x"), json!([{"name": "a"}, 7])] {
+        let resp = post("/api/test/items", body.clone()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "POST {body}");
+    }
+    // `PATCH {}` rendered `SET` with nothing after it (a 500); an array
+    // updated every column from the first element only.
+    for body in [json!({}), json!([{"name": "a"}, {"price": 2}])] {
+        let resp = patch("/api/test/items?id=eq.1", body.clone()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "PATCH {body}");
+    }
+}
+
+#[tokio::test]
+async fn test_bulk_insert_over_the_bind_parameter_limit_is_a_400() {
+    // 33k rows x 2 columns > 65535 params: used to fail as a 500.
+    let rows: Vec<_> = (0..33_000).map(|i| json!({ "name": format!("n{i}"), "price": 1 })).collect();
+    let resp = post("/api/test/items", json!(rows)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ============================================================================
 // INSERT (POST)
 // ============================================================================
 

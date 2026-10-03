@@ -224,6 +224,7 @@ fn plan_mutate(
     let mutation = match request.method {
         RequestMethod::Post => {
             let payload_columns = extract_payload_columns(&request.body);
+            validate_payload(request.method, &request.body, table, &payload_columns)?;
             let is_bulk = matches!(&request.body, Some(RequestBody::Bulk(_)));
             // Determine the conflict target. An explicit `on_conflict=` param wins;
             // otherwise, when the client asked for upsert semantics via
@@ -259,6 +260,7 @@ fn plan_mutate(
         }
         RequestMethod::Patch | RequestMethod::Put => {
             let payload_columns = extract_payload_columns(&request.body);
+            validate_payload(request.method, &request.body, table, &payload_columns)?;
             MutationType::Update { payload_columns }
         }
         RequestMethod::Delete => MutationType::Delete,
@@ -419,6 +421,57 @@ fn extract_payload_columns(body: &Option<RequestBody>) -> Vec<String> {
         Some(RequestBody::Raw(_)) => Vec::new(),
         None => Vec::new(),
     }
+}
+
+/// Postgres accepts at most this many bind parameters in one statement.
+const MAX_BIND_PARAMS: usize = 65_535;
+
+/// Reject a body a mutation can't faithfully apply, before anything is rendered.
+///
+/// Without this, unknown keys reached the renderer (multiplied across a bulk
+/// insert, enough to exhaust memory before the database saw a thing, even
+/// for a role without INSERT), a non-object or empty body inserted a row of
+/// defaults, an oversized bulk insert failed with a 500, and `PATCH {}`
+/// rendered `SET` with nothing after it.
+fn validate_payload(
+    method: RequestMethod,
+    body: &Option<RequestBody>,
+    table: &crate::cache::Table,
+    columns: &[String],
+) -> Result<(), Error> {
+    let rows: Vec<&serde_json::Value> = match body {
+        Some(RequestBody::Single(v)) => vec![v],
+        Some(RequestBody::Bulk(rows)) => rows.iter().collect(),
+        Some(RequestBody::Raw(_)) | None => return Ok(()),
+    };
+    if rows.iter().any(|v| !v.is_object()) {
+        return Err(Error::invalid_body(
+            "the body must be a JSON object or an array of objects",
+        ));
+    }
+    for column in columns {
+        resolve::resolve_column(table, column)?;
+    }
+    let is_bulk = matches!(body, Some(RequestBody::Bulk(_)));
+    if method == RequestMethod::Post {
+        if is_bulk && columns.is_empty() {
+            return Err(Error::invalid_body("nothing to insert: no rows with columns"));
+        }
+        if rows.len().saturating_mul(columns.len()) > MAX_BIND_PARAMS {
+            return Err(Error::invalid_body(format!(
+                "too many values for one insert (rows x columns over {MAX_BIND_PARAMS}); \
+                 split the request"
+            )));
+        }
+    } else {
+        if is_bulk {
+            return Err(Error::invalid_body("an update takes one object, not an array"));
+        }
+        if columns.is_empty() {
+            return Err(Error::invalid_body("nothing to update: the body has no columns"));
+        }
+    }
+    Ok(())
 }
 
 /// Resolve RPC call parameters from the routine signature and request body.

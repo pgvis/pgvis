@@ -187,7 +187,7 @@ impl AppState {
             pre_request: self.config.pre_request.clone(),
             statement_timeout: self.config.statement_timeout_ms,
             tx_end: None,
-            is_mutation: matches!(plan, ActionPlan::Mutate(_)),
+            is_mutation: plan_writes(&plan),
         };
 
         let result = self.backend.execute(&exec_ctx, &sql, &params).await?;
@@ -804,6 +804,18 @@ async fn dispatch_request(
         return (StatusCode::NOT_IMPLEMENTED, Json(resp)).into_response();
     }
 
+    // GET/HEAD must have no side effects: a link, a crawler or an <img> could
+    // otherwise run a volatile function and commit its writes.
+    if matches!(method, RequestMethod::Get | RequestMethod::Head) && plan_writes(&plan) {
+        let resp = serde_json::json!({
+            "code": "PGRST101",
+            "message": "Cannot call a volatile function with GET or HEAD; use POST",
+            "details": null,
+            "hint": null,
+        });
+        return (StatusCode::METHOD_NOT_ALLOWED, Json(resp)).into_response();
+    }
+
     // 3. Render the plan to SQL + parameters
     //    Postgres: uses CTE wrapper for single-row JSON response + GUC headers
     //    SQLite: uses raw SQL — Rust-side JSON assembly in execute module
@@ -821,10 +833,11 @@ async fn dispatch_request(
         }
     };
 
-    tracing::debug!(sql = %sql, params = ?params_vec, "executing query");
+    // Parameter values are request data (passwords, tokens, PII): log the count.
+    tracing::debug!(sql = %sql, params = params_vec.len(), "executing query");
 
     // 4. Build ExecContext (JWT already verified above, before planning).
-    let is_mutation = matches!(&plan, ActionPlan::Mutate(_));
+    let is_mutation = plan_writes(&plan);
     let exec_ctx = build_exec_context(&state.config, &auth, &preferences, is_mutation);
 
     // 4b. Data cache: compute key and check for cache hit (reads only).
@@ -1551,6 +1564,20 @@ fn resolve_schema_from_headers(headers: &HeaderMap, config: &Config) -> String {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_else(|| config.routing.default_schema.clone())
+}
+
+/// Whether executing `plan` can write: a mutation, or a call to a volatile
+/// function. Writes must reach the primary (never a read replica), and are
+/// refused on GET/HEAD.
+fn plan_writes(plan: &ActionPlan) -> bool {
+    match plan {
+        ActionPlan::Mutate(_) => true,
+        ActionPlan::Call(call) => matches!(
+            call.function_info.volatility,
+            pgvis_core::cache::Volatility::Volatile
+        ),
+        _ => false,
+    }
 }
 
 /// Convert an axum HTTP method to our [`RequestMethod`].

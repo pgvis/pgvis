@@ -275,6 +275,16 @@ async fn test_rpc_get_single_item() {
 // ============================================================================
 
 #[tokio::test]
+async fn test_get_on_a_volatile_function_is_405() {
+    // A link, crawler or <img> must not be able to run a volatile function.
+    let resp = rpc_get("void_function").await;
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    // Stable functions stay callable with GET.
+    let resp = rpc_get_params("add", "a=1&b=2").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn test_rpc_void_function() {
     let resp = rpc_post("void_function", json!({})).await;
     let status = resp.status();
