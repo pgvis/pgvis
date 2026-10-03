@@ -24,6 +24,7 @@ pub mod execute;
 pub mod introspect;
 pub mod pubsub;
 pub mod replica;
+mod schema_watch;
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -52,6 +53,8 @@ pub use replica::PgReplicaBackend;
 /// - `dialect()` — returns [`POSTGRES`](pgvis_core::dialect::POSTGRES)
 pub struct PgBackend {
     pool: Pool,
+    /// For the schema-change listener's own connection.
+    dsn: String,
 }
 
 impl PgBackend {
@@ -77,7 +80,10 @@ impl PgBackend {
     /// ```
     pub fn new(dsn: &str, pool_cfg: &pgvis_core::config::PoolConfig) -> Result<Self, Error> {
         let pool = create_pool(dsn, pool_cfg)?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            dsn: dsn.to_string(),
+        })
     }
 
     /// Get a reference to the underlying connection pool.
@@ -119,11 +125,10 @@ impl Backend for PgBackend {
         })
     }
 
+    /// `LISTEN pgrst` on a dedicated connection (PostgREST's convention).
     fn watch_schema(&self) -> BoxFuture<'_, Option<SchemaChangeStream>> {
-        Box::pin(async {
-            // TODO: Implement LISTEN/NOTIFY for schema change detection
-            None
-        })
+        let dsn = self.dsn.clone();
+        Box::pin(async move { Some(schema_watch::watch(dsn)) })
     }
 
     fn dialect(&self) -> &'static Dialect {

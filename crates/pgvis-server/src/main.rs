@@ -201,9 +201,27 @@ async fn main() -> anyhow::Result<()> {
 
             let components = builder.build_components().await?;
 
+            // SIGUSR1 reloads the schema cache (as PostgREST does).
+            #[cfg(unix)]
+            {
+                let reloader = components.reloader.clone();
+                let mut usr1 = tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::user_defined1(),
+                )?;
+                tokio::spawn(async move {
+                    while usr1.recv().await.is_some() {
+                        tracing::info!("SIGUSR1: reloading the schema cache");
+                        reloader.reload();
+                    }
+                });
+            }
+
             let listener = tokio::net::TcpListener::bind(&bind).await?;
             tracing::info!("listening on {bind}");
-            axum::serve(listener, components.router).await?;
+            // Finish in-flight requests on SIGTERM / Ctrl-C instead of cutting them off.
+            axum::serve(listener, components.router)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
         }
 
         #[cfg(feature = "mcp")]
@@ -326,6 +344,29 @@ fn read_strict_config(path: &std::path::Path) -> anyhow::Result<String> {
         );
     }
     Ok(text)
+}
+
+/// Resolves on Ctrl-C or (on Unix) SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                sigterm.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
+    tracing::info!("shutdown requested: finishing in-flight requests");
 }
 
 /// The DSN with any password replaced, for logging.

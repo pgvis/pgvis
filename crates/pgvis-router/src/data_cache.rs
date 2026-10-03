@@ -131,6 +131,9 @@ pub struct DataCache {
     table_generations: RwLock<HashMap<String, u64>>,
     /// Global generation counter — bumped by volatile RPCs that can affect anything.
     global_generation: AtomicU64,
+    /// `built_at` (ns) of the schema cache the stored entries were made
+    /// against; see [`DataCache::sync_schema`].
+    schema_stamp: AtomicU64,
     /// Atomic stats counters.
     stat_hits: AtomicU64,
     stat_misses: AtomicU64,
@@ -150,6 +153,7 @@ impl DataCache {
             cache_lists: config.cache_lists,
             table_generations: RwLock::new(HashMap::new()),
             global_generation: AtomicU64::new(0),
+            schema_stamp: AtomicU64::new(0),
             stat_hits: AtomicU64::new(0),
             stat_misses: AtomicU64::new(0),
             stat_invalidations: AtomicU64::new(0),
@@ -268,6 +272,19 @@ impl DataCache {
         };
 
         self.store.insert(entry);
+    }
+
+    /// Invalidate every entry when the schema cache has been rebuilt (after
+    /// DDL, a cached response may no longer match the table). Called with the
+    /// current schema's `built_at` before each lookup; one atomic swap when
+    /// nothing changed.
+    pub fn sync_schema(&self, built_at: Option<std::time::SystemTime>) {
+        let stamp = built_at
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos() as u64);
+        if self.schema_stamp.swap(stamp, Ordering::Relaxed) != stamp {
+            self.invalidate_all();
+        }
     }
 
     /// Invalidate all cached entries (for volatile RPCs that can affect anything).

@@ -1825,6 +1825,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "axum",
+ "futures",
  "pgvis-core",
  "pgvis-mcp",
  "pgvis-postgres",

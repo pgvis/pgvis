@@ -118,6 +118,8 @@ fn nth_set_bit(mut bits: u64, n: u32) -> u32 {
 pub struct PgReplicaBackend {
     /// The primary connection pool (writes always go here).
     primary: Pool,
+    /// For the schema-change listener's own connection.
+    primary_dsn: String,
     /// All reader pools in order: replicas first, then optionally primary.
     readers: Vec<Pool>,
     /// Shared health state for routing decisions.
@@ -215,6 +217,7 @@ impl PgReplicaBackend {
 
         Ok(Self {
             primary,
+            primary_dsn: primary_dsn.to_string(),
             readers,
             health,
             _monitor_handle: monitor_handle,
@@ -299,9 +302,10 @@ impl Backend for PgReplicaBackend {
         })
     }
 
+    /// Schema changes are made on (and announced from) the primary.
     fn watch_schema(&self) -> BoxFuture<'_, Option<SchemaChangeStream>> {
-        // Delegate to primary (same as PgBackend)
-        Box::pin(async { None })
+        let dsn = self.primary_dsn.clone();
+        Box::pin(async move { Some(crate::schema_watch::watch(dsn)) })
     }
 
     fn dialect(&self) -> &'static Dialect {

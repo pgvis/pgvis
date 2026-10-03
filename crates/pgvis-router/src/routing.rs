@@ -880,6 +880,7 @@ async fn dispatch_request(
         None
     } else if let ActionPlan::Read(ref read_plan) = plan {
         state.data_cache.as_ref().and_then(|dc| {
+            dc.sync_schema(cache.built_at);
             dc.compute_key(
                 read_plan,
                 &sql,

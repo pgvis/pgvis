@@ -18,6 +18,7 @@ pgvis-router = { path = "../pgvis-router" }
 pgvis-mcp = { path = "../pgvis-mcp", optional = true }
 axum.workspace = true
 tokio.workspace = true
+futures.workspace = true
 arc-swap.workspace = true
 tracing.workspace = true
 

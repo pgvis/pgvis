@@ -116,9 +116,23 @@ in [08-future-scope.md](08-future-scope.md).
 ## Hot reload
 
 `Backend::watch_schema()` ([03-backends-and-dialects.md](03-backends-and-dialects.md))
-is the push channel: on Postgres it is intended to be driven by `LISTEN/NOTIFY`
-on a dedicated connection (currently returns `None` — TODO). The reload sequence
-is: receive signal → `introspect()` → build a new `SchemaCache` →
-`ArcSwap::store`. Because surfaces use wildcard routes and read the cache
-snapshot per request, no routes, OpenAPI document, or MCP tool list need to be
-rebuilt structurally — they reflect the new cache on the next request.
+is the push channel. On Postgres it is `LISTEN pgrst` on a dedicated connection
+([schema_watch.rs](../crates/pgvis-postgres/src/schema_watch.rs)), following
+PostgREST: `NOTIFY pgrst, 'reload schema'` (or an empty payload) from a
+migration or a DDL event trigger asks every instance to reload. After a
+reconnect it reports one change, in case a notification was missed. SQLite has
+no push channel.
+
+[`SchemaReloader`](../crates/pgvis-lib/src/reload.rs) (spawned by the
+`Builder`, exposed as `Components::reloader`, and usable on its own by
+embedders) runs the sequence: change notification or `reload()` → debounce
+(200 ms, so a migration's burst of DDL reloads once) → `introspect()` →
+`ArcSwap::store`. A failed introspection keeps the current cache.
+`reload_now()` reloads and waits, e.g. right after running migrations; the
+`pgvis` binary also reloads on `SIGUSR1`.
+
+Because surfaces use wildcard routes and read the cache snapshot per request,
+no routes, OpenAPI document, or MCP tool list need to be rebuilt structurally —
+they reflect the new cache on the next request. The data cache notices the new
+`SchemaCache::built_at` and invalidates every entry, so no response cached
+against the old schema is served.
