@@ -24,6 +24,7 @@
   --color-text-dim: #64748b;
   --color-border: #1f1f3d;
   --color-border-strong: #2d2d5a;
+  --font-brand: "Geist", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --font-mono: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, monospace;
   --radius: 12px;
@@ -33,6 +34,7 @@
 }
 
 html {
+  color-scheme: dark;
   scroll-behavior: smooth;
   -webkit-text-size-adjust: 100%;
 }
@@ -68,7 +70,7 @@ pre {
 
 /* ── Header ─────────────────────────────────────────────────────────── */
 
-header {
+body > header {
   position: sticky;
   top: 0;
   z-index: 50;
@@ -78,7 +80,7 @@ header {
   border-bottom: 1px solid var(--color-border);
 }
 
-header nav {
+body > header nav {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -90,16 +92,25 @@ header nav {
 .logo {
   display: inline-flex;
   align-items: center;
-  gap: 0.7rem;
-  font-size: 1.5rem;
-  font-weight: 700;
-  color: var(--color-text-strong);
-  letter-spacing: -0.02em;
+  gap: 0.55rem;
 }
 
 .logo img {
-  width: 40px;
-  height: 40px;
+  width: 34px;
+  height: 34px;
+}
+
+.wordmark {
+  font-family: var(--font-brand);
+  font-weight: 700;
+  font-size: 1.5rem;
+  line-height: 1;
+  letter-spacing: -0.03em;
+  color: #f5f2eb;
+}
+
+.wordmark .vis {
+  color: #a78bfa;
 }
 
 .nav-links {
@@ -322,7 +333,7 @@ header nav {
 
 .feature-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  grid-template-columns: repeat(4, 1fr);
   gap: 1.25rem;
 }
 
@@ -331,7 +342,7 @@ header nav {
   background: linear-gradient(180deg, var(--color-bg-secondary), var(--color-bg-elev));
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
-  padding: 1.75rem;
+  padding: 1.5rem;
   transition: border-color 0.2s, transform 0.2s, box-shadow 0.2s;
   box-shadow: var(--shadow-card);
 }
@@ -395,8 +406,20 @@ header nav {
   color: #7dd3fc;
 }
 
+.icon-bolt {
+  background: rgba(250, 204, 21, 0.1);
+  border-color: rgba(250, 204, 21, 0.25);
+  color: #fde68a;
+}
+
+.icon-live {
+  background: rgba(34, 211, 238, 0.1);
+  border-color: rgba(34, 211, 238, 0.25);
+  color: #67e8f9;
+}
+
 .feature h3 {
-  font-size: 1.15rem;
+  font-size: 1.05rem;
   font-weight: 700;
   color: var(--color-text-strong);
   margin-bottom: 0.5rem;
@@ -405,8 +428,8 @@ header nav {
 
 .feature p {
   color: var(--color-text-muted);
-  line-height: 1.65;
-  font-size: 0.95rem;
+  line-height: 1.6;
+  font-size: 0.9rem;
 }
 
 .feature code,
@@ -427,8 +450,12 @@ header nav {
 
 .code-tabs {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 1.25rem;
+}
+
+.code-tabs .code-block:first-child {
+  grid-column: 1 / -1;
 }
 
 .code-block {
@@ -477,7 +504,7 @@ header nav {
 
 .why-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  grid-template-columns: repeat(4, 1fr);
   gap: 1.25rem;
 }
 
@@ -591,11 +618,12 @@ footer {
 .footer-brand {
   display: inline-flex;
   align-items: center;
-  gap: 0.55rem;
-  font-weight: 700;
-  color: var(--color-text-strong);
-  font-size: 1.05rem;
-  margin-bottom: 0.5rem;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.footer-brand .wordmark {
+  font-size: 1.2rem;
 }
 
 .footer-col p {
@@ -606,15 +634,24 @@ footer {
 }
 
 .footer-bottom {
+  position: relative;
   display: flex;
   justify-content: space-between;
   align-items: center;
   flex-wrap: wrap;
   gap: 1rem;
   padding-top: 1.5rem;
-  border-top: 1px solid var(--color-border);
   font-size: 0.85rem;
   color: var(--color-text-dim);
+}
+
+.footer-bottom::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 1.5rem;
+  right: 1.5rem;
+  border-top: 1px solid var(--color-border);
 }
 
 .footer-github {
@@ -689,6 +726,8 @@ footer {
 
 .vision-milestone-head {
   display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
   justify-content: space-between;
   align-items: center;
   margin-bottom: 0.75rem;
@@ -699,18 +738,19 @@ footer {
   font-size: 0.78rem;
   color: var(--color-text-strong);
   text-transform: uppercase;
-  letter-spacing: 0.12em;
-  padding: 0.3rem 0.7rem;
+  letter-spacing: 0.08em;
+  padding: 0.3rem 0.6rem;
   border-radius: 6px;
   background: rgba(99, 102, 241, 0.12);
   border: 1px solid rgba(99, 102, 241, 0.25);
 }
 
 .vision-milestone-status {
-  font-size: 0.7rem;
+  font-size: 0.68rem;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
   padding: 0.2rem 0.55rem;
   border-radius: 999px;
   font-family: var(--font-mono);
@@ -867,6 +907,13 @@ footer {
 
 /* ── Responsive ────────────────────────────────────────────────────── */
 
+@media (max-width: 1080px) {
+  .feature-grid,
+  .why-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
 @media (max-width: 900px) {
   .footer-grid {
     grid-template-columns: 1fr 1fr;
@@ -879,7 +926,7 @@ footer {
     padding: 3rem 0 2rem;
   }
 
-  header nav {
+  body > header nav {
     padding: 0.85rem 1.25rem;
   }
 
@@ -895,6 +942,10 @@ footer {
   .code-tabs,
   .why-grid {
     grid-template-columns: 1fr;
+  }
+
+  .engine-diagram-wrap {
+    padding: 0.5rem;
   }
 
   .hero-meta {

@@ -13,10 +13,7 @@ export default defineConfig({
       title: "pgvis",
       description:
         "Turn any Postgres database into MCP tools, a PostgREST-compatible REST API, and an OpenAPI 3.0 spec — from one I/O-free Rust engine.",
-      logo: {
-        src: "./src/assets/app-icon-indigo.svg",
-        replacesTitle: false,
-      },
+      favicon: "/app-icon-indigo.svg",
       social: [
         {
           icon: "github",
@@ -45,6 +42,7 @@ export default defineConfig({
       customCss: ["./src/styles/custom.css"],
       components: {
         Footer: "./src/components/Footer.astro",
+        SiteTitle: "./src/components/SiteTitle.astro",
       },
       head: [
         {
@@ -59,9 +57,19 @@ export default defineConfig({
               "pgvis, PostgREST alternative, MCP server, Model Context Protocol, Postgres REST API, OpenAPI 3.0, Rust database API, embeddable database API, LLM database tools",
           },
         },
+        { tag: "meta", attrs: { property: "og:image", content: `${SITE}/og-image.png` } },
+        { tag: "meta", attrs: { property: "og:image:width", content: "1200" } },
+        { tag: "meta", attrs: { property: "og:image:height", content: "630" } },
+        { tag: "meta", attrs: { name: "twitter:card", content: "summary_large_image" } },
+        { tag: "meta", attrs: { name: "twitter:image", content: `${SITE}/og-image.png` } },
+        { tag: "link", attrs: { rel: "preconnect", href: "https://fonts.googleapis.com" } },
+        { tag: "link", attrs: { rel: "preconnect", href: "https://fonts.gstatic.com", crossorigin: true } },
         {
           tag: "link",
-          attrs: { rel: "icon", type: "image/svg+xml", href: "/app-icon-indigo.svg" },
+          attrs: {
+            rel: "stylesheet",
+            href: "https://fonts.googleapis.com/css2?family=Geist:wght@700&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap",
+          },
         },
       ],
     }),

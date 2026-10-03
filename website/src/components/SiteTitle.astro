@@ -1,0 +1,18 @@
+---
+// Docs site title: the same Prism mark + split wordmark as the landing pages.
+const { siteTitleHref } = Astro.locals.starlightRoute;
+---
+
+<a href={siteTitleHref} class="site-title sl-flex" aria-label="pgvis home">
+  <img src="/mark-prism.svg" width="48" height="48" alt="" aria-hidden="true" />
+  <span class="pgvis-wordmark" translate="no">pg<span class="vis">vis</span></span>
+</a>
+
+<style>
+  .site-title {
+    align-items: center;
+    text-decoration: none;
+    white-space: nowrap;
+    min-width: 0;
+  }
+</style>
