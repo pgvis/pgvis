@@ -367,7 +367,7 @@ pub struct PubSubState {
 /// database work runs under, and its key for the per-identity subscriber cap.
 struct Caller {
     ctx: pgvis_core::ExecContext,
-    identity: String,
+    identity: Option<String>,
 }
 
 /// Verify the JWT exactly as the data API does and keep the identity.
@@ -380,13 +380,14 @@ fn authorize_pubsub(
     headers: &axum::http::HeaderMap,
 ) -> Result<Caller, axum::response::Response> {
     let auth = crate::routing::verify_jwt(headers, &state.config)?;
-    // Role + `sub`; unauthenticated callers share their role's identity.
-    let sub = auth.claims.as_ref().and_then(|c| c.get("sub"));
-    let identity = format!(
-        "{}\0{}",
-        auth.role.as_deref().unwrap_or(""),
-        sub.map(|v| v.to_string()).unwrap_or_default()
-    );
+    // Role + `sub`. Callers without a `sub` (anonymous ones) have no identity
+    // to tell apart: sharing one slot pool would cap every anonymous client
+    // together, so they are bounded by `max_subscribers` alone.
+    let identity = auth
+        .claims
+        .as_ref()
+        .and_then(|c| c.get("sub"))
+        .map(|sub| format!("{}\0{sub}", auth.role.as_deref().unwrap_or("")));
     // Pub/sub statements may NOTIFY or call a volatile authorize function, so
     // they are mutations (never routed to a read replica).
     let ctx = crate::routing::build_exec_context(
@@ -433,7 +434,7 @@ pub async fn handle_subscribe(
     }
 
     // Validate and subscribe
-    let rx = match hub.subscribe_as(&channel, Some(&caller.identity)).await {
+    let rx = match hub.subscribe_as(&channel, caller.identity.as_deref()).await {
         Ok(rx) => rx,
         Err(e) => {
             return error_response(&e);
@@ -471,7 +472,7 @@ pub async fn handle_subscribe(
 struct SseSubscription {
     hub: Arc<PubSubHub>,
     channel: String,
-    identity: String,
+    identity: Option<String>,
 }
 
 impl Drop for SseSubscription {
@@ -482,7 +483,7 @@ impl Drop for SseSubscription {
         let channel = std::mem::take(&mut self.channel);
         let identity = std::mem::take(&mut self.identity);
         tokio::spawn(async move {
-            hub.unsubscribe_as(&channel, Some(&identity)).await;
+            hub.unsubscribe_as(&channel, identity.as_deref()).await;
         });
     }
 }
@@ -497,7 +498,7 @@ fn make_sse_stream(
     keepalive_secs: u64,
     hub: Arc<PubSubHub>,
     channel: String,
-    identity: String,
+    identity: Option<String>,
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::convert::Infallible>> {
     let keepalive_interval = std::time::Duration::from_secs(keepalive_secs);
 

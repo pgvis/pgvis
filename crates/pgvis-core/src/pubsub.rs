@@ -247,8 +247,8 @@ pub struct PubSubConfig {
     /// Maximum concurrent SSE subscribers per identity (JWT role + `sub` claim).
     ///
     /// Stops one caller from taking every `max_subscribers` slot. Callers
-    /// without a token share one identity per role (e.g. all anonymous
-    /// clients). `0` disables the per-identity cap.
+    /// without a `sub` claim (e.g. anonymous clients) can't be told apart, so
+    /// only `max_subscribers` bounds them. `0` disables the per-identity cap.
     ///
     /// Default: `100`.
     #[serde(default = "default_max_subscribers_per_identity")]

@@ -393,6 +393,26 @@ async fn subscriber_caps_hold_under_concurrency() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn anonymous_callers_are_bounded_by_the_global_cap_only() {
+    // Anonymous callers carry no `sub`, so they can't be told apart; a
+    // per-identity cap would make every anonymous client share one pool.
+    let mut config = config();
+    config.pubsub.max_subscribers = 5;
+    config.pubsub.max_subscribers_per_identity = 1;
+    let base = start(config).await;
+    let channel = format!("public.{}", unique("anon"));
+
+    let mut streams = Vec::new();
+    for _ in 0..5 {
+        let resp = subscribe(&base, &channel, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        streams.push(resp);
+    }
+    let resp = subscribe(&base, &channel, None).await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
 /// Run futures concurrently on the runtime and collect their outputs in order.
 async fn futures_join_all<F>(futures: impl Iterator<Item = F>) -> Vec<F::Output>
 where

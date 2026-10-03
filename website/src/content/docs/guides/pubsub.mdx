@@ -322,7 +322,7 @@ async fn main() -> anyhow::Result<()> {
 | `allowed_channels` | string[] | `[]` | Channel allowlist (empty = allow all). Supports glob patterns: `chat.*`, `events.*` |
 | `authorize_function` | string | none | SQL function `fn(channel text, op text) returns boolean` that authorizes each subscribe/publish as the caller's role |
 | `max_subscribers` | usize | `1000` | Maximum concurrent SSE subscribers on this instance |
-| `max_subscribers_per_identity` | usize | `100` | Maximum concurrent SSE subscribers per JWT role + `sub` (`0` = no limit) |
+| `max_subscribers_per_identity` | usize | `100` | Maximum concurrent SSE subscribers per JWT role + `sub` (`0` = no limit); callers without `sub` are bounded by `max_subscribers` only |
 
 ### Environment Variables
 
