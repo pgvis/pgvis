@@ -20,6 +20,8 @@ pgvis-lib = { path = "../pgvis-lib" }
 arc-swap.workspace = true
 clap.workspace = true
 figment.workspace = true
+toml.workspace = true
+serde_ignored.workspace = true
 tokio.workspace = true
 axum.workspace = true
 tower.workspace = true

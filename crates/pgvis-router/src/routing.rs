@@ -1256,10 +1256,14 @@ pub(crate) fn verify_jwt(headers: &HeaderMap, config: &Config) -> Result<AuthRes
 
     let mut validation = Validation::new(algorithm);
     validation.validate_exp = true;
-    // PostgREST ignores the `aud` claim unless `jwt-aud` is configured. Disable
-    // aud validation (jsonwebtoken 9 defaults it on), otherwise any token that
-    // carries an `aud` is rejected.
-    validation.validate_aud = false;
+    validation.validate_nbf = true;
+    // PostgREST ignores the `aud` claim unless `jwt-aud` is configured; without
+    // it, disable aud validation (jsonwebtoken 9 defaults it on), otherwise
+    // any token that carries an `aud` is rejected.
+    match &config.jwt_aud {
+        Some(aud) => validation.set_audience(&[aud]),
+        None => validation.validate_aud = false,
+    }
     // Don't require specific claims beyond exp
     validation.required_spec_claims = std::collections::HashSet::new();
 
@@ -1272,9 +1276,23 @@ pub(crate) fn verify_jwt(headers: &HeaderMap, config: &Config) -> Result<AuthRes
                 .and_then(|v| v.as_str())
                 .map(String::from)
                 .or_else(|| config.anon_role.clone());
+            // No role to switch to would run the request as the DSN's own role
+            // (often the table owner). Many IdPs omit a role claim by default.
+            let Some(role) = role else {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "code": "PGRST301",
+                        "message": "JWT has no role claim and no anon_role is configured",
+                        "details": null,
+                        "hint": format!("Add a `{}` claim to the token or set anon_role", config.role_claim_key),
+                    })),
+                )
+                    .into_response());
+            };
 
             Ok(AuthResult {
-                role,
+                role: Some(role),
                 claims: Some(claims),
             })
         }
@@ -1545,5 +1563,83 @@ fn http_method_to_request_method(method: &axum::http::Method) -> RequestMethod {
         axum::http::Method::PUT => RequestMethod::Put,
         axum::http::Method::DELETE => RequestMethod::Delete,
         _ => RequestMethod::Get,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonwebtoken::{EncodingKey, Header, encode};
+
+    const SECRET: &str = "a-test-secret-that-is-long-enough";
+
+    fn config(anon_role: Option<&str>, jwt_aud: Option<&str>) -> Config {
+        Config {
+            jwt_secret: Some(SECRET.into()),
+            anon_role: anon_role.map(String::from),
+            jwt_aud: jwt_aud.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    fn bearer(claims: serde_json::Value) -> HeaderMap {
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(SECRET.as_bytes()),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        headers
+    }
+
+    fn exp() -> i64 {
+        (std::time::SystemTime::now() + std::time::Duration::from_secs(600))
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    #[test]
+    fn a_token_without_a_role_claim_is_refused_rather_than_run_as_the_dsn_role() {
+        let headers = bearer(serde_json::json!({ "sub": "u1", "exp": exp() }));
+        let err = verify_jwt(&headers, &config(None, None)).err().expect("401");
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+
+        // With anon_role configured the request falls back to it, as before.
+        let auth = verify_jwt(&headers, &config(Some("web_anon"), None)).unwrap();
+        assert_eq!(auth.role.as_deref(), Some("web_anon"));
+    }
+
+    #[test]
+    fn a_role_claim_is_used() {
+        let headers = bearer(serde_json::json!({ "role": "app_user", "exp": exp() }));
+        let auth = verify_jwt(&headers, &config(None, None)).unwrap();
+        assert_eq!(auth.role.as_deref(), Some("app_user"));
+    }
+
+    #[test]
+    fn jwt_aud_rejects_tokens_for_another_audience() {
+        let other = bearer(serde_json::json!({ "role": "r", "aud": "other-app", "exp": exp() }));
+        let mine = bearer(serde_json::json!({ "role": "r", "aud": "pgvis", "exp": exp() }));
+        let cfg = config(None, Some("pgvis"));
+        assert!(verify_jwt(&other, &cfg).is_err());
+        assert!(verify_jwt(&mine, &cfg).is_ok());
+        // Unset jwt_aud keeps ignoring `aud`.
+        assert!(verify_jwt(&other, &config(None, None)).is_ok());
+    }
+
+    #[test]
+    fn a_token_not_yet_valid_is_rejected() {
+        let headers = bearer(serde_json::json!({ "role": "r", "nbf": exp(), "exp": exp() + 60 }));
+        assert!(verify_jwt(&headers, &config(None, None)).is_err());
+    }
+
+    #[test]
+    fn without_a_secret_embedders_keep_the_dsn_role() {
+        // In-process embedders (no jwt_secret) do their own auth; unchanged.
+        let auth = verify_jwt(&HeaderMap::new(), &Config::default()).unwrap();
+        assert_eq!(auth.role, None);
     }
 }
