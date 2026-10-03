@@ -167,10 +167,7 @@ fn render_update(
 
     let mut sql = format!("UPDATE {table_ref} SET {}", set_clauses.join(", "));
 
-    // WHERE clause
-    if let Some(wc) =
-        fragment::render_where_clause(&plan.filters, &plan.logic_filters, Some(table_alias), ctx)
-    {
+    if let Some(wc) = render_mutation_where(table_ref, table_alias, plan, ctx) {
         sql.push_str(" WHERE ");
         sql.push_str(&wc);
     }
@@ -192,16 +189,45 @@ fn render_delete(
 
     let mut sql = format!("DELETE FROM {table_ref}");
 
-    // WHERE clause
-    if let Some(wc) =
-        fragment::render_where_clause(&plan.filters, &plan.logic_filters, Some(table_alias), ctx)
-    {
+    if let Some(wc) = render_mutation_where(table_ref, table_alias, plan, ctx) {
         sql.push_str(" WHERE ");
         sql.push_str(&wc);
     }
 
     append_returning(&mut sql, plan, ctx);
     Ok(sql)
+}
+
+/// The WHERE clause of an UPDATE/DELETE. With a client `limit`/`offset`,
+/// the rows are chosen by a subquery on the row identifier, honouring
+/// `order`: `<id> IN (SELECT <id> FROM t WHERE ... ORDER BY ... LIMIT n)`.
+/// (UPDATE/DELETE have no LIMIT of their own; ignoring it changed every
+/// matching row.)
+fn render_mutation_where(
+    table_ref: &str,
+    table_alias: &str,
+    plan: &MutatePlan,
+    ctx: &mut RenderContext<'_>,
+) -> Option<String> {
+    let wc =
+        fragment::render_where_clause(&plan.filters, &plan.logic_filters, Some(table_alias), ctx);
+    let Some(limit_offset) = fragment::render_limit_offset(plan.range.limit, plan.range.offset)
+    else {
+        return wc; // not limited: the plain filter
+    };
+    let id = ctx.dialect.row_identifier;
+    let mut sub = format!("SELECT {id} FROM {table_ref}");
+    if let Some(wc) = wc {
+        sub.push_str(" WHERE ");
+        sub.push_str(&wc);
+    }
+    if let Some(ob) = fragment::render_order_clause(&plan.order, Some(table_alias), ctx) {
+        sub.push_str(" ORDER BY ");
+        sub.push_str(&ob);
+    }
+    sub.push(' ');
+    sub.push_str(&limit_offset);
+    Some(format!("{id} IN ({sub})"))
 }
 
 // ---------------------------------------------------------------------------

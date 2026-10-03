@@ -144,6 +144,19 @@ pub async fn execute_query(
         .and(pre_request.map_err(|e| execution_error("pre-request function failed", &e)))
         .and(main.map_err(|e| execution_error("query execution failed", &e)));
 
+    // Mutation guards (max-affected, singular): checked against the affected
+    // row count before deciding to commit, so a violation rolls back.
+    let result = result.and_then(|rows| {
+        if ctx.max_affected.is_none() && !ctx.single_row {
+            return Ok(rows);
+        }
+        let affected = rows
+            .first()
+            .and_then(|row| row.try_get::<_, Option<i64>>("page_total").ok().flatten())
+            .unwrap_or(0);
+        ctx.check_affected(affected).map(|()| rows)
+    });
+
     // On error, or when the caller asked for `Prefer: tx=rollback`, roll back.
     let rollback = result.is_err() || matches!(ctx.tx_end, Some(TxEnd::Rollback));
     if rollback {
@@ -511,6 +524,8 @@ mod tests {
             tx_end: None,
             is_mutation: false,
             raw_body: false,
+            max_affected: None,
+            single_row: false,
         };
         let settings = collect_guc_settings(&ctx);
         // role must come first so subsequent settings run under the target role.

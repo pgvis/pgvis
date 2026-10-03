@@ -217,8 +217,19 @@ fn plan_mutate(
 
     // Resolve ordering
     let order = resolve::resolve_order(table, &request.order)?;
-    let range = resolve::resolve_range(&request.range, config.max_rows);
+    // Only the client's own limit/offset: `max_rows` caps what a read returns,
+    // and must never silently turn a PATCH/DELETE into a limited one.
+    let range = resolve::resolve_range(&request.range, None);
     let count = resolve_count_strategy(&request.preferences);
+    let limited = range.limit.is_some() || range.offset.is_some();
+    if limited && request.method == RequestMethod::Post {
+        return Err(Error::invalid_filter("limit/offset do not apply to an insert"));
+    }
+    if limited && table_info.is_view {
+        return Err(Error::invalid_filter(
+            "a limited update/delete needs a table: a view has no row identifier",
+        ));
+    }
 
     // Determine mutation type
     let mutation = match request.method {

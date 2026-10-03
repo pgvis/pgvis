@@ -141,6 +141,41 @@ pub struct ExecContext {
     /// instead of a parsed [`QueryResult::body`]: no parse and re-serialize
     /// when the caller only forwards it. Backends may ignore it (SQLite does).
     pub raw_body: bool,
+
+    /// `Prefer: max-affected=N` (with `handling=strict`): more affected rows
+    /// roll the transaction back with `PGRST124`.
+    pub max_affected: Option<u64>,
+
+    /// A singular response was requested for a mutation: anything but
+    /// exactly one affected row rolls the transaction back with `PGRST116`.
+    pub single_row: bool,
+}
+
+impl ExecContext {
+    /// Check the mutation guards against the number of rows the statement
+    /// affected. Backends call this *before* deciding to commit, so a
+    /// violation rolls the writes back instead of reporting after the fact.
+    pub fn check_affected(&self, rows: i64) -> Result<(), Error> {
+        if let Some(max) = self.max_affected {
+            if rows > max as i64 {
+                return Err(Error::Plan {
+                    message: format!("Query result exceeds max-affected preference constraint ({rows} > {max})"),
+                    detail: None,
+                    hint: None,
+                    code: crate::error::ErrorCode::MaxAffectedExceeded,
+                });
+            }
+        }
+        if self.single_row && rows != 1 {
+            return Err(Error::Plan {
+                message: "JSON object requested, multiple (or no) rows returned".into(),
+                detail: Some(format!("The result contains {rows} rows")),
+                hint: None,
+                code: crate::error::ErrorCode::NotSingular,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Transaction end behaviour, controlled by `Prefer: tx` header.

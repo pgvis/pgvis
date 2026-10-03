@@ -654,3 +654,129 @@ async fn test_update_with_numeric_filter() {
         assert_eq!(row["description"], "expensive item updated");
     }
 }
+
+// ============================================================================
+// Mutation guards: enforced inside the transaction (rolled back on violation)
+// ============================================================================
+
+/// Insert `n` rows tagged `marker` into test.menagerie.
+async fn seed(marker: &str, n: i32) {
+    let rows: Vec<_> = (0..n).map(|i| json!({ "col_text": marker, "col_int4": i })).collect();
+    let resp = post_prefer("/api/test/menagerie", json!(rows), "return=minimal").await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+/// The `col_int4` values of the rows tagged `marker`, ascending.
+async fn values(marker: &str) -> Vec<i64> {
+    let body: serde_json::Value = get(&format!(
+        "/api/test/menagerie?col_text=eq.{marker}&select=col_int4&order=col_int4.asc"
+    ))
+    .await
+    .json()
+    .await
+    .unwrap();
+    body.as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["col_int4"].as_i64().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn test_max_affected_strict_rolls_back_when_exceeded() {
+    let m = "guard-max";
+    seed(m, 3).await;
+    let resp = patch_prefer(
+        &format!("/api/test/menagerie?col_text=eq.{m}"),
+        json!({ "col_int4": 99 }),
+        "handling=strict, max-affected=2",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "PGRST124");
+    assert_eq!(values(m).await, [0, 1, 2], "the update must be rolled back");
+
+    // Within the limit it applies, and is reported as applied.
+    let resp = patch_prefer(
+        &format!("/api/test/menagerie?col_text=eq.{m}&col_int4=eq.0"),
+        json!({ "col_int4": 10 }),
+        "handling=strict, max-affected=2",
+    )
+    .await;
+    assert!(resp.status().is_success());
+    let applied = resp.headers()["preference-applied"].to_str().unwrap().to_string();
+    assert!(applied.contains("max-affected=2"), "{applied}");
+    assert_eq!(values(m).await, [1, 2, 10]);
+    delete(&format!("/api/test/menagerie?col_text=eq.{m}")).await;
+}
+
+#[tokio::test]
+async fn test_max_affected_without_strict_is_not_applied_or_reported() {
+    let m = "guard-lenient";
+    seed(m, 3).await;
+    let resp = patch_prefer(
+        &format!("/api/test/menagerie?col_text=eq.{m}"),
+        json!({ "col_int4": 7 }),
+        "max-affected=1",
+    )
+    .await;
+    assert!(resp.status().is_success());
+    let applied = resp
+        .headers()
+        .get("preference-applied")
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    assert!(!applied.contains("max-affected"), "{applied}");
+    assert_eq!(values(m).await, [7, 7, 7]);
+    delete(&format!("/api/test/menagerie?col_text=eq.{m}")).await;
+}
+
+#[tokio::test]
+async fn test_singular_accept_on_a_mutation_rolls_back_unless_exactly_one_row() {
+    let m = "guard-single";
+    seed(m, 2).await;
+    let s = server_info();
+    let resp = s
+        .client
+        .patch(format!("{}/api/test/menagerie?col_text=eq.{m}", s.base_url))
+        .header("accept", "application/vnd.pgrst.object+json")
+        .header("prefer", "return=representation")
+        .json(&json!({ "col_int4": 50 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_ACCEPTABLE);
+    // It used to answer 406 *after* committing both updates.
+    assert_eq!(values(m).await, [0, 1], "the update must be rolled back");
+    delete(&format!("/api/test/menagerie?col_text=eq.{m}")).await;
+}
+
+#[tokio::test]
+async fn test_limit_and_order_bound_a_delete() {
+    let m = "guard-limit";
+    seed(m, 4).await;
+    // `limit` used to be ignored: this deleted every matching row.
+    let resp = delete(&format!(
+        "/api/test/menagerie?col_text=eq.{m}&order=col_int4.desc&limit=2"
+    ))
+    .await;
+    assert!(resp.status().is_success());
+    assert_eq!(values(m).await, [0, 1]);
+
+    let resp = patch_prefer(
+        &format!("/api/test/menagerie?col_text=eq.{m}&order=col_int4.asc&limit=1"),
+        json!({ "col_int4": 5 }),
+        "return=minimal",
+    )
+    .await;
+    assert!(resp.status().is_success());
+    assert_eq!(values(m).await, [1, 5]);
+    delete(&format!("/api/test/menagerie?col_text=eq.{m}")).await;
+}
+
+#[tokio::test]
+async fn test_a_limited_mutation_on_a_view_is_rejected() {
+    let resp = delete("/api/test/items_view?id=eq.-1&limit=1").await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}

@@ -244,6 +244,14 @@ pub struct Dialect {
     /// - Postgres: true
     /// - SQLite: false
     pub supports_json_recordset: bool,
+
+    /// System column identifying a table row, for limited UPDATE/DELETE
+    /// (`WHERE <id> IN (SELECT <id> ... ORDER BY ... LIMIT n)`). Views have
+    /// none, so a limited mutation on a view is rejected.
+    ///
+    /// - Postgres: `ctid`
+    /// - SQLite: `rowid`
+    pub row_identifier: &'static str,
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +284,7 @@ pub static POSTGRES: Dialect = Dialect {
     supports_is_distinct: true,
     supports_row_to_json: true,
     supports_json_recordset: true,
+    row_identifier: "ctid",
 };
 
 /// The SQLite dialect — limited feature set.
@@ -311,6 +320,7 @@ pub static SQLITE: Dialect = Dialect {
     supports_is_distinct: false, // SQLite 3.39+ — conservative default
     supports_row_to_json: false,
     supports_json_recordset: false,
+    row_identifier: "rowid",
 };
 
 #[cfg(test)]

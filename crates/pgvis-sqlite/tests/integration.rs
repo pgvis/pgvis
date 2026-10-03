@@ -509,6 +509,36 @@ async fn test_transaction_rollback() {
     assert_eq!(body.as_array().unwrap().len(), 0);
 }
 
+#[tokio::test]
+async fn test_mutation_guards_roll_back_before_commit() {
+    let backend = setup_backend().await;
+    let before = query(&backend, "SELECT * FROM users", &[]).await;
+    let all = before.as_array().unwrap().len();
+    assert!(all > 1, "fixture needs several users");
+
+    for ctx in [
+        ExecContext {
+            is_mutation: true,
+            max_affected: Some(1),
+            ..Default::default()
+        },
+        ExecContext {
+            is_mutation: true,
+            single_row: true,
+            ..Default::default()
+        },
+    ] {
+        let err = backend
+            .execute(&ctx, "UPDATE users SET is_active = 9 RETURNING *", &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(err.http_status(), 400 | 406), "{err}");
+        // Rolled back: no row changed.
+        let after = query(&backend, "SELECT * FROM users WHERE is_active = 9", &[]).await;
+        assert_eq!(after.as_array().unwrap().len(), 0);
+    }
+}
+
 // ===========================================================================
 // View query tests
 // ===========================================================================

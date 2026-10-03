@@ -539,6 +539,8 @@ pub(crate) fn anonymous_exec_context(config: &Config, is_mutation: bool) -> Exec
         tx_end: None,
         is_mutation,
         raw_body: false,
+        max_affected: None,
+        single_row: false,
     }
 }
 

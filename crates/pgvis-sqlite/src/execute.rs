@@ -153,8 +153,11 @@ pub async fn execute_query(
     let params = params.to_vec();
     let is_mutation = ctx.is_mutation;
     let should_rollback = matches!(ctx.tx_end, Some(TxEnd::Rollback));
+    let guards = ctx.clone();
 
-    conn.call(move |conn| {
+    // Outer error: SQLite failure. Inner error: a mutation guard (max-affected,
+    // singular) that rolled the transaction back.
+    conn.call(move |conn| -> Result<Result<QueryResult, Error>, SqliteInternalError> {
         // Begin transaction
         let tx_behavior = if is_mutation {
             rusqlite::TransactionBehavior::Immediate
@@ -167,6 +170,14 @@ pub async fn execute_query(
 
         // Execute and collect results
         let result = execute_and_collect(&tx, &sql, &params);
+
+        // Mutation guards are checked before committing; dropping the
+        // transaction rolls the writes back.
+        if let Ok(qr) = &result {
+            if let Err(guard) = guards.check_affected(qr.page_total.unwrap_or(0)) {
+                return Ok(Err(guard));
+            }
+        }
 
         // Commit or rollback
         match &result {
@@ -183,7 +194,7 @@ pub async fn execute_query(
             }
         }
 
-        result
+        result.map(Ok)
     })
     .await
     .map_err(|e| {
@@ -200,7 +211,7 @@ pub async fn execute_query(
             detail: None,
             hint: None,
         }
-    })
+    })?
 }
 
 /// Inner execution: prepare, bind, iterate rows, build JSON.

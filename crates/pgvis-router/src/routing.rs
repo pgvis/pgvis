@@ -189,6 +189,8 @@ impl AppState {
             tx_end: None,
             is_mutation: plan_writes(&plan),
             raw_body: false,
+            max_affected: None,
+            single_row: false,
         };
 
         let result = self.backend.execute(&exec_ctx, &sql, &params).await?;
@@ -343,6 +345,8 @@ impl AppState {
             tx_end: None,
             is_mutation: false,
             raw_body: false,
+            max_affected: None,
+            single_row: false,
         };
 
         self.backend.execute(&exec_ctx, &sql, &sql_params).await
@@ -857,6 +861,16 @@ async fn dispatch_request(
     // Table reads are forwarded as the database's JSON text: no parse and
     // re-serialize. (RPC/mutation bodies are reshaped below, so stay parsed.)
     exec_ctx.raw_body = matches!(plan, ActionPlan::Read(_));
+    // Mutation guards, enforced by the backend before it commits.
+    if let ActionPlan::Mutate(_) = &plan {
+        if preferences.handling == Some(pgvis_core::preferences::PreferHandling::Strict) {
+            exec_ctx.max_affected = preferences.max_affected;
+        }
+        exec_ctx.single_row = headers
+            .get("accept")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|s| s.contains("application/vnd.pgrst.object"));
+    }
 
     // 4b. Data cache: compute key and check for cache hit (reads only).
     //     When a `pre_request` hook is configured we bypass the read cache
@@ -1374,6 +1388,8 @@ pub(crate) fn build_exec_context(
         tx_end,
         is_mutation,
         raw_body: false,
+        max_affected: None,
+        single_row: false,
     }
 }
 

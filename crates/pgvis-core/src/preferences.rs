@@ -334,7 +334,9 @@ impl Preferences {
                 }
             ));
         }
-        if let Some(n) = self.max_affected {
+        // Enforced only with handling=strict (PostgREST semantics); otherwise
+        // it is ignored and must not be reported as applied.
+        if let (Some(n), Some(PreferHandling::Strict)) = (self.max_affected, &self.handling) {
             parts.push(format!("max-affected={n}"));
         }
         if let Some(p) = &self.params {

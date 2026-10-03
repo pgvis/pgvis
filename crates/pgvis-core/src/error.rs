@@ -101,6 +101,9 @@ pub enum ErrorCode {
     StatementTimeout,
     /// `Prefer: max-affected` exceeded.
     MaxAffectedExceeded,
+    /// A singular response (`Accept: application/vnd.pgrst.object`) was
+    /// requested but the statement did not affect exactly one row.
+    NotSingular,
 
     // --- pgvis-specific ---
     /// Operation not supported by the current backend/dialect.
@@ -144,6 +147,7 @@ impl ErrorCode {
             Self::DatabaseError => "PGRST400",
             Self::StatementTimeout => "PGRST109",
             Self::MaxAffectedExceeded => "PGRST124",
+            Self::NotSingular => "PGRST116",
             Self::UnsupportedOperation => "PGV001",
             Self::Internal => "PGV500",
             Self::ConfigError => "PGV002",
@@ -176,6 +180,7 @@ impl ErrorCode {
             Self::DatabaseError => 500,
             Self::StatementTimeout => 504,
             Self::MaxAffectedExceeded => 400,
+            Self::NotSingular => 406,
             Self::UnsupportedOperation => 400,
             Self::Internal => 500,
             Self::ConfigError => 500,
