@@ -13,6 +13,9 @@ pgvis is not just a standalone server — it's a library you can embed in any Ru
 [dependencies]
 pgvis-lib = "0.1"
 tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+serde_json = "1"
+anyhow = "1"
 ```
 
 The `pgvis-lib` crate includes all backends and MCP by default. Feature flags:
@@ -22,6 +25,8 @@ The `pgvis-lib` crate includes all backends and MCP by default. Feature flags:
 | `postgres` | ✓ | PostgreSQL backend |
 | `sqlite` | ✓ | SQLite backend |
 | `mcp` | ✓ | MCP server support |
+
+`pgvis-lib` re-exports the crates it builds on — `pgvis_lib::pgvis_core`, `pgvis_lib::pgvis_router`, and (per feature) `pgvis_lib::pgvis_mcp`, `pgvis_lib::pgvis_postgres`, `pgvis_lib::pgvis_sqlite` — so you don't need to depend on them directly.
 
 ## Quick Start: REST Router
 
@@ -35,11 +40,13 @@ async fn main() -> anyhow::Result<()> {
         .build()
         .await?;
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
     axum::serve(listener, router).await?;
     Ok(())
 }
 ```
+
+With no `jwt_secret` and no `anon_role` configured, every request runs as the DSN's own role — see [Authentication](#authentication) before exposing the router.
 
 ## REST + MCP (Streamable HTTP)
 
@@ -55,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     // Serves REST at /api/{schema}/{table} AND MCP at /mcp
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
     axum::serve(listener, router).await?;
     Ok(())
 }
@@ -75,10 +82,14 @@ async fn main() -> anyhow::Result<()> {
         .build_mcp_server()
         .await?;
 
-    pgvis_lib::pgvis_mcp::serve_stdio(mcp).await?;
+    pgvis_lib::pgvis_mcp::serve_stdio(mcp)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
     Ok(())
 }
 ```
+
+MCP tool calls always run as `anon_role` — see the [MCP guide](/guides/mcp#authentication).
 
 ## SQLite Backend
 
@@ -98,13 +109,13 @@ let router = Builder::new("sqlite::memory:")
     .await?;
 ```
 
-SQLite uses the `main` schema by default. The `.schemas()` call is ignored for SQLite.
+SQLite has a single `main` schema, which is the default for SQLite DSNs. Leave `.schemas()` unset: SQLite introspection ignores it, but the names you pass are still used for routing. A full `Config` passed with `.config(...)` defaults `schemas` to `["public"]`, so set `schemas: vec!["main".into()]` there.
 
 ## Custom Configuration
 
 ```rust
 use pgvis_lib::Builder;
-use pgvis_core::config::{Config, RoutingConfig, JwtAlgorithm};
+use pgvis_lib::pgvis_core::config::{Config, RoutingConfig, JwtAlgorithm};
 
 let config = Config {
     schemas: vec!["public".into(), "api".into()],
@@ -129,6 +140,24 @@ let router = Builder::new("postgres://localhost/mydb")
     .await?;
 ```
 
+## Authentication
+
+The router authenticates HTTP requests from the `Config` you pass in:
+
+| Configuration | Request without a token | Request with a valid JWT |
+|---------------|-------------------------|--------------------------|
+| No `jwt_secret` | Runs as `anon_role`, or as the DSN's role if unset | Token is not checked; same as without |
+| `jwt_secret` + `anon_role` | Runs as `anon_role` | Runs as the token's role claim (`role_claim_key`), or `anon_role` if it has none |
+| `jwt_secret`, no `anon_role` | `401` | Runs as the token's role claim; a token without one is `401` rather than falling back to the DSN's role |
+
+`jwt_aud` (when set) rejects tokens minted for another audience, and `nbf` is honoured. The verified claims are available to SQL as one GUC, `request.jwt.claims` — pgvis no longer sets per-claim `request.jwt.claim.<key>` settings:
+
+```sql
+current_setting('request.jwt.claims', true)::json->>'sub'
+```
+
+The `pgvis serve` binary refuses to start with neither `jwt_secret` nor `anon_role` unless `--insecure-no-auth` is passed, and rejects unknown config-file keys. The library does neither: it is up to you to configure auth, or to put your own authentication in front of the router and call pgvis [in-process](#calling-functions-rpc-in-process) with an explicit `CallerIdentity`.
+
 ## Accessing Internal Components
 
 Use `build_components()` for access to the schema cache, backend, and other internals:
@@ -144,9 +173,9 @@ let components = Builder::new("postgres://localhost/mydb")
 // Access the schema cache
 let cache = components.cache.load();
 println!("Tables: {}", cache.tables.len());
-for table in &cache.tables {
+for table in cache.tables.values() {
     println!("  {}.{} ({} columns)",
-        table.id.schema, table.id.name, table.columns.len());
+        table.schema(), table.name(), table.columns.len());
 }
 
 // Generate OpenAPI spec
@@ -155,7 +184,7 @@ let json = serde_json::to_string_pretty(&spec)?;
 println!("{json}");
 
 // Serve the router
-let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
 axum::serve(listener, components.router).await?;
 ```
 
@@ -167,7 +196,37 @@ axum::serve(listener, components.router).await?;
 | `cache` | `Arc<ArcSwap<SchemaCache>>` | Hot-swappable schema cache |
 | `config` | `Arc<Config>` | Shared configuration |
 | `dialect` | `Arc<Dialect>` | SQL dialect (Postgres/SQLite) |
-| `router` | `axum::Router` | The fully-wired REST + OpenAPI router |
+| `router` | `axum::Router` | The fully-wired router: REST + OpenAPI, plus `/mcp` and `/pubsub` when enabled |
+| `pubsub` | `Option<Arc<PubSubHub>>` | The pub/sub hub; `None` when pub/sub is disabled or the backend is SQLite |
+| `reloader` | `SchemaReloader` | Keeps `cache` current after DDL (see below) |
+
+`Components` is `#[non_exhaustive]`: read or move its fields, but don't construct or exhaustively destructure it.
+
+## Keeping the Schema Cache Current
+
+The `Builder` spawns a `SchemaReloader` that re-introspects the database and atomically swaps in the new schema cache — REST routes, OpenAPI and MCP tools all follow it. In-flight requests finish on the cache they started with, and a failed introspection keeps the current cache.
+
+On Postgres it reloads on PostgREST's `NOTIFY pgrst, 'reload schema'` (or an empty payload), received on a dedicated `LISTEN` connection. Send it from your migrations, or install a DDL event trigger:
+
+```sql
+CREATE OR REPLACE FUNCTION pgrst_watch() RETURNS event_trigger
+  LANGUAGE plpgsql AS $$ BEGIN NOTIFY pgrst, 'reload schema'; END; $$;
+CREATE EVENT TRIGGER pgrst_watch ON ddl_command_end EXECUTE PROCEDURE pgrst_watch();
+```
+
+You can also reload on demand through `components.reloader`:
+
+```rust
+// Fire and forget; requests arriving together are coalesced into one
+// introspection after a 200 ms debounce.
+components.reloader.reload();
+
+// Or reload now and wait for it — e.g. right after running migrations.
+run_migrations().await?;
+components.reloader.reload_now().await?; // new tables are routable from here on
+```
+
+`SchemaReloader` is `Clone`, so you can hand it to a signal handler or admin endpoint (`pgvis serve` reloads on `SIGUSR1`). If you build your own cache instead of using the `Builder`, start one with `pgvis_lib::SchemaReloader::spawn(backend, cache, introspect_config)`. When the data cache is enabled, a schema reload also invalidates every cached response.
 
 ## Calling Functions (RPC) In-Process
 
@@ -200,7 +259,7 @@ async fn main() -> anyhow::Result<()> {
     let router = build_router(state.clone());
 
     // Spawn the HTTP server
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
     tokio::spawn(async move { axum::serve(listener, router).await.ok(); });
 
     // Call a function in-process (same pipeline, no HTTP)
@@ -213,7 +272,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-> **`build_router(state)` vs `build_app(...)`** — Use `build_router` when you need to keep a reference to the `AppState` for in-process RPC. `build_app` is a convenience that constructs the state internally and returns only the router.
+> **`build_router(state)` vs `build_app(...)`** — Use `build_router` when you need to keep a reference to the `AppState` for in-process RPC. `build_app` is a convenience that constructs the state internally and returns only the router. `AppState::new` creates its own data cache (when `config.cache.enabled`), so serve the router built from that state rather than `components.router` — then HTTP and in-process calls share one cache, and a mutating in-process call invalidates what HTTP readers see. `build_router` serves REST and OpenAPI only; mount `/mcp` and `/pubsub` yourself if you need them.
 
 ### `call_rpc` — Raw Result
 
@@ -225,14 +284,15 @@ let result = state.call_rpc(
     &CallerIdentity::anonymous(),
 ).await?;
 
-// result.body is a serde_json::Value (array for set-returning, object for scalar)
+// result.body is a serde_json::Value: an array of rows for set-returning
+// functions, `[{"result": <value>}]` for scalar ones
 let items: Vec<serde_json::Value> = serde_json::from_value(result.body)?;
 println!("Found {} items", items.len());
 ```
 
-### `call_rpc_as<T>` — Typed Convenience
+Overloaded functions are resolved by argument names, as on the HTTP path: an unknown or misspelled argument, or a missing required one, is `PGRST202`; arguments matching more than one overload are `PGRST203`.
 
-Deserializes the result body directly into your struct:
+### Typed Helpers
 
 ```rust
 #[derive(serde::Deserialize)]
@@ -242,24 +302,45 @@ struct Item {
     price: f64,
 }
 
-// Set-returning function → Vec<Item>
+// Set-returning function (RETURNS TABLE / SETOF) → one T per row
 let items: Vec<Item> = state
-    .call_rpc_as("public", "get_items", serde_json::json!({}), &CallerIdentity::anonymous())
+    .call_rpc_rows("public", "get_items", serde_json::json!({}), &CallerIdentity::anonymous())
     .await?;
 
-// Scalar function → Vec with one element containing "result" key
-#[derive(serde::Deserialize)]
-struct ScalarResult { result: i64 }
-
-let rows: Vec<ScalarResult> = state
-    .call_rpc_as("public", "add", serde_json::json!({"a": 10, "b": 20}), &CallerIdentity::anonymous())
+// Scalar (or single JSON object) function → the unwrapped value
+let sum: i64 = state
+    .call_rpc_scalar("public", "add", serde_json::json!({"a": 10, "b": 20}), &CallerIdentity::anonymous())
     .await?;
-assert_eq!(rows[0].result, 30);
+assert_eq!(sum, 30);
+
+// Nullable scalar → None for SQL NULL or no row
+let maybe: Option<String> = state
+    .call_rpc_scalar_opt("public", "find_name", serde_json::json!({"id": 7}), &CallerIdentity::anonymous())
+    .await?;
+```
+
+### `call_read` — In-Process Table Reads
+
+Reads use the same PostgREST query syntax as `GET /{table}`, and always bypass the data cache:
+
+```rust
+use std::collections::HashMap;
+
+let params = HashMap::from([
+    ("select".to_string(), "id,name,price".to_string()),
+    ("price".to_string(), "lt.10".to_string()),
+    ("order".to_string(), "name.asc".to_string()),
+    ("limit".to_string(), "20".to_string()),
+]);
+
+let cheap: Vec<Item> = state
+    .call_read_rows("public", "items", &params, &CallerIdentity::with_role("authenticated"))
+    .await?;
 ```
 
 ### `CallerIdentity` — Row-Level Security
 
-`CallerIdentity` controls the database role and JWT claims applied inside the transaction, exactly as if the call came from an authenticated HTTP request:
+`CallerIdentity` controls the database role and JWT claims applied inside the transaction, exactly as if the call came from an authenticated HTTP request. There is no JWT verification on this path — your application is vouching for the identity:
 
 ```rust
 use pgvis_lib::pgvis_router::CallerIdentity;
@@ -270,7 +351,7 @@ let anon = CallerIdentity::anonymous();
 // Role-only — SET LOCAL role = 'authenticated'
 let user = CallerIdentity::with_role("authenticated");
 
-// Full identity — role + JWT claims propagated as GUC
+// Full identity — role + JWT claims propagated as the request.jwt.claims GUC
 let admin = CallerIdentity {
     role: Some("admin".into()),
     claims: Some(serde_json::json!({
@@ -280,22 +361,28 @@ let admin = CallerIdentity {
     })),
 };
 
-// RLS policies using current_setting('request.jwt.claims') will see these claims
+// RLS policies using current_setting('request.jwt.claims', true)::json->>'org_id' see these claims
 let result = state
     .call_rpc("public", "get_my_data", serde_json::json!({}), &admin)
     .await?;
 ```
+
+`CallerIdentity::anonymous()` does **not** apply `anon_role`: with no role it runs as the DSN's own role. Pass `CallerIdentity::with_role(...)` with your anonymous role when the call should be restricted.
 
 ### API Reference
 
 | Method | Signature | Returns |
 |--------|-----------|---------|
 | `call_rpc` | `(&self, schema, function, args, caller) → Result<QueryResult, Error>` | Raw result with body, total_count, page_total |
-| `call_rpc_as<T>` | `(&self, schema, function, args, caller) → Result<T, Error>` | Deserialized `T` from the JSON body |
+| `call_rpc_rows<T>` | `(&self, schema, function, args, caller) → Result<Vec<T>, Error>` | Each row of a set-returning function as `T` |
+| `call_rpc_scalar<T>` | `(&self, schema, function, args, caller) → Result<T, Error>` | The single value of a scalar function; error on `NULL` / no row |
+| `call_rpc_scalar_opt<T>` | `(&self, schema, function, args, caller) → Result<Option<T>, Error>` | As above, `None` on `NULL` / no row |
+| `call_read` | `(&self, schema, table, &params, caller) → Result<QueryResult, Error>` | Raw table read; `params` is a `HashMap<String, String>` of query parameters |
+| `call_read_rows<T>` | `(&self, schema, table, &params, caller) → Result<Vec<T>, Error>` | Each row as `T` |
 
 | `CallerIdentity` | Description |
 |------------------|-------------|
-| `::anonymous()` | No role switch, no claims |
+| `::anonymous()` | No role switch (runs as the DSN's role), no claims |
 | `::with_role("name")` | SET LOCAL role, no claims |
 | `{ role, claims }` | Full identity with GUC propagation |
 
@@ -304,13 +391,13 @@ let result = state
 `call_rpc` returns `pgvis_core::error::Error`:
 
 ```rust
-use pgvis_core::error::Error;
+use pgvis_lib::pgvis_core::error::{Error, ErrorCode};
 
 match state.call_rpc("public", "nonexistent_fn", serde_json::json!({}), &CallerIdentity::anonymous()).await {
     Ok(result) => { /* use result.body */ },
-    Err(Error::NotFound { .. }) => eprintln!("Function not found"),
-    Err(Error::DatabaseError(msg)) => eprintln!("DB error: {msg}"),
-    Err(e) => eprintln!("Other error: {e}"),
+    Err(Error::Plan { code: ErrorCode::FunctionNotFound, message, .. }) => eprintln!("Function not found: {message}"),
+    Err(Error::Execution { message, db_code, .. }) => eprintln!("DB error {db_code:?}: {message}"),
+    Err(e) => eprintln!("Other error ({}): {e}", e.code().as_str()),
 }
 ```
 
@@ -335,11 +422,62 @@ async fn main() -> anyhow::Result<()> {
         .route("/custom", get(|| async { "my custom endpoint" }))
         .merge(pgvis_router);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
     axum::serve(listener, app).await?;
     Ok(())
 }
 ```
+
+pgvis does not yet ship health or Prometheus metrics endpoints (they are designed but not implemented); the `/health` route above is your own.
+
+### Graceful Shutdown
+
+Serving is up to you, so is shutdown. Use axum's graceful shutdown to let in-flight requests finish, as `pgvis serve` does on SIGTERM / Ctrl-C:
+
+```rust
+axum::serve(listener, app)
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await?;
+```
+
+A request dropped mid-flight never hands an open transaction back to the pool: its connection is discarded and the server rolls it back.
+
+## Read Replicas and Pool Status
+
+Set `config.replica.replica_dsns` and the `Builder` uses a replica-aware Postgres backend: reads (including `STABLE`/`IMMUTABLE` RPCs) are spread across the primary and replicas, while writes and `VOLATILE` RPCs stay on the primary.
+
+```rust
+use pgvis_lib::pgvis_core::config::{Config, ReplicaConfig};
+
+let config = Config {
+    replica: ReplicaConfig {
+        replica_dsns: vec!["postgres://replica1/mydb".into(), "postgres://replica2/mydb".into()],
+        max_replication_lag_bytes: 10 * 1024 * 1024, // exclude replicas further behind
+        health_check_interval_ms: 5_000,
+        primary_reads: true,                         // primary also serves reads
+    },
+    ..Default::default()
+};
+```
+
+A background health monitor probes every replica concurrently over its own connections, under a deadline, and excludes unreachable or lagging ones; if none are eligible, reads fall back to the primary.
+
+`Backend::pool_status()` reports the request pool's occupancy for your own monitoring (`None` for SQLite; the primary pool for the replica backend):
+
+```rust
+if let Some(pool) = components.backend.pool_status() {
+    println!("{}/{} connections, {} idle, {} waiting",
+        pool.size, pool.max_size, pool.available, pool.waiting);
+}
+```
+
+When the pool is exhausted, requests fail with `503` (`PGRST000`) rather than `500`.
+
+## Data Cache
+
+Set `config.cache.enabled = true` to cache read responses in memory (primary-key lookups, plus list queries with `cache_lists = true`) for `ttl_seconds`, up to `max_entries`. REST and in-process mutations invalidate the affected table, volatile RPCs and schema reloads invalidate everything. MCP tool calls are not cached, but MCP writes also don't invalidate the REST data cache yet — keep TTLs short if agents write to tables that HTTP clients read through the cache.
 
 ## Error Handling
 
@@ -347,7 +485,6 @@ async fn main() -> anyhow::Result<()> {
 
 - Database connection failed (wrong DSN, server unreachable)
 - Introspection failed (insufficient permissions)
-- No tables found in the specified schemas
 
 ```rust
 match Builder::new("postgres://localhost/mydb").build().await {
@@ -363,8 +500,8 @@ match Builder::new("postgres://localhost/mydb").build().await {
 
 The embed API (`pgvis-lib`) is the same code path the CLI uses. There is no "server-only" logic — the `Builder` assembles:
 
-1. A database backend (connection pool + introspection)
-2. A schema cache (tables, columns, relationships, routines, constraints)
+1. A database backend (connection pool + introspection; replica-aware when replicas are configured)
+2. A schema cache (tables, columns, relationships, routines, constraints) and its `SchemaReloader`
 3. A dialect (Postgres or SQLite capability flags)
 4. Configuration
 5. An axum `Router` (REST + OpenAPI) or MCP `Server`
@@ -383,8 +520,8 @@ When pub/sub is enabled in your config, the `Components` struct exposes a `pubsu
 
 ```rust
 use pgvis_lib::Builder;
-use pgvis_core::pubsub::PubSubConfig;
-use pgvis_core::config::Config;
+use pgvis_lib::pgvis_core::pubsub::PubSubConfig;
+use pgvis_lib::pgvis_core::config::Config;
 
 let config = Config {
     pubsub: PubSubConfig { enabled: true, ..Default::default() },
@@ -410,4 +547,4 @@ if let Some(hub) = &components.pubsub {
 }
 ```
 
-The REST router already includes `/pubsub/*` endpoints automatically when enabled. See the full [Pub/Sub guide](/guides/pubsub) for configuration, patterns, and limitations.
+The hub is trusted in-process code: it publishes as the DSN's role and skips `pubsub.authorize_function`, which applies only to the REST and MCP surfaces. The REST router already includes `/pubsub/*` endpoints automatically when enabled. See the full [Pub/Sub guide](/guides/pubsub) for configuration, authorization, patterns, and limitations.

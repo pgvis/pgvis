@@ -30,8 +30,8 @@ Because all three surfaces lower into the same `ApiRequest` → plan → SQL
 pipeline, their behavior never diverges. The core engine
 ([`pgvis-core`](crates/pgvis-core)) does **no I/O** — database drivers
 implement a single `Backend` trait — which is what makes pgvis embeddable as a
-library and backend-agnostic by design (SQLite is planned with no core
-rewrite).
+library and backend-agnostic by design (Postgres and SQLite ship today, from
+the same core).
 
 How it differs from PostgREST: an I/O-free backend-agnostic core, a
 first-class MCP surface for LLM agents, an embeddable Rust library (not just a
@@ -41,15 +41,17 @@ PostgREST-compatible flat mode for drop-in replacement.
 ## Quick start
 
 **Prerequisites:** a stable Rust toolchain (Rust edition 2024 — see
-[rust-toolchain.toml](rust-toolchain.toml)) and a running PostgreSQL instance.
+[rust-toolchain.toml](rust-toolchain.toml)) and a running PostgreSQL 17 or 18 instance.
 
 ```bash
 # Build the CLI (the `mcp` feature is on by default)
 cargo build --release --bin pgvis
 
-# Point it at your database and serve
+# Point it at your database and serve (binds 127.0.0.1:3000).
+# Without a JWT secret or anon role the server refuses to start;
+# --insecure-no-auth is for local development only.
 export PGVIS_DSN="postgres://user@localhost/mydb"
-./target/release/pgvis serve --bind 0.0.0.0:3000
+./target/release/pgvis serve --insecure-no-auth
 
 # First request — list rows from a table in the `public` schema
 curl "http://localhost:3000/api/public/your_table"
@@ -65,7 +67,8 @@ The CLI is the source of truth for flags and subcommands
 pgvis --dsn <DSN> [--config <FILE>] <COMMAND>
 
   serve     Start the HTTP server (REST + optional MCP over Streamable HTTP)
-              --bind <ADDR>     default 0.0.0.0:3000   (env PGVIS_BIND)
+              --bind <ADDR>     default 127.0.0.1:3000 (env PGVIS_BIND)
+              --insecure-no-auth  start without jwt_secret/anon_role (local dev)
               --schema <NAME>   repeatable / comma-sep  (env PGVIS_SCHEMAS)
               --mcp-http        also serve MCP at /mcp
   mcp       Run an MCP server over stdio (for Claude Desktop / agents)
@@ -89,7 +92,7 @@ pgvis --dsn "postgres://user@localhost/mydb" mcp
 pgvis --dsn "postgres://user@localhost/mydb" mcp --read-only
 
 # or expose MCP over Streamable HTTP at /mcp alongside the REST API
-pgvis --dsn "postgres://user@localhost/mydb" serve --mcp-http
+PGVIS_ANON_ROLE=web_anon pgvis --dsn "postgres://user@localhost/mydb" serve --mcp-http
 ```
 
 The stdio MCP server logs to **stderr** (stdout carries the JSON-RPC stream),
@@ -178,17 +181,17 @@ config keys map directly — see the table in that file). Most-used fields:
 | Field | Purpose | Default |
 |---|---|---|
 | `schemas` | Schemas exposed as routes / tools | `["public"]` |
-| `jwt_secret` / `jwt_algo` | JWT verification (symmetric or asymmetric) | none (anonymous) |
+| `jwt_secret` / `jwt_algo` | JWT verification (symmetric or asymmetric) | none |
+| `jwt_aud` | Required JWT audience, when set | none |
 | `anon_role` | Role used for unauthenticated requests | none |
 | `aggregates_enabled` | Allow `sum()`/`avg()`/… in `select` | disabled |
 | `max_rows` | Server-side cap on returned rows | unlimited |
 | `routing.prefix` | URL prefix | `"api"` |
 | `routing.schema_in_path` | `/{prefix}/{schema}/{table}` vs flat | `true` |
 
-> Today the CLI uses built-in defaults plus `PGVIS_*` env vars. `--config` /
-> `PGVIS_CONFIG` is wired but the TOML layering is still stubbed
-> (`load_config` returns `Config::default()`); full file-based config lands in
-> a later release.
+> Layering is defaults → TOML file (`--config` / `PGVIS_CONFIG`) → `PGVIS_*`
+> env vars (`__` for nested keys, e.g. `PGVIS_POOL__SIZE`) → CLI flags. The
+> config file is strict: an unknown key stops startup.
 
 ## Advantages
 
@@ -198,9 +201,8 @@ config keys map directly — see the table in that file). Most-used fields:
   parser, planner, and SQL builder, so behavior can't drift between them.
 - **PostgREST-compatible.** Same query DSL, `Prefer` semantics, and `PGRST*`
   error codes — existing PostgREST clients work unchanged.
-- **Backend-agnostic, I/O-free core.** A single `Backend` trait; SQLite is
-  planned with no core rewrite (dialect capability flags drive feature
-  gating).
+- **Backend-agnostic, I/O-free core.** A single `Backend` trait; Postgres
+  and SQLite share the core (dialect capability flags drive feature gating).
 - **A library, not just a server.** Add a database API to any Rust app with
   the `pgvis-lib` `Builder`.
 - **Safe by construction.** Parameterized SQL, JWT auth, role switching / RLS,

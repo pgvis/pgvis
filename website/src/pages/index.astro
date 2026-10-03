@@ -25,12 +25,22 @@ const features = [
   },
   {
     title: "Safe by construction",
-    body: "Parameterized SQL only. JWT verification with symmetric or asymmetric algorithms, role switching, and Row-Level Security via Postgres. Statement timeouts and a server-side row cap.",
+    body: "Parameterized SQL only. JWT verification (HS256/384/512, RS256, EdDSA) with `exp`, `nbf` and optional audience checks, role switching, and Row-Level Security. Secure defaults: binds to loopback, refuses to start without auth unless you pass `--insecure-no-auth`, and a token without a role is a 401.",
     icon: "shield",
   },
   {
+    title: "Fast on the hot path",
+    body: "BEGIN, role and claims, pre-request hook and query go out as one pipelined round trip. Table reads forward Postgres's JSON text without re-parsing. Optional in-memory response cache and health-checked, lag-aware read replicas; pool exhaustion returns 503.",
+    icon: "bolt",
+  },
+  {
+    title: "Live schema & pub/sub",
+    body: "The schema cache reloads on `NOTIFY pgrst, 'reload schema'` or `SIGUSR1` — REST, OpenAPI and MCP pick up DDL without a restart. Opt-in pub/sub on Postgres `LISTEN`/`NOTIFY`: subscribe over SSE, publish over REST or MCP, with optional per-caller channel authorization by a SQL function.",
+    icon: "live",
+  },
+  {
     title: "Backend-agnostic",
-    body: "Postgres and SQLite today. Dialect capability flags drive feature gating — no core rewrite needed for a new backend.",
+    body: "Postgres (including PostgreSQL 18 virtual generated columns and temporal keys) and SQLite today. Dialect capability flags drive feature gating — no core rewrite needed for a new backend.",
     icon: "backend",
   },
 ];
@@ -53,8 +63,8 @@ const features = [
           — from one Rust engine
         </h1>
         <p class="subtitle">
-          Point pgvis at your Postgres database. It introspects the schema once and serves it three
-          ways from a single pipeline: typed Model Context Protocol tools for LLM agents, a
+          Point pgvis at your Postgres database. It introspects the schema, reloads it live on
+          <code>NOTIFY pgrst</code>, and serves it three ways from a single pipeline: typed Model Context Protocol tools for LLM agents, a
           PostgREST-compatible REST API, and an OpenAPI 3.0 document. One parser, one planner, one
           SQL builder — behavior stays consistent by design.
         </p>
@@ -143,6 +153,16 @@ const features = [
                     <path d="m9 12 2 2 4-4" />
                   </svg>
                 )}
+                {f.icon === "bolt" && (
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M13 2 4 14h7l-1 8 9-12h-7z" />
+                  </svg>
+                )}
+                {f.icon === "live" && (
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M3 12h4l3-8 4 16 3-8h4" />
+                  </svg>
+                )}
                 {f.icon === "backend" && (
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <rect x="3" y="4" width="18" height="6" rx="2" />
@@ -176,9 +196,11 @@ const features = [
             <pre><code>{`# build the CLI
 cargo build --release --bin pgvis
 
-# point it at your database
+# point it at your database (binds 127.0.0.1:3000)
 export PGVIS_DSN="postgres://user@localhost/mydb"
-./target/release/pgvis serve --bind 0.0.0.0:3000
+# local dev only: no JWT, every request runs as the DSN's role.
+# In production set PGVIS_JWT_SECRET and/or PGVIS_ANON_ROLE instead.
+./target/release/pgvis serve --insecure-no-auth
 
 # query
 curl "http://localhost:3000/api/public/users?select=id,name&active=eq.true"`}</code></pre>
@@ -198,7 +220,8 @@ curl "http://localhost:3000/api/public/users?select=id,name&active=eq.true"`}</c
       "args": [
         "--dsn", "postgres://localhost/mydb",
         "mcp"
-      ]
+      ],
+      "env": { "PGVIS_ANON_ROLE": "web_anon" }
     }
   }
 }`}</code></pre>
@@ -235,7 +258,7 @@ let router = Builder::new("postgres://localhost/mydb")
             <h4>I/O-free, backend-agnostic core</h4>
             <p>
               <code>pgvis-core</code> does no I/O. Backends implement a single <code>Backend</code> trait
-              — Postgres today, SQLite in progress — without touching the engine.
+              — Postgres and SQLite today — without touching the engine.
             </p>
           </div>
           <div class="why-card">

@@ -10,7 +10,7 @@ Get a REST API, MCP tools, and an OpenAPI spec from your database in under 5 min
 ## Prerequisites
 
 - A stable Rust toolchain (edition 2024) — or use Nix
-- A running PostgreSQL instance (or use SQLite for zero-dependency testing)
+- A running PostgreSQL 17 or 18 instance (or use SQLite for zero-dependency testing)
 
 ## Option A: PostgreSQL
 
@@ -20,20 +20,39 @@ cargo build --release --bin pgvis
 
 # Point it at your database
 export PGVIS_DSN="postgres://user:password@localhost/mydb"
+
+# Run every request as a low-privilege role...
+export PGVIS_ANON_ROLE="web_anon"
 ./target/release/pgvis serve
+
+# ...or, for local experiments only, as the DSN's own role
+./target/release/pgvis serve --insecure-no-auth
 ```
 
-pgvis introspects all tables, views, and functions in the `public` schema and starts serving on `http://localhost:3000`.
+pgvis introspects all tables, views, and functions in the `public` schema and starts serving on `http://localhost:3000` (it binds `127.0.0.1` by default; pass `--bind 0.0.0.0:3000` to expose it).
+
+`pgvis serve` refuses to start with neither a `jwt_secret` nor an `anon_role`, because every request would then run as the DSN's own role — often the table owner, which bypasses Row-Level Security. Set `anon_role` (and, for authenticated users, `jwt_secret`) as described in the [Configuration reference](/reference/configuration#authentication), or pass `--insecure-no-auth` to accept that explicitly. The `web_anon` role above must exist in your database and be granted access to the tables you want to expose:
+
+```sql
+CREATE ROLE web_anon NOLOGIN;
+GRANT web_anon TO "user";            -- the DSN's login role must be able to switch to it
+GRANT USAGE ON SCHEMA public TO web_anon;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO web_anon;
+-- for the write examples below, also e.g.:
+-- GRANT INSERT ON items TO web_anon;
+```
+
+If your server requires TLS, add `?sslmode=require` to the DSN; certificates are verified against the system trust store (or `SSL_CERT_FILE`).
 
 ## Option B: SQLite (No Server Required)
 
 ```bash
 # Use any existing SQLite database
 export PGVIS_DSN="sqlite:./mydata.db"
-./target/release/pgvis serve
+./target/release/pgvis serve --schema main --insecure-no-auth
 ```
 
-pgvis auto-detects SQLite from the DSN and uses the `main` schema.
+pgvis auto-detects SQLite from the DSN. SQLite has no roles, so `--insecure-no-auth` is the usual choice for local files. Its tables live in the `main` schema, so pass `--schema main` and use `/api/main/<table>` in place of `/api/public/<table>` in the examples below.
 
 ## First Requests
 
@@ -108,7 +127,7 @@ curl -X POST "http://localhost:3000/api/public/rpc/add" \
 
 ### Claude Desktop (stdio transport)
 
-Add to your Claude Desktop MCP configuration (`~/.config/claude/mcp.json`):
+Add to your Claude Desktop MCP configuration (`claude_desktop_config.json`):
 
 ```json
 {
@@ -121,7 +140,7 @@ Add to your Claude Desktop MCP configuration (`~/.config/claude/mcp.json`):
 }
 ```
 
-Claude can now query your database using natural language — pgvis generates typed tools for every table and function.
+Claude can now query your database using natural language — pgvis generates typed tools for every table and function. MCP tool calls run as `anon_role` (pass `"env": {"PGVIS_ANON_ROLE": "web_anon"}` in the entry); with no `anon_role` and no `jwt_secret` they run as the DSN's own role.
 
 ### Read-only mode (safer for LLMs)
 
@@ -139,7 +158,7 @@ Claude can now query your database using natural language — pgvis generates ty
 ### HTTP transport (alongside REST)
 
 ```bash
-pgvis --dsn "postgres://user@localhost/mydb" serve --mcp-http
+PGVIS_ANON_ROLE=web_anon pgvis --dsn "postgres://user@localhost/mydb" serve --mcp-http
 # MCP available at POST /mcp
 ```
 
@@ -165,8 +184,18 @@ nix develop
 
 # Or build the binary directly
 nix build
-./result/bin/pgvis serve --dsn "postgres://user@localhost/mydb"
+./result/bin/pgvis --dsn "postgres://user@localhost/mydb" serve --insecure-no-auth
 ```
+
+## Reloading After Schema Changes
+
+pgvis picks up DDL without a restart. At the end of a migration run:
+
+```sql
+NOTIFY pgrst, 'reload schema';
+```
+
+or send `SIGUSR1` to the `pgvis serve` process.
 
 ## Next Steps
 
