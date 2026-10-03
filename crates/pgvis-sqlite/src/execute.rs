@@ -163,7 +163,7 @@ pub async fn execute_query(
         };
         let tx = conn
             .transaction_with_behavior(tx_behavior)
-            .map_err(|e| tokio_rusqlite::Error::Rusqlite(e))?;
+            .map_err(|e| SqliteInternalError::from_rusqlite("BEGIN failed", &e))?;
 
         // Execute and collect results
         let result = execute_and_collect(&tx, &sql, &params);
@@ -172,34 +172,30 @@ pub async fn execute_query(
         match &result {
             Ok(_) if should_rollback => {
                 tx.rollback()
-                    .map_err(|e| tokio_rusqlite::Error::Rusqlite(e))?;
+                    .map_err(|e| SqliteInternalError::from_rusqlite("ROLLBACK failed", &e))?;
             }
             Ok(_) => {
                 tx.commit()
-                    .map_err(|e| tokio_rusqlite::Error::Rusqlite(e))?;
+                    .map_err(|e| SqliteInternalError::from_rusqlite("COMMIT failed", &e))?;
             }
             Err(_) => {
                 // Transaction will auto-rollback on drop
             }
         }
 
-        result.map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))
+        result
     })
     .await
     .map_err(|e| {
-        // Recover the SQLSTATE-equivalent db_code from our internal error, which
-        // is wrapped in `tokio_rusqlite::Error::Other`. The extended SQLite code
-        // was captured at the failure site (before stringification) so constraint
-        // violations map to the right HTTP status instead of a blanket 500.
-        let db_code = if let tokio_rusqlite::Error::Other(boxed) = &e {
-            boxed
-                .downcast_ref::<SqliteInternalError>()
-                .and_then(|err| err.db_code.clone())
-        } else {
-            None
+        // The SQLSTATE-equivalent db_code was captured at the failure site
+        // (before stringification), so constraint violations map to the
+        // right HTTP status instead of a blanket 500.
+        let (message, db_code) = match e {
+            tokio_rusqlite::Error::Error(err) => (err.message, err.db_code),
+            other => (other.to_string(), None),
         };
         Error::Execution {
-            message: format!("SQLite execution failed: {e}"),
+            message: format!("SQLite execution failed: {message}"),
             db_code,
             detail: None,
             hint: None,

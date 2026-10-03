@@ -30,13 +30,13 @@ pub async fn query_tables(
                  AND name NOT LIKE 'sqlite_%' \
                  ORDER BY name",
             )
-            .map_err(|e| tokio_rusqlite::Error::Rusqlite(e))?;
+            ?;
 
         let table_entries: Vec<(String, String)> = table_stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
-            .map_err(|e| tokio_rusqlite::Error::Rusqlite(e))?
+            ?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -47,15 +47,15 @@ pub async fn query_tables(
 
             // Query columns via PRAGMA table_xinfo (includes hidden/generated cols)
             let columns =
-                query_columns(conn, name).map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
+                query_columns(conn, name)?;
 
             // Query unique constraints (includes PK) via PRAGMA index_list + index_info
             let unique_constraints = query_unique_constraints(conn, name)
-                .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
+                ?;
 
             // Determine PK columns
             let pk_cols = determine_pk_cols(conn, name, &unique_constraints)
-                .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
+                ?;
 
             tables.insert(
                 ident.clone(),
@@ -73,7 +73,7 @@ pub async fn query_tables(
             );
         }
 
-        Ok(tables)
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(tables)
     })
     .await
     .map_err(|e| Error::Introspection(format!("SQLite tables introspection failed: {e}")))

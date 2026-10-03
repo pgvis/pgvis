@@ -1672,6 +1672,16 @@ mod tests {
     }
 
     #[test]
+    fn string_typed_exp_and_nbf_cannot_bypass_validation() {
+        // CVE-2026-25537 (jsonwebtoken < 10.3): a string `exp` was never
+        // treated as expired, and a string `nbf` was ignored.
+        let expired = bearer(serde_json::json!({ "role": "r", "exp": "1" }));
+        assert!(verify_jwt(&expired, &config(None, None)).is_err());
+        let not_yet = bearer(serde_json::json!({ "role": "r", "nbf": exp().to_string(), "exp": exp() }));
+        assert!(verify_jwt(&not_yet, &config(None, None)).is_err());
+    }
+
+    #[test]
     fn without_a_secret_embedders_keep_the_dsn_role() {
         // In-process embedders (no jwt_secret) do their own auth; unchanged.
         let auth = verify_jwt(&HeaderMap::new(), &Config::default()).unwrap();
