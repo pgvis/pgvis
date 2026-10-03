@@ -357,15 +357,10 @@ async fn test_rpc_nonexistent_function() {
 async fn test_rpc_wrong_param_name() {
     // Function expects "a" and "b", we pass "x" and "y"
     let resp = rpc_post("add", json!({"x": 1, "y": 2})).await;
-    let status = resp.status();
-    // Should either fail or use defaults (which may error for non-default params)
-    assert!(
-        status.is_client_error()
-            || status.is_server_error()
-            || status == StatusCode::OK
-            || status == StatusCode::CREATED,
-        "got {status}"
-    );
+    // No overload takes x/y: PGRST202, as in PostgREST.
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "PGRST202");
 }
 
 // ============================================================================
@@ -848,4 +843,113 @@ async fn test_in_process_rpc_with_role() {
         body.clone()
     };
     assert_eq!(value, json!(3));
+}
+
+// ============================================================================
+// Overload resolution, argument validation, VARIADIC
+// ============================================================================
+
+/// Assert a 200 response whose (unwrapped scalar) body is `expected`.
+async fn assert_scalar(resp: reqwest::Response, expected: serde_json::Value) {
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body, expected);
+}
+
+/// Assert an error response with the given status and PGRST code.
+async fn assert_error(resp: reqwest::Response, status: StatusCode, code: &str) {
+    assert_eq!(resp.status(), status);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], code, "body: {body}");
+}
+
+#[tokio::test]
+async fn test_rpc_overload_chosen_by_argument_names() {
+    assert_scalar(
+        rpc_post("overloaded", json!({"a": 1})).await,
+        json!("one:1"),
+    )
+    .await;
+    assert_scalar(
+        rpc_post("overloaded", json!({"a": 1, "b": 2})).await,
+        json!("two:3"),
+    )
+    .await;
+    assert_scalar(
+        rpc_get_params("overloaded", "a=1&b=2").await,
+        json!("two:3"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_rpc_overload_missing_required_param() {
+    // `b` alone matches neither overload (both require `a`).
+    let resp = rpc_post("overloaded", json!({"b": 2})).await;
+    assert_error(resp, StatusCode::NOT_FOUND, "PGRST202").await;
+}
+
+#[tokio::test]
+async fn test_rpc_unknown_argument_rejected() {
+    let resp = rpc_post("add", json!({"a": 1, "b": 2, "c": 3})).await;
+    assert_error(resp, StatusCode::NOT_FOUND, "PGRST202").await;
+    let resp = rpc_post("echo_params", json!({"nmae": "typo"})).await;
+    assert_error(resp, StatusCode::NOT_FOUND, "PGRST202").await;
+    let resp = rpc_get_params("echo_params", "nmae=typo").await;
+    assert_error(resp, StatusCode::NOT_FOUND, "PGRST202").await;
+}
+
+#[tokio::test]
+async fn test_rpc_ambiguous_overload() {
+    let resp = rpc_post("ambiguous", json!({"a": 1})).await;
+    assert_error(resp, StatusCode::MULTIPLE_CHOICES, "PGRST203").await;
+    // Supplying `b` leaves a single candidate.
+    assert_scalar(
+        rpc_post("ambiguous", json!({"a": 1, "b": 2})).await,
+        json!(3),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_rpc_named_variadic_argument() {
+    let resp = rpc_post("sum_variadic", json!({"label": "s=", "nums": "{1,2,3}"})).await;
+    assert_scalar(resp, json!("s=6")).await;
+    let resp = rpc_get_params("sum_variadic", "label=s%3D&nums=%7B4,5%7D").await;
+    assert_scalar(resp, json!("s=9")).await;
+}
+
+#[tokio::test]
+async fn test_rpc_get_reserved_keys_are_not_arguments() {
+    // `limit`/`order` are request options, not function arguments.
+    let resp = rpc_get_params("get_items", "limit=3&order=id.asc").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_in_process_rpc_overload_resolution() {
+    let ips = in_process_state();
+    let result = ips
+        .state
+        .call_rpc(
+            "test",
+            "overloaded",
+            json!({"a": 1, "b": 2}),
+            &pgvis_router::CallerIdentity::anonymous(),
+        )
+        .await
+        .expect("call_rpc should pick the two-argument overload");
+    assert_eq!(result.body, json!([{"result": "two:3"}]));
+
+    let err = ips
+        .state
+        .call_rpc(
+            "test",
+            "overloaded",
+            json!({"a": 1, "c": 2}),
+            &pgvis_router::CallerIdentity::anonymous(),
+        )
+        .await
+        .expect_err("unknown argument must be rejected");
+    assert_eq!(err.code().as_str(), "PGRST202");
 }

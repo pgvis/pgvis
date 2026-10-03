@@ -42,7 +42,10 @@ pub fn render_call(plan: &CallPlan, ctx: &mut RenderContext<'_>) -> Result<Strin
                 .and_then(|o| o.get(&p.name).cloned())
                 .unwrap_or(Value::Null);
             let placeholder = ctx.push_param(val);
-            format!("{} := {placeholder}", ctx.quote_ident(&p.name))
+            // A named variadic argument must be marked VARIADIC, or Postgres
+            // reports that no function matches.
+            let variadic = if p.is_variadic { "VARIADIC " } else { "" };
+            format!("{variadic}{} := {placeholder}", ctx.quote_ident(&p.name))
         })
         .collect();
 
@@ -207,5 +210,49 @@ mod tests {
         let sql = render_call(&plan, &mut ctx).unwrap();
 
         assert_eq!(sql, "SELECT \"public\".\"now_utc\"() AS result");
+    }
+
+    #[test]
+    fn test_named_variadic_param() {
+        let plan = CallPlan {
+            function: QualifiedIdentifier::new("public", "sum_all"),
+            function_info: ResolvedFunctionInfo {
+                volatility: Volatility::Immutable,
+                return_type: "integer".to_string(),
+                returns_set: false,
+                returns_table: false,
+                isolation_level: None,
+            },
+            params: vec![
+                ResolvedParam {
+                    name: "label".to_string(),
+                    param_type: "text".to_string(),
+                    has_value: true,
+                    is_variadic: false,
+                },
+                ResolvedParam {
+                    name: "nums".to_string(),
+                    param_type: "integer[]".to_string(),
+                    has_value: true,
+                    is_variadic: true,
+                },
+            ],
+            returning: vec![ResolvedSelect::Star],
+            filters: vec![],
+            logic_filters: vec![],
+            order: vec![],
+            range: empty_range(),
+            is_singular: true,
+            preferences: Preferences::default(),
+            body: None,
+        };
+
+        let mut ctx = RenderContext::new(&POSTGRES);
+        let sql = render_call(&plan, &mut ctx).unwrap();
+
+        assert_eq!(
+            sql,
+            "SELECT \"public\".\"sum_all\"(\"label\" := $1, VARIADIC \"nums\" := $2) AS result"
+        );
     }
 }

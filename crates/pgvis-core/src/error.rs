@@ -73,6 +73,8 @@ pub enum ErrorCode {
     AmbiguousFunction,
     /// Requested resource not found (table, view, function not in schema cache).
     NotFound,
+    /// No function overload accepts the given argument names.
+    FunctionNotFound,
     /// Relationship not found between the specified tables.
     RelationshipNotFound,
     /// Column not found in the target table.
@@ -130,6 +132,7 @@ impl ErrorCode {
             Self::AmbiguousFunction => "PGRST203",
             // PGRST202 = function not found; PGRST204 = column not found; PGRST205 = table not found.
             Self::NotFound => "PGRST205",
+            Self::FunctionNotFound => "PGRST202",
             Self::ColumnNotFound => "PGRST204",
             Self::SpreadOnToMany => "PGRST119",
             Self::AggregatesDisabled => "PGRST123",
@@ -165,7 +168,7 @@ impl ErrorCode {
             // Ambiguous embedding/function → 300 Multiple Choices.
             Self::AmbiguousRelationship | Self::AmbiguousFunction => 300,
             // Table/function not found → 404; relationship/column not found → 400.
-            Self::NotFound => 404,
+            Self::NotFound | Self::FunctionNotFound => 404,
             Self::RelationshipNotFound | Self::ColumnNotFound => 400,
             Self::SpreadOnToMany | Self::AggregatesDisabled => 400,
             Self::JwtMissing | Self::JwtInvalid | Self::JwtExpired => 401,

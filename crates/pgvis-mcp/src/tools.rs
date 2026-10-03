@@ -86,11 +86,11 @@ pub fn build_mcp_tools(cache: &SchemaCache, config: &Config) -> Vec<McpToolDefin
         // from the catalogue, so under read_only we drop them entirely too;
         // exposing them while disallowing mutations would be misleading.
         if !config.read_only {
-            for (_ident, routine_group) in &cache.routines {
-                for routine in routine_group {
-                    if routine.ident.schema == *schema {
-                        tools.push(make_call_tool(routing, schema, routine));
-                    }
+            // One tool per function name: overloads share it, and the planner
+            // picks the overload from the argument names at call time.
+            for (ident, routine_group) in &cache.routines {
+                if ident.schema == *schema {
+                    tools.push(make_call_tool(routing, schema, &ident.name, routine_group));
                 }
             }
         }
@@ -737,34 +737,51 @@ fn make_delete_tool(routing: &RoutingConfig, schema: &str, table: &Table) -> Mcp
     }
 }
 
-fn make_call_tool(routing: &RoutingConfig, schema: &str, routine: &Routine) -> McpToolDefinition {
-    let name = mcp_tool_name(routing, schema, "call", &routine.ident.name);
+/// One tool for all overloads of `fn_name`: the input schema is the union of
+/// their parameters, and only a parameter every overload requires is required.
+/// The planner resolves the overload from the argument names at call time.
+fn make_call_tool(
+    routing: &RoutingConfig,
+    schema: &str,
+    fn_name: &str,
+    routines: &[Routine],
+) -> McpToolDefinition {
+    let name = mcp_tool_name(routing, schema, "call", fn_name);
 
-    // Build parameter description from routine params
-    let param_desc: Vec<String> = routine
-        .params
+    // Build parameter description from each overload's params
+    let signatures: Vec<String> = routines
         .iter()
-        .map(|p| {
+        .map(|routine| {
+            let param_desc: Vec<String> = routine
+                .params
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{}: {}{}",
+                        p.name,
+                        p.typ,
+                        if p.is_variadic { " (variadic)" } else { "" }
+                    )
+                })
+                .collect();
             format!(
-                "{}: {}{}",
-                p.name,
-                p.typ,
-                if p.is_variadic { " (variadic)" } else { "" }
+                "{}.{}({}) → {}",
+                schema,
+                fn_name,
+                param_desc.join(", "),
+                routine.return_type,
             )
         })
         .collect();
-    let description = format!(
-        "Call function {}.{}({}) → {}",
-        schema,
-        routine.ident.name,
-        param_desc.join(", "),
-        routine.return_type,
-    );
+    let description = format!("Call function {}", signatures.join(" | "));
 
-    // Build input schema from routine parameters
+    // Build input schema from the union of the overloads' parameters
     let mut properties = serde_json::Map::new();
     let mut required = Vec::new();
-    for param in &routine.params {
+    for param in routines.iter().flat_map(|r| &r.params) {
+        if properties.contains_key(&param.name) {
+            continue;
+        }
         properties.insert(
             param.name.clone(),
             serde_json::json!({
@@ -772,7 +789,10 @@ fn make_call_tool(routing: &RoutingConfig, schema: &str, routine: &Routine) -> M
                 "description": format!("Parameter: {} ({})", param.name, param.typ),
             }),
         );
-        if param.required {
+        let required_by_all = routines
+            .iter()
+            .all(|r| r.params.iter().any(|p| p.name == param.name && p.required));
+        if required_by_all {
             required.push(serde_json::Value::String(param.name.clone()));
         }
     }
@@ -1240,5 +1260,49 @@ mod tests {
         let terms = parse_mcp_order(a.as_ref()).unwrap();
         assert_eq!(terms.len(), 1);
         assert_eq!(terms[0].field, "age");
+    }
+
+    // ---- overloads share one call tool --------------------------------------
+
+    #[test]
+    fn overloads_merge_into_one_call_tool() {
+        use pgvis_core::cache::{QualifiedIdentifier, RoutineParam};
+        let param = |name: &str, required: bool| RoutineParam {
+            name: name.to_string(),
+            typ: "integer".to_string(),
+            required,
+            is_variadic: false,
+        };
+        let routine = |params: Vec<RoutineParam>| Routine {
+            ident: QualifiedIdentifier::new("public", "f"),
+            description: None,
+            params,
+            return_type: "integer".to_string(),
+            return_type_is_set: false,
+            return_type_is_composite: false,
+            volatility: Volatility::Stable,
+            is_variadic: false,
+            isolation_level: None,
+            settings: Vec::new(),
+        };
+        let mut cache = SchemaCache::default();
+        cache.routines.insert(
+            QualifiedIdentifier::new("public", "f"),
+            vec![
+                routine(vec![param("a", true)]),
+                routine(vec![param("a", true), param("b", true)]),
+            ],
+        );
+        let config = Config {
+            schemas: vec!["public".to_string()],
+            ..Config::default()
+        };
+
+        let tools = build_mcp_tools(&cache, &config);
+        assert_eq!(tools.len(), 1, "one tool for both overloads");
+        let schema = &tools[0].input_schema;
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 2);
+        // `b` is optional: only the second overload needs it.
+        assert_eq!(schema["required"], json!(["a"]));
     }
 }

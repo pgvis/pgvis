@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use crate::cache::{QualifiedIdentifier, SchemaCache};
 use crate::config::Config;
 use crate::dialect::Dialect;
-use crate::error::Error;
+use crate::error::{Error, ErrorCode};
 use crate::preferences::{PreferCount, Preferences};
 use crate::query_params::types::OrderDirection;
 use crate::select_ast::SelectItem;
@@ -296,15 +296,9 @@ fn plan_call(
 ) -> Result<ActionPlan, Error> {
     let routines = cache
         .find_routines(&request.schema, &request.target)
-        .ok_or_else(|| {
-            Error::not_found(format!("function {}.{}", request.schema, request.target))
-        })?;
-
-    // For now, take the first matching routine
-    // TODO: Implement overload resolution (scoring algorithm)
-    let routine = routines.first().ok_or_else(|| {
-        Error::not_found(format!("function {}.{}", request.schema, request.target))
-    })?;
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let routine = resolve_overload(routines, request)?;
 
     let function_info = ResolvedFunctionInfo {
         volatility: routine.volatility,
@@ -474,18 +468,94 @@ fn validate_payload(
     Ok(())
 }
 
-/// Resolve RPC call parameters from the routine signature and request body.
-fn resolve_call_params(
-    routine: &crate::cache::Routine,
-    body: &Option<RequestBody>,
-) -> Result<Vec<ResolvedParam>, Error> {
-    let body_keys: HashSet<String> = match body {
+/// The argument names a call supplies: the keys of a single-object body.
+fn call_arg_names(body: &Option<RequestBody>) -> HashSet<String> {
+    match body {
         Some(RequestBody::Single(obj)) => obj
             .as_object()
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default(),
         _ => HashSet::new(),
-    };
+    }
+}
+
+/// Pick the overload a call's argument names select (PostgREST semantics).
+///
+/// A candidate must declare every supplied argument name and receive every
+/// parameter that has no default. None → `PGRST202` (404), so an unknown or
+/// misspelled argument is an error rather than silently dropped. More than one
+/// → `PGRST203` (300).
+fn resolve_overload<'a>(
+    routines: &'a [crate::cache::Routine],
+    request: &ApiRequest,
+) -> Result<&'a crate::cache::Routine, Error> {
+    let args = call_arg_names(&request.body);
+    let candidates: Vec<&crate::cache::Routine> = routines
+        .iter()
+        .filter(|r| {
+            args.iter()
+                .all(|a| r.params.iter().any(|p| !p.name.is_empty() && p.name == *a))
+                && r.params
+                    .iter()
+                    .all(|p| !p.required || args.contains(&p.name))
+        })
+        .collect();
+
+    let function = format!("{}.{}", request.schema, request.target);
+    match candidates.as_slice() {
+        [routine] => Ok(routine),
+        [] => {
+            let mut names: Vec<&str> = args.iter().map(String::as_str).collect();
+            names.sort_unstable();
+            Err(Error::Plan {
+                message: format!(
+                    "Could not find the function {function}({}) in the schema cache",
+                    names.join(", ")
+                ),
+                detail: Some(format!(
+                    "Searched for the function {function} with parameters [{}], but no \
+                     matches were found in the schema cache",
+                    names.join(", ")
+                )),
+                hint: None,
+                code: ErrorCode::FunctionNotFound,
+            })
+        }
+        _ => {
+            let signatures: Vec<String> = candidates
+                .iter()
+                .map(|r| {
+                    let params: Vec<String> = r
+                        .params
+                        .iter()
+                        .map(|p| format!("{} => {}", p.name, p.typ))
+                        .collect();
+                    format!("{function}({})", params.join(", "))
+                })
+                .collect();
+            Err(Error::Plan {
+                message: format!(
+                    "Could not choose the best candidate function between: {}",
+                    signatures.join(", ")
+                ),
+                detail: None,
+                hint: Some(
+                    "Try renaming the parameters or the function itself in the database so \
+                     function overloading can be resolved"
+                        .to_string(),
+                ),
+                code: ErrorCode::AmbiguousFunction,
+            })
+        }
+    }
+}
+
+/// Resolve RPC call parameters from the routine signature and request body.
+fn resolve_call_params(
+    routine: &crate::cache::Routine,
+    body: &Option<RequestBody>,
+) -> Result<Vec<ResolvedParam>, Error> {
+    let body_keys = call_arg_names(body);
 
     Ok(routine
         .params
@@ -497,4 +567,193 @@ fn resolve_call_params(
             is_variadic: p.is_variadic,
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::{Routine, RoutineParam, Volatility};
+    use crate::dialect::POSTGRES;
+    use serde_json::json;
+
+    fn param(name: &str, typ: &str, required: bool, is_variadic: bool) -> RoutineParam {
+        RoutineParam {
+            name: name.to_string(),
+            typ: typ.to_string(),
+            required,
+            is_variadic,
+        }
+    }
+
+    fn routine(name: &str, params: Vec<RoutineParam>, volatility: Volatility) -> Routine {
+        Routine {
+            ident: QualifiedIdentifier::new("public", name),
+            description: None,
+            is_variadic: params.iter().any(|p| p.is_variadic),
+            params,
+            return_type: "integer".to_string(),
+            return_type_is_set: false,
+            return_type_is_composite: false,
+            volatility,
+            isolation_level: None,
+            settings: Vec::new(),
+        }
+    }
+
+    fn cache_with(routines: Vec<Routine>) -> SchemaCache {
+        let mut cache = SchemaCache::default();
+        for r in routines {
+            cache.routines.entry(r.ident.clone()).or_default().push(r);
+        }
+        cache
+    }
+
+    fn call(name: &str, args: serde_json::Value) -> ApiRequest {
+        ApiRequest {
+            schema: "public".to_string(),
+            target: name.to_string(),
+            method: RequestMethod::Post,
+            is_rpc: true,
+            select: vec![SelectItem::Star],
+            filters: Vec::new(),
+            order: Vec::new(),
+            range: None,
+            preferences: Preferences::default(),
+            body: Some(RequestBody::Single(args)),
+            on_conflict: None,
+            columns: None,
+            logic_filters: Vec::new(),
+            cursor: None,
+        }
+    }
+
+    /// Plan and render the call, returning its SQL and the chosen volatility.
+    fn plan_sql(cache: &SchemaCache, req: &ApiRequest) -> Result<(String, Volatility), Error> {
+        let ActionPlan::Call(plan) = plan_request(req, cache, &POSTGRES, &Config::default())?
+        else {
+            panic!("expected a call plan");
+        };
+        let mut ctx = crate::query::RenderContext::new(&POSTGRES);
+        let sql = crate::query::call::render_call(&plan, &mut ctx)?;
+        Ok((sql, plan.function_info.volatility))
+    }
+
+    /// `f(a)` (stable) and `f(a, b)` (volatile).
+    fn overloaded() -> SchemaCache {
+        cache_with(vec![
+            routine(
+                "f",
+                vec![param("a", "integer", true, false)],
+                Volatility::Stable,
+            ),
+            routine(
+                "f",
+                vec![
+                    param("a", "integer", true, false),
+                    param("b", "integer", true, false),
+                ],
+                Volatility::Volatile,
+            ),
+        ])
+    }
+
+    #[test]
+    fn overload_matching_all_keys_is_chosen() {
+        let cache = overloaded();
+        let (sql, volatility) = plan_sql(&cache, &call("f", json!({"a": 1, "b": 2}))).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT \"public\".\"f\"(\"a\" := $1, \"b\" := $2) AS result"
+        );
+        // Metadata comes from the chosen overload, not the first one.
+        assert_eq!(volatility, Volatility::Volatile);
+
+        let (sql, volatility) = plan_sql(&cache, &call("f", json!({"a": 1}))).unwrap();
+        assert_eq!(sql, "SELECT \"public\".\"f\"(\"a\" := $1) AS result");
+        assert_eq!(volatility, Volatility::Stable);
+    }
+
+    #[test]
+    fn missing_required_param_is_function_not_found() {
+        let cache = overloaded();
+        let err = plan_sql(&cache, &call("f", json!({"b": 2}))).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::FunctionNotFound);
+        assert_eq!(err.code().as_str(), "PGRST202");
+        assert_eq!(err.http_status(), 404);
+    }
+
+    #[test]
+    fn unknown_key_is_function_not_found() {
+        let cache = cache_with(vec![routine(
+            "g",
+            vec![param("user_id", "integer", false, false)],
+            Volatility::Stable,
+        )]);
+        let err = plan_sql(&cache, &call("g", json!({"user_idd": 5}))).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::FunctionNotFound);
+
+        // An unknown function is the same error.
+        let err = plan_sql(&cache, &call("nope", json!({}))).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::FunctionNotFound);
+    }
+
+    #[test]
+    fn several_matching_overloads_are_ambiguous() {
+        // h(a) and h(a, b DEFAULT ...) both accept {"a": 1}.
+        let cache = cache_with(vec![
+            routine(
+                "h",
+                vec![param("a", "integer", true, false)],
+                Volatility::Stable,
+            ),
+            routine(
+                "h",
+                vec![
+                    param("a", "integer", true, false),
+                    param("b", "integer", false, false),
+                ],
+                Volatility::Stable,
+            ),
+        ]);
+        let err = plan_sql(&cache, &call("h", json!({"a": 1}))).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::AmbiguousFunction);
+        assert_eq!(err.http_status(), 300);
+    }
+
+    #[test]
+    fn single_function_with_defaults_unchanged() {
+        let cache = cache_with(vec![routine(
+            "echo",
+            vec![
+                param("name", "text", false, false),
+                param("greeting", "text", false, false),
+            ],
+            Volatility::Stable,
+        )]);
+        let (sql, _) = plan_sql(&cache, &call("echo", json!({}))).unwrap();
+        assert_eq!(sql, "SELECT \"public\".\"echo\"() AS result");
+        let (sql, _) = plan_sql(&cache, &call("echo", json!({"greeting": "hi"}))).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT \"public\".\"echo\"(\"greeting\" := $1) AS result"
+        );
+    }
+
+    #[test]
+    fn named_variadic_argument_is_marked() {
+        let cache = cache_with(vec![routine(
+            "sum_all",
+            vec![
+                param("label", "text", true, false),
+                param("nums", "integer[]", true, true),
+            ],
+            Volatility::Immutable,
+        )]);
+        let req = call("sum_all", json!({"label": "s", "nums": "{1,2,3}"}));
+        let (sql, _) = plan_sql(&cache, &req).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT \"public\".\"sum_all\"(\"label\" := $1, VARIADIC \"nums\" := $2) AS result"
+        );
+    }
 }

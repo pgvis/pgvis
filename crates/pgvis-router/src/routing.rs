@@ -1447,12 +1447,13 @@ fn parse_filters_from_params(
 ///
 /// Every non-reserved query parameter becomes a named argument. Values are
 /// passed as JSON strings (the function's parameter types drive coercion in the
-/// database), except `select` which is reserved for the response projection.
+/// database). [`RESERVED`] keys (`select`, `limit`, …) are not arguments: the
+/// planner rejects unknown argument names, so passing them through would 404.
 fn rpc_args_from_params(params: &QueryParams) -> serde_json::Value {
     use serde_json::Value;
     let mut obj = serde_json::Map::new();
     for (key, value) in params.iter() {
-        if key == "select" {
+        if RESERVED.contains(&key.as_str()) {
             continue;
         }
         // Pass the text through untouched: parameters bind as text and the

@@ -203,3 +203,30 @@ BEGIN
     PERFORM pg_sleep(seconds);
 END;
 $$;
+
+-- Overloads resolved by argument names.
+CREATE FUNCTION test.overloaded(a integer)
+RETURNS text
+LANGUAGE sql STABLE
+AS $$ SELECT 'one:' || a $$;
+
+CREATE FUNCTION test.overloaded(a integer, b integer)
+RETURNS text
+LANGUAGE sql STABLE
+AS $$ SELECT 'two:' || (a + b) $$;
+
+-- Both overloads accept {"a": …}: ambiguous.
+CREATE FUNCTION test.ambiguous(a integer)
+RETURNS integer
+LANGUAGE sql STABLE
+AS $$ SELECT a $$;
+
+CREATE FUNCTION test.ambiguous(a integer, b integer DEFAULT 0)
+RETURNS integer
+LANGUAGE sql STABLE
+AS $$ SELECT a + b $$;
+
+CREATE FUNCTION test.sum_variadic(label text, VARIADIC nums integer[])
+RETURNS text
+LANGUAGE sql STABLE
+AS $$ SELECT label || (SELECT sum(n) FROM unnest(nums) AS n) $$;
