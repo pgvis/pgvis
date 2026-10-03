@@ -73,6 +73,8 @@ pub enum ErrorCode {
     AmbiguousFunction,
     /// Requested resource not found (table, view, function not in schema cache).
     NotFound,
+    /// No function overload accepts the given argument names.
+    FunctionNotFound,
     /// Relationship not found between the specified tables.
     RelationshipNotFound,
     /// Column not found in the target table.
@@ -99,6 +101,9 @@ pub enum ErrorCode {
     StatementTimeout,
     /// `Prefer: max-affected` exceeded.
     MaxAffectedExceeded,
+    /// A singular response (`Accept: application/vnd.pgrst.object`) was
+    /// requested but the statement did not affect exactly one row.
+    NotSingular,
 
     // --- pgvis-specific ---
     /// Operation not supported by the current backend/dialect.
@@ -107,6 +112,8 @@ pub enum ErrorCode {
     Internal,
     /// Configuration error at startup.
     ConfigError,
+    /// A pub/sub failure; the inner code carries its own string and status.
+    PubSub(crate::pubsub::PubSubErrorCode),
 }
 
 impl ErrorCode {
@@ -128,6 +135,7 @@ impl ErrorCode {
             Self::AmbiguousFunction => "PGRST203",
             // PGRST202 = function not found; PGRST204 = column not found; PGRST205 = table not found.
             Self::NotFound => "PGRST205",
+            Self::FunctionNotFound => "PGRST202",
             Self::ColumnNotFound => "PGRST204",
             Self::SpreadOnToMany => "PGRST119",
             Self::AggregatesDisabled => "PGRST123",
@@ -139,9 +147,11 @@ impl ErrorCode {
             Self::DatabaseError => "PGRST400",
             Self::StatementTimeout => "PGRST109",
             Self::MaxAffectedExceeded => "PGRST124",
+            Self::NotSingular => "PGRST116",
             Self::UnsupportedOperation => "PGV001",
             Self::Internal => "PGV500",
             Self::ConfigError => "PGV002",
+            Self::PubSub(code) => code.as_str(),
         }
     }
 
@@ -162,7 +172,7 @@ impl ErrorCode {
             // Ambiguous embedding/function → 300 Multiple Choices.
             Self::AmbiguousRelationship | Self::AmbiguousFunction => 300,
             // Table/function not found → 404; relationship/column not found → 400.
-            Self::NotFound => 404,
+            Self::NotFound | Self::FunctionNotFound => 404,
             Self::RelationshipNotFound | Self::ColumnNotFound => 400,
             Self::SpreadOnToMany | Self::AggregatesDisabled => 400,
             Self::JwtMissing | Self::JwtInvalid | Self::JwtExpired => 401,
@@ -170,9 +180,11 @@ impl ErrorCode {
             Self::DatabaseError => 500,
             Self::StatementTimeout => 504,
             Self::MaxAffectedExceeded => 400,
+            Self::NotSingular => 406,
             Self::UnsupportedOperation => 400,
             Self::Internal => 500,
             Self::ConfigError => 500,
+            Self::PubSub(code) => code.http_status(),
         }
     }
 }
@@ -312,7 +324,7 @@ impl Error {
             Self::Auth { code, .. } => code.clone(),
             Self::Unsupported(_) => ErrorCode::UnsupportedOperation,
             Self::Internal(_) => ErrorCode::Internal,
-            Self::PubSub { .. } => ErrorCode::Internal, // code is in the PubSubErrorCode
+            Self::PubSub { code, .. } => ErrorCode::PubSub(*code),
         }
     }
 
@@ -332,15 +344,19 @@ impl Error {
                     "42883" => 404, // undefined_function
                     "57014" => 504, // query_canceled (statement timeout)
                     "25006" => 405, // read_only_sql_transaction
+                    "P0001" => 400, // raise_exception: a function rejected the request
                     // Connection-exception class (08xxx) → service unavailable.
                     c if c.starts_with("08") => 503,
+                    // PostgREST convention: `RAISE ... USING ERRCODE = 'PT402'`
+                    // lets a function choose the HTTP status.
+                    c if c.starts_with("PT") => c[2..]
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|s| (100..=599).contains(s))
+                        .unwrap_or(500),
                     _ => 500,
                 };
             }
-        }
-        // PubSub errors carry their own HTTP status in PubSubErrorCode
-        if let Self::PubSub { code, .. } = self {
-            return code.http_status();
         }
         self.code().http_status()
     }
@@ -362,6 +378,15 @@ impl Error {
             message: message.into(),
             detail: None,
             code: ErrorCode::InvalidFilter,
+        }
+    }
+
+    /// Create a parse error for a request body the operation can't apply.
+    pub fn invalid_body(message: impl Into<String>) -> Self {
+        Self::Parse {
+            message: message.into(),
+            detail: None,
+            code: ErrorCode::InvalidBody,
         }
     }
 

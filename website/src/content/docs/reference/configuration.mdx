@@ -9,46 +9,89 @@ pgvis configuration is layered (later sources override earlier):
 
 1. **Defaults** — sensible production defaults from `Config::default()`
 2. **TOML config file** — specified via `--config` flag or `PGVIS_CONFIG` env var
-3. **Environment variables** — prefixed with `PGVIS_`, lowercase field names
+3. **Environment variables** — prefixed with `PGVIS_`, lowercase field names; nested tables use `__` (double underscore), e.g. `PGVIS_POOL__SIZE` → `pool.size`
+4. **CLI flags** — e.g. `--schema`, `--cache-ttl`, `--read-only`
+
+The config file is **strict**: a missing file, or any key pgvis does not recognise (a typo, or a PostgREST spelling such as `jwt-secret`), stops startup with an error that names the offending keys. Environment variables are not checked this way — an unrecognised `PGVIS_*` variable is silently ignored, so double-check the spelling (in particular the `__` for nested keys).
 
 ## Environment Variables
+
+### Startup and CLI-backed variables
+
+These are read by the CLI itself (see [CLI Flags](#cli-flags)).
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `PGVIS_DSN` | Database connection string | *required* |
-| `PGVIS_BIND` | Server bind address | `0.0.0.0:3000` |
 | `PGVIS_CONFIG` | Path to TOML config file | none |
-| `PGVIS_SCHEMAS` | Schemas to expose (comma-separated) | `public` |
-| `PGVIS_JWT_SECRET` | JWT verification secret | none (anonymous only) |
-| `PGVIS_JWT_ALGO` | JWT algorithm | `HS256` |
-| `PGVIS_ANON_ROLE` | Database role for unauthenticated requests | none |
-| `PGVIS_ROLE_CLAIM_KEY` | JWT claim key for role | `role` |
-| `PGVIS_MAX_ROWS` | Maximum rows returned per request | unlimited |
-| `PGVIS_STATEMENT_TIMEOUT_MS` | SQL statement timeout (ms) | `30000` |
-| `PGVIS_POOL_SIZE` | Pool max connections | `16` |
-| `PGVIS_POOL_TIMEOUT_MS` | Pool checkout timeout (ms) | `5000` |
-| `PGVIS_POOL_CREATE_TIMEOUT_MS` | Pool create connection timeout (ms) | `5000` |
-| `PGVIS_POOL_RECYCLE_TIMEOUT_MS` | Pool recycle/validate timeout (ms) | `5000` |
-| `PGVIS_POOL_KEEPALIVES` | TCP keepalive on connections | `true` |
-| `PGVIS_POOL_KEEPALIVES_IDLE_SECS` | Keepalive idle time (seconds) | `60` |
-| `PGVIS_POOL_CONNECT_TIMEOUT_SECS` | TCP connect timeout (seconds) | `10` |
-| `PGVIS_POOL_RECYCLING_METHOD` | Connection recycling method | `Fast` |
-| `PGVIS_READ_ONLY` | Reject all mutations | `false` |
-| `PGVIS_AGGREGATES_ENABLED` | Allow aggregate functions in select | `false` |
-| `PGVIS_PLAN_ENABLED` | Allow EXPLAIN plan requests | `false` |
-| `PGVIS_TX_ALLOW_OVERRIDE` | Allow `Prefer: tx=rollback` | `false` |
-| `PGVIS_TX_ROLLBACK_ALL` | Force rollback on all transactions | `false` |
-| `PGVIS_PRE_REQUEST` | Pre-request function name | none |
-| `PGVIS_OPENAPI_TITLE` | OpenAPI document title | none |
-| `PGVIS_OPENAPI_SERVER_URL` | OpenAPI server URL override | none |
-| `PGVIS_REPLICA_DSNS` | Read replica DSNs (comma-separated) | none |
-| `PGVIS_MAX_REPLICATION_LAG_BYTES` | Replica lag threshold in bytes | `10485760` (10 MB) |
-| `PGVIS_HEALTH_CHECK_INTERVAL_MS` | Replica health check interval (ms) | `5000` |
-| `PGVIS_CACHE_ENABLED` | Enable the in-memory read cache | `false` |
-| `PGVIS_CACHE_TTL` | Cache entry TTL in seconds | `60` |
-| `PGVIS_CACHE_MAX_ENTRIES` | Max cache entries (LRU capacity) | `10000` |
-| `PGVIS_CACHE_LISTS` | Also cache list queries (not just PK lookups) | `false` |
-| `RUST_LOG` | Log level filter | `pgvis=info,tower_http=info` |
+| `PGVIS_SCHEMAS` | Schemas to expose (comma-separated; all commands) | `public` (SQLite tables live in `main`, so pass `main` there) |
+| `PGVIS_BIND` | `serve` bind address | `127.0.0.1:3000` |
+| `PGVIS_INSECURE_NO_AUTH` | `serve`: allow starting with neither `jwt_secret` nor `anon_role` (`true`) | `false` |
+| `PGVIS_REPLICA_DSNS` | `serve`: read replica DSNs (comma-separated) | none |
+| `PGVIS_CACHE_ENABLED` | `serve`: enable the in-memory read cache | `false` |
+| `PGVIS_CACHE_TTL` | `serve`: cache entry TTL in seconds | `60` |
+| `PGVIS_CACHE_MAX_ENTRIES` | `serve`: max cache entries | `10000` |
+| `PGVIS_CACHE_LISTS` | `serve`: also cache list queries (not just PK lookups) | `false` |
+| `PGVIS_PUBSUB_ENABLED` | `serve`: enable pub/sub | `false` |
+| `PGVIS_PUBSUB_CHANNEL_PREFIX` | `serve`: pub/sub channel prefix | `pgvis:` |
+| `RUST_LOG` | Log level filter (logs are JSON on stderr) | `pgvis=info,tower_http=info` |
+| `SSL_CERT_FILE` | CA bundle used to verify the Postgres server's TLS certificate (see [TLS](#database-connection-and-tls-postgres)) | platform trust store |
+
+### Config-key variables
+
+Every scalar config key can also be set as `PGVIS_<KEY>` (top-level keys) or `PGVIS_<TABLE>__<KEY>` (keys inside a `[table]`). List-valued keys other than `schemas` (`extra_search_path`, `replica.replica_dsns`, `pubsub.allowed_channels`) are best set in the TOML file.
+
+| Variable | Config key | Default |
+|----------|-----------|---------|
+| `PGVIS_JWT_SECRET` | `jwt_secret` | none |
+| `PGVIS_JWT_ALGO` | `jwt_algo` | `HS256` |
+| `PGVIS_JWT_AUD` | `jwt_aud` | none (`aud` not checked) |
+| `PGVIS_ANON_ROLE` | `anon_role` | none |
+| `PGVIS_ROLE_CLAIM_KEY` | `role_claim_key` | `role` |
+| `PGVIS_AGGREGATES_ENABLED` | `aggregates_enabled` | `false` |
+| `PGVIS_PLAN_ENABLED` | `plan_enabled` | `false` |
+| `PGVIS_TX_ALLOW_OVERRIDE` | `tx_allow_override` | `false` |
+| `PGVIS_TX_ROLLBACK_ALL` | `tx_rollback_all` | `false` |
+| `PGVIS_MAX_ROWS` | `max_rows` | unlimited |
+| `PGVIS_STATEMENT_TIMEOUT_MS` | `statement_timeout_ms` | `30000` |
+| `PGVIS_READ_ONLY` | `read_only` | `false` |
+| `PGVIS_PRE_REQUEST` | `pre_request` | none |
+| `PGVIS_OPENAPI_TITLE` | `openapi_title` | none |
+| `PGVIS_OPENAPI_SERVER_URL` | `openapi_server_url` | none |
+| `PGVIS_OPENAPI_MODE` | `openapi_mode` | `IgnorePrivileges` |
+| `PGVIS_POOL__SIZE` | `pool.size` | `16` |
+| `PGVIS_POOL__TIMEOUT_MS` | `pool.timeout_ms` | `5000` |
+| `PGVIS_POOL__CREATE_TIMEOUT_MS` | `pool.create_timeout_ms` | `5000` |
+| `PGVIS_POOL__RECYCLE_TIMEOUT_MS` | `pool.recycle_timeout_ms` | `5000` |
+| `PGVIS_POOL__KEEPALIVES` | `pool.keepalives` | `true` |
+| `PGVIS_POOL__KEEPALIVES_IDLE_SECS` | `pool.keepalives_idle_secs` | `60` |
+| `PGVIS_POOL__CONNECT_TIMEOUT_SECS` | `pool.connect_timeout_secs` | `10` |
+| `PGVIS_POOL__RECYCLING_METHOD` | `pool.recycling_method` | `Fast` |
+| `PGVIS_ROUTING__PREFIX` | `routing.prefix` | `api` |
+| `PGVIS_ROUTING__SCHEMA_IN_PATH` | `routing.schema_in_path` | `true` |
+| `PGVIS_ROUTING__DEFAULT_SCHEMA` | `routing.default_schema` | `public` |
+| `PGVIS_ROUTING__MCP_SEPARATOR` | `routing.mcp_separator` | `/` |
+| `PGVIS_REPLICA__MAX_REPLICATION_LAG_BYTES` | `replica.max_replication_lag_bytes` | `10485760` (10 MB) |
+| `PGVIS_REPLICA__HEALTH_CHECK_INTERVAL_MS` | `replica.health_check_interval_ms` | `5000` |
+| `PGVIS_REPLICA__PRIMARY_READS` | `replica.primary_reads` | `true` |
+| `PGVIS_CACHE__ENABLED` | `cache.enabled` | `false` |
+| `PGVIS_CACHE__TTL_SECONDS` | `cache.ttl_seconds` | `60` |
+| `PGVIS_CACHE__MAX_ENTRIES` | `cache.max_entries` | `10000` |
+| `PGVIS_CACHE__CACHE_LISTS` | `cache.cache_lists` | `false` |
+| `PGVIS_PUBSUB__ENABLED` | `pubsub.enabled` | `false` |
+| `PGVIS_PUBSUB__CHANNEL_PREFIX` | `pubsub.channel_prefix` | `pgvis:` |
+| `PGVIS_PUBSUB__MAX_PAYLOAD_BYTES` | `pubsub.max_payload_bytes` | `7500` |
+| `PGVIS_PUBSUB__MAX_SUBSCRIBERS` | `pubsub.max_subscribers` | `1000` |
+| `PGVIS_PUBSUB__MAX_SUBSCRIBERS_PER_IDENTITY` | `pubsub.max_subscribers_per_identity` | `100` |
+| `PGVIS_PUBSUB__CHANNEL_BUFFER_SIZE` | `pubsub.channel_buffer_size` | `64` |
+| `PGVIS_PUBSUB__AUTHORIZE_FUNCTION` | `pubsub.authorize_function` | none |
+| `PGVIS_PUBSUB__RECONNECT_BASE_MS` | `pubsub.reconnect_base_ms` | `500` |
+| `PGVIS_PUBSUB__RECONNECT_MAX_MS` | `pubsub.reconnect_max_ms` | `30000` |
+| `PGVIS_PUBSUB__KEEPALIVE_INTERVAL_SECS` | `pubsub.keepalive_interval_secs` | `15` |
+
+:::caution
+Flat spellings such as `PGVIS_POOL_SIZE` or `PGVIS_MAX_REPLICATION_LAG_BYTES` are **not** read — nested keys need the `__` separator.
+:::
 
 ## TOML Config File
 
@@ -62,6 +105,7 @@ extra_search_path = ["extensions"]
 # Authentication
 jwt_secret = "your-secret-key-here"
 jwt_algo = "HS256"
+jwt_aud = "my-api"          # optional: require this `aud` claim
 anon_role = "web_anon"
 role_claim_key = "role"
 
@@ -135,20 +179,23 @@ cache_lists = false
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `jwt_secret` | `string?` | `null` | JWT secret for token verification. If absent, JWT verification is disabled. Can be a symmetric secret or path to a public key. |
+| `jwt_secret` | `string?` | unset | Key used to verify tokens. For `HS256`/`HS384`/`HS512` it is the shared secret (used as raw bytes). For `RS256`/`EdDSA` it is the **PEM-encoded public key itself** (the key text, not a file path); a key that fails to parse makes every authenticated request fail with a 500 rather than falling back to HMAC. If unset, JWT verification is disabled and every request runs as `anon_role`. |
 | `jwt_algo` | `enum` | `HS256` | JWT signing algorithm. One of: `HS256`, `HS384`, `HS512`, `RS256`, `EdDSA`. |
-| `anon_role` | `string?` | `null` | The database role used for unauthenticated requests. On Postgres, this role's permissions define anonymous access. |
-| `role_claim_key` | `string` | `"role"` | The JWT claim key that specifies the database role. The value of this claim becomes the `SET LOCAL role` value. |
+| `jwt_aud` | `string?` | unset | Required audience. When set, a token whose `aud` does not include this value is rejected (401). When unset, `aud` is not checked. Set it whenever the signing key is shared with other applications. |
+| `anon_role` | `string?` | unset | The database role used for unauthenticated requests, and for tokens without a role claim. On Postgres, this role's permissions define anonymous access. On SQLite it is informational only. |
+| `role_claim_key` | `string` | `"role"` | The (top-level) JWT claim that names the database role. Its value becomes the transaction's role. |
 
 #### How JWT auth works
 
 1. Client sends `Authorization: Bearer <token>` header
-2. pgvis verifies the token against `jwt_secret` using `jwt_algo`
-3. The role from the token's `role_claim_key` claim is used to `SET LOCAL role`
-4. All JWT claims are available as `current_setting('request.jwt.claims')` in SQL
+2. pgvis verifies the token against `jwt_secret` using `jwt_algo`. The signature is always checked; `exp` and `nbf` are checked when present; `aud` is checked when `jwt_aud` is set
+3. The role from the token's `role_claim_key` claim becomes the transaction's role (`SET LOCAL role`). A token without that claim falls back to `anon_role`; if no `anon_role` is configured it is rejected with **401** — it never runs as the DSN's own role
+4. All JWT claims are available as one JSON value in `current_setting('request.jwt.claims', true)` in SQL. (The older per-claim `request.jwt.claim.<key>` settings are **not** set — read claims from the JSON, e.g. `current_setting('request.jwt.claims', true)::json->>'sub'`.)
 5. This integrates with PostgreSQL Row-Level Security (RLS)
 
-If no valid JWT is present, the `anon_role` is used (or the connection's default role if `anon_role` is not set).
+Requests **without** a token run as `anon_role`. When `jwt_secret` is set and there is no `anon_role`, an unauthenticated request is a 401 — this also applies to the metadata endpoints (the OpenAPI/schema root and `GET /pgvis/cache`).
+
+When `jwt_secret` is unset, tokens are not verified and every request runs as `anon_role`. If **neither** `jwt_secret` nor `anon_role` is set, every request would run as the DSN's own role (often the table owner, which bypasses RLS), so `pgvis serve` refuses to start unless you pass `--insecure-no-auth` (or `PGVIS_INSECURE_NO_AUTH=true`). Use that only for local development.
 
 ### Feature Gates
 
@@ -158,19 +205,21 @@ If no valid JWT is present, the `anon_role` is used (or the connection's default
 | `plan_enabled` | `bool` | `false` | Whether clients can request `Accept: application/vnd.pgrst.plan+json` to get the query execution plan. |
 | `tx_allow_override` | `bool` | `false` | Whether `Prefer: tx=rollback` is honoured. When false, the preference is silently ignored. |
 | `tx_rollback_all` | `bool` | `false` | Force rollback of ALL transactions regardless of client preference. Useful for testing/staging environments. |
-| `read_only` | `bool` | `false` | Reject all mutations (POST/PATCH/DELETE on tables, VOLATILE RPC calls). MCP tool catalogues omit write tools entirely. |
+| `read_only` | `bool` | `false` | MCP read-only mode (also set by `pgvis mcp --read-only`). The MCP tool catalogue omits create/update/delete tools and all RPC tools, such calls are rejected if attempted anyway, and the `pubsub_publish` tool is refused. It does **not** restrict the REST API — use database privileges for that. |
 
 ### Query Limits
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_rows` | `u64?` | `null` (unlimited) | Maximum number of rows returned per request. Acts as a server-side cap on `limit`. When a client requests more rows than this (or no limit), the response is capped. |
-| `statement_timeout_ms` | `u64?` | `30000` (30s) | SQL statement timeout in milliseconds. Applied to every query. Prevents runaway queries. Set to `null` or `0` to disable. |
+| `max_rows` | `u64?` | unset (unlimited) | Maximum number of rows a read returns. Acts as a server-side cap on `limit`: when a client requests more rows than this (or no limit), the response is capped. It never limits which rows a `PATCH`/`DELETE` changes. |
+| `statement_timeout_ms` | `u64?` | `30000` (30s) | SQL statement timeout in milliseconds, set per transaction (`statement_timeout`). Prevents runaway queries. Set to `0` to disable. |
 
 ### Connection Pool
 
-Pool settings live under the `[pool]` table in TOML (or as flat `PGVIS_POOL_*` env vars).
+Pool settings live under the `[pool]` table in TOML (or as `PGVIS_POOL__*` env vars, with a double underscore).
 These settings apply to both the primary pool and all replica pools.
+
+Each request takes one pooled connection for two round trips, however many claims its JWT carries: `BEGIN`, the role/claims/statement-timeout settings, the pre-request call and the query go out as one pipelined flight, then `COMMIT`/`ROLLBACK`. When no connection becomes free within `pool.timeout_ms`, or the database is unreachable, the request fails with **503** (`PGRST000`) so clients can retry. `GET /pgvis/cache` reports the primary pool's occupancy under `pool` (`max_size`, `size`, `available`, `waiting`); a `waiting` count that stays above zero means the pool is too small for the load.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -181,7 +230,7 @@ These settings apply to both the primary pool and all replica pools.
 | `pool.keepalives` | `bool` | `true` | Whether TCP keepalive is enabled on connections. Critical for connections through NATs, firewalls, or load balancers that silently drop idle TCP connections. |
 | `pool.keepalives_idle_secs` | `u64` | `60` (1 min) | How long a connection must be idle before the first keepalive probe is sent. Lower values detect dead connections faster but generate more traffic. Only effective when `keepalives = true`. |
 | `pool.connect_timeout_secs` | `u64` | `10` | Maximum time (seconds) to wait for a TCP connection to be established with the Postgres server. Independent of the pool checkout timeout. Set to `0` for no timeout. |
-| `pool.recycling_method` | `enum` | `Fast` | How connections are validated when returned to the pool. `Fast`: check `is_closed()` only (cheapest). `Verified`: execute an empty query to ensure the connection responds (one round-trip). `Clean`: run DISCARD-like statements for pristine session state (most thorough). |
+| `pool.recycling_method` | `enum` | `Fast` | How connections are validated when checked out of the pool. `Fast`: check `is_closed()` only (cheapest). `Verified`: execute an empty query to ensure the connection responds (one round-trip). `Clean`: run DISCARD-like statements for pristine session state (most thorough). |
 
 #### Recycling methods explained
 
@@ -208,9 +257,9 @@ These settings apply to both the primary pool and all replica pools.
 
 #### How replica routing works
 
-1. **Writes** (`POST`, `PATCH`, `PUT`, `DELETE` on tables) always go to the primary
-2. **Reads** (`GET` on tables/views, read-only RPC) are distributed round-robin across healthy replicas (and the primary if `primary_reads = true`)
-3. A background health monitor checks each replica's replication lag every `health_check_interval_ms`
+1. **Writes** (`POST`, `PATCH`, `PUT`, `DELETE` on tables) and calls to `VOLATILE` functions always go to the primary
+2. **Reads** (`GET` on tables/views, `STABLE`/`IMMUTABLE` RPC) are distributed round-robin across healthy replicas (and the primary if `primary_reads = true`)
+3. A background health monitor checks every replica concurrently each `health_check_interval_ms`, over its own dedicated connections with short timeouts — so a replica whose request pool is merely busy is not marked unhealthy, and one unreachable host doesn't stall the checks of the others
 4. Replicas whose WAL receive position is more than `max_replication_lag_bytes` behind the primary are temporarily excluded
 5. If all replicas are unhealthy, reads fall back to the primary automatically
 
@@ -229,7 +278,7 @@ An optional in-memory cache for read responses. Off by default — when disabled
 |-------|------|---------|-------------|
 | `cache.enabled` | `bool` | `false` | Master switch. When `true`, an in-memory response cache is created at startup. |
 | `cache.ttl_seconds` | `u64` | `60` | How long a cached entry lives before it expires and the next read re-queries the database. Lower = fresher data; higher = less DB load. |
-| `cache.max_entries` | `u64` | `10000` | Maximum entries held. When full, least-recently-used entries are evicted. |
+| `cache.max_entries` | `u64` | `10000` | Maximum entries held. When full, entries are evicted (SIEVE policy, which removes stale-generation entries before live ones). |
 | `cache.cache_lists` | `bool` | `false` | Whether to cache list/collection queries in addition to primary-key lookups. See the caveats below before enabling. |
 
 #### What gets cached
@@ -238,51 +287,53 @@ An optional in-memory cache for read responses. Off by default — when disabled
 - **List queries** are cached only when `cache_lists = true`.
 - **Queries with embeds** are never cached.
 
-The cache key hashes the request's **JWT claims** together with the **rendered SQL and parameters**, prefixed by the database role. This means each entry is unique per `(role, identity, query shape)`:
+The cache key hashes the request's **JWT claims** together with the **rendered SQL and parameters** (a keyed hash with a random per-process key), prefixed by the database role and the table's current **generation**. This means each entry is unique per `(role, identity, query shape, table generation)`:
 
 - Two users who share a role but differ in identity (e.g. different `sub`) get separate entries — one user's row-level-security-filtered rows are never served to another.
 - The same primary key requested with a different `select`, an extra filter, a different order, or different pagination gets a separate entry — the cache never returns a response of the wrong shape.
 
 #### Invalidation
 
-Any write clears the entire cache:
+Invalidation is generation-based — nothing is scanned or cleared; a bumped generation simply makes later reads compute a different key, and old entries age out:
 
-- A mutation (`POST`/`PATCH`/`PUT`/`DELETE`) on any table, and
-- A **volatile** RPC call (a function that may modify data).
+- A mutation (`POST`/`PATCH`/`PUT`/`DELETE`) on a table invalidates **that table's** entries.
+- A **volatile** RPC call (a function that may modify data) invalidates **every** table's entries.
+- A schema cache reload invalidates everything, so no response cached against the old schema is served.
 
-Clearing wholesale is deliberate: a write can cascade to other tables through foreign keys or triggers, so evicting only the directly-targeted table could leave stale rows elsewhere. The `ttl_seconds` window is the upper bound on staleness for everything else (for example, a data-modifying function mislabeled `STABLE`/`IMMUTABLE` in the catalog, which won't trigger invalidation).
+Only the directly-written table is invalidated by a mutation: a write that cascades to other tables through foreign keys or triggers leaves their entries in place until they expire. The `ttl_seconds` window is the upper bound on staleness for such cases (and for a data-modifying function mislabeled `STABLE`/`IMMUTABLE` in the catalog, which won't trigger invalidation).
 
 #### Caveats — read before enabling
 
 - **Highly personalized data caches poorly.** Because claims are part of the key, per-user data produces a distinct entry per user and gets little benefit. The cache shines on PK lookups against shared, role-gated data.
 - **List cardinality.** High-variety list traffic produces many distinct keys, yielding low hit rates and high memory churn. This is why `cache_lists` is off by default.
-- **Write-heavy multi-table workloads.** Since every write clears the whole cache, frequent writes erase the working set before it pays off. The cache targets read-heavy workloads.
+- **Write-heavy workloads.** Frequent writes to a table keep invalidating its entries before they pay off, and cascading writes (FKs, triggers) can leave other tables' entries stale for up to `ttl_seconds`. The cache targets read-heavy workloads.
 
 #### Monitoring
 
-`GET /pgvis/cache` (a fixed path, not under your configured prefix) returns the current settings plus hit/miss/invalidation counters and the hit rate:
+`GET /pgvis/cache` (a fixed path, not under your configured prefix) returns the current settings, hit/miss/invalidation counters and the hit rate, plus connection-pool occupancy:
 
 ```json
 {
   "settings": { "enabled": true, "ttl_seconds": 60, "max_entries": 10000, "cache_lists": false },
-  "stats":    { "hits": 1280, "misses": 240, "invalidations": 12, "entries": 305, "hit_rate": 84.21 }
+  "stats":    { "hits": 1280, "misses": 240, "invalidations": 12, "entries": 305, "hit_rate": 84.21 },
+  "pool":     { "max_size": 16, "size": 4, "available": 3, "waiting": 0 }
 }
 ```
 
-The endpoint is always available; `stats` is `null` when caching is disabled.
+The endpoint is always available; `stats` is `null` when caching is disabled, and `pool` is `null` on SQLite. It authenticates like the data API (a 401 without a token when `jwt_secret` is set and there is no `anon_role`).
 
 ### Hooks
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `pre_request` | `string?` | `null` | Fully-qualified function name to call before every query. Called after JWT verification and role switching. Can raise exceptions to abort the request (e.g., rate limiting, audit logging). |
+| `pre_request` | `string?` | unset | Fully-qualified function name to call before every query. Called after JWT verification and role switching. Can raise exceptions to abort the request (e.g., rate limiting, audit logging). |
 
 ### OpenAPI
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `openapi_title` | `string?` | `null` | Title in the OpenAPI document's `info` section. |
-| `openapi_server_url` | `string?` | `null` | Server URL override for the OpenAPI spec (for proxied deployments). |
+| `openapi_title` | `string?` | unset | Title in the OpenAPI document's `info` section. |
+| `openapi_server_url` | `string?` | unset | Server URL override for the OpenAPI spec (for proxied deployments). |
 | `openapi_mode` | `enum` | `IgnorePrivileges` | Controls spec generation. `IgnorePrivileges`: show everything. `FollowPrivileges`: filter based on role. `Disabled`: disable the endpoint entirely. |
 
 ### Routing
@@ -293,6 +344,34 @@ The endpoint is always available; `stats` is `null` when caching is disabled.
 | `routing.schema_in_path` | `bool` | `true` | Whether the schema name appears in the URL path. When `true`: `/{prefix}/{schema}/{table}`. When `false`: `/{prefix}/{table}` with schema from header. |
 | `routing.default_schema` | `string` | `"public"` | The default schema when `schema_in_path = false` and no profile header is sent. Must be one of the schemas listed in `schemas`. |
 | `routing.mcp_separator` | `char` | `'/'` | Separator in MCP tool names. `/` maps to hierarchical discovery. `.` is an alternative for flat tool lists. |
+
+### Database Connection and TLS (Postgres)
+
+There are no TLS config keys: TLS follows the DSN's `sslmode` parameter, for the primary, every replica and the pub/sub listener.
+
+| `sslmode` | Behaviour |
+|-----------|-----------|
+| `disable` | Plaintext only |
+| `prefer` (default) | TLS whenever the server offers it. If the server's certificate does not verify, the connection **fails** — it does not fall back to plaintext |
+| `require` | TLS is mandatory, and the certificate is verified |
+
+Server certificates are always verified against the platform trust store; set `SSL_CERT_FILE` to point at a CA bundle (for example your provider's root CA) when the server's CA is not in it. libpq-only parameters such as `sslrootcert`, `sslcert`, and the `verify-ca`/`verify-full` modes are not supported.
+
+```bash
+pgvis --dsn "postgres://app:secret@db.example.com:5432/app?sslmode=require" serve
+SSL_CERT_FILE=/etc/ssl/certs/my-db-ca.pem pgvis --dsn "postgres://…?sslmode=require" serve
+```
+
+The DSN's password is redacted (`***`) in pgvis's startup logs. PostgreSQL 17 or newer is required (17 and 18 are tested); older servers are rejected at startup.
+
+### Schema Cache Reload
+
+There are no config keys for reloading. pgvis re-introspects the schema, debounced, after any of:
+
+- `NOTIFY pgrst, 'reload schema'` (or an empty payload) from any session on Postgres — e.g. at the end of a migration. pgvis always listens on the `pgrst` channel (PostgREST's convention); with replicas, it listens on the primary
+- `SIGUSR1` to the `pgvis serve` process
+
+A failed re-introspection keeps the current schema cache. A reload also invalidates the data cache.
 
 ---
 
@@ -353,28 +432,46 @@ CLI flags override config file and environment variable values.
 
 | Flag | Env | Description |
 |------|-----|-------------|
-| `--bind <ADDR>` | `PGVIS_BIND` | Bind address (default: `0.0.0.0:3000`) |
-| `--schema <NAME>` | `PGVIS_SCHEMAS` | Schemas to expose (repeatable or comma-separated) |
+| `-b`, `--bind <ADDR>` | `PGVIS_BIND` | Bind address (default: `127.0.0.1:3000`, loopback only; pass e.g. `0.0.0.0:3000` to expose it) |
+| `--insecure-no-auth` | `PGVIS_INSECURE_NO_AUTH` | Allow starting with neither `jwt_secret` nor `anon_role`; every request then runs as the DSN's own role. Without it, `serve` refuses to start in that case. Local development only |
+| `-s`, `--schema <NAME>` | `PGVIS_SCHEMAS` | Schemas to expose (repeatable or comma-separated) |
 | `--replica-dsn <DSN>` | `PGVIS_REPLICA_DSNS` | Read replica DSNs (repeatable or comma-separated) |
 | `--cache-enabled` | `PGVIS_CACHE_ENABLED` | Enable the in-memory read cache |
-| `--cache-ttl <SECS>` | `PGVIS_CACHE_TTL` | Cache entry TTL in seconds |
-| `--cache-max-entries <N>` | `PGVIS_CACHE_MAX_ENTRIES` | Max cache entries (LRU capacity) |
+| `--cache-ttl <SECS>` | `PGVIS_CACHE_TTL` | Cache entry TTL in seconds (`cache.ttl_seconds`) |
+| `--cache-max-entries <N>` | `PGVIS_CACHE_MAX_ENTRIES` | Max cache entries (`cache.max_entries`) |
 | `--cache-lists` | `PGVIS_CACHE_LISTS` | Also cache list queries (not just PK lookups) |
+| `--pubsub-enabled` | `PGVIS_PUBSUB_ENABLED` | Enable pub/sub (SSE at `/pubsub/{channel}` and MCP tools) |
+| `--pubsub-channel-prefix <PREFIX>` | `PGVIS_PUBSUB_CHANNEL_PREFIX` | Pub/sub channel prefix (`pubsub.channel_prefix`) |
 | `--mcp-http` | — | Also serve MCP at `/mcp` via Streamable HTTP |
+
+`serve` is the default command, but when the subcommand is omitted its flags take their built-in defaults and the `serve`-only variables above (`PGVIS_BIND`, `PGVIS_INSECURE_NO_AUTH`, `PGVIS_CACHE_*`, …) are **not** read. Name `serve` explicitly.
 
 ### `pgvis mcp`
 
 | Flag | Env | Description |
 |------|-----|-------------|
-| `--schema <NAME>` | `PGVIS_SCHEMAS` | Schemas to expose |
-| `--read-only` | — | Expose only read tools (no create/update/delete) |
+| `-s`, `--schema <NAME>` | `PGVIS_SCHEMAS` | Schemas to expose |
+| `--read-only` | — | Expose only read tools (no create/update/delete/RPC); same as `read_only = true` |
+
+### `pgvis openapi` / `pgvis inspect`
+
+No flags. `openapi` prints the OpenAPI 3.0 document; `inspect` dumps the introspected schema cache as JSON. Both write to stdout and exit.
 
 ### Global options
 
+Global options go **before** the subcommand (`pgvis --dsn … serve`, not `pgvis serve --dsn …`).
+
 | Flag | Env | Description |
 |------|-----|-------------|
-| `--dsn <DSN>` | `PGVIS_DSN` | Database connection string (required) |
-| `--config <FILE>` | `PGVIS_CONFIG` | Path to TOML config file |
+| `-d`, `--dsn <DSN>` | `PGVIS_DSN` | Database connection string (required) |
+| `-c`, `--config <FILE>` | `PGVIS_CONFIG` | Path to TOML config file |
+
+### Signals
+
+| Signal | Effect (`pgvis serve`) |
+|--------|------------------------|
+| `SIGUSR1` | Reload the schema cache |
+| `SIGTERM` / Ctrl-C | Graceful shutdown: stop accepting connections and finish in-flight requests |
 
 ---
 
@@ -401,11 +498,17 @@ PGVIS_MAX_ROWS=500 pgvis --config pgvis.toml serve
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `pubsub.enabled` | bool | `false` | Enable the pub/sub subsystem |
+| `pubsub.enabled` | bool | `false` | Enable the pub/sub subsystem. When `false` no listener connection or background task is created |
 | `pubsub.channel_prefix` | string | `"pgvis:"` | Prefix added to Postgres LISTEN/NOTIFY channel names |
-| `pubsub.max_payload_bytes` | integer | `7500` | Maximum message payload size |
-| `pubsub.buffer_capacity` | integer | `256` | In-process broadcast buffer per channel |
+| `pubsub.max_payload_bytes` | integer | `7500` | Maximum message payload size in bytes, checked before publishing (Postgres caps NOTIFY payloads at ~8000 bytes) |
+| `pubsub.max_subscribers` | integer | `1000` | Maximum concurrent subscribers across all channels; beyond it new subscriptions get a 503 |
+| `pubsub.max_subscribers_per_identity` | integer | `100` | Concurrent SSE subscribers per JWT role + `sub` (`0` = no limit); callers without `sub` (e.g. anonymous clients) can't be told apart and are bounded by `max_subscribers` only |
+| `pubsub.channel_buffer_size` | integer | `64` | Per-channel broadcast buffer; a subscriber that falls further behind receives a "lagged" notice |
 | `pubsub.allowed_channels` | string[] | `[]` | Channel allowlist (empty = allow all). Supports globs: `chat.*` |
+| `pubsub.authorize_function` | string | unset | SQL function called as `fn(channel text, op text)` (`op` is `'subscribe'` or `'publish'`) in a transaction running as the caller's role with their JWT claims set. Anything but `true` (false, NULL, or an error) is a 403. Unset = any caller that passes JWT verification may use every channel in `allowed_channels` |
+| `pubsub.reconnect_base_ms` | integer | `500` | Listener reconnect backoff base (`base * 2^attempt`) |
+| `pubsub.reconnect_max_ms` | integer | `30000` | Listener reconnect backoff cap |
+| `pubsub.keepalive_interval_secs` | integer | `15` | Interval of the SSE `: keepalive` comment that keeps idle connections open through proxies |
 
 TOML example:
 
@@ -421,8 +524,9 @@ Environment variables:
 
 | Variable | Maps to |
 |----------|---------|
-| `PGVIS_PUBSUB_ENABLED` | `pubsub.enabled` |
-| `PGVIS_PUBSUB_CHANNEL_PREFIX` | `pubsub.channel_prefix` |
+| `PGVIS_PUBSUB_ENABLED` | `pubsub.enabled` (`serve` only) |
+| `PGVIS_PUBSUB_CHANNEL_PREFIX` | `pubsub.channel_prefix` (`serve` only) |
+| `PGVIS_PUBSUB__<KEY>` | any scalar `pubsub.<key>`, e.g. `PGVIS_PUBSUB__MAX_SUBSCRIBERS=5000` |
 
 See the [Pub/Sub guide](/guides/pubsub) for full usage details.
 
@@ -436,7 +540,8 @@ See the [Pub/Sub guide](/guides/pubsub) for full usage details.
 | `db-extra-search-path` | `extra_search_path` |
 | `db-anon-role` | `anon_role` |
 | `jwt-secret` | `jwt_secret` |
-| `jwt-role-claim-key` | `role_claim_key` |
+| `jwt-aud` | `jwt_aud` |
+| `jwt-role-claim-key` | `role_claim_key` (top-level claim name only) |
 | `db-aggregates-enabled` | `aggregates_enabled` |
 | `db-plan-enabled` | `plan_enabled` |
 | `db-tx-allow-override` | `tx_allow_override` |

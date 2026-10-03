@@ -56,8 +56,10 @@ pub struct AppState {
     /// In-memory data cache for read responses (None when caching is disabled).
     pub data_cache: Option<Arc<DataCache>>,
     /// Cached OpenAPI JSON, lazily populated and invalidated on schema reload.
-    /// Tuple: (schema_cache_ptr as usize, serialized Value).
-    openapi_cache: Arc<std::sync::Mutex<(usize, Option<serde_json::Value>)>>,
+    /// Tuple: (schema cache the spec was built from, serialized Value). The
+    /// `Weak` pins that cache's allocation, so a reloaded cache can never reuse
+    /// its address and be mistaken for it.
+    openapi_cache: Arc<std::sync::Mutex<(std::sync::Weak<SchemaCache>, Option<serde_json::Value>)>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +123,7 @@ impl AppState {
             dialect,
             backend,
             data_cache,
-            openapi_cache: Arc::new(std::sync::Mutex::new((0, None))),
+            openapi_cache: Arc::new(std::sync::Mutex::new((std::sync::Weak::new(), None))),
         }
     }
 
@@ -185,7 +187,10 @@ impl AppState {
             pre_request: self.config.pre_request.clone(),
             statement_timeout: self.config.statement_timeout_ms,
             tx_end: None,
-            is_mutation: matches!(plan, ActionPlan::Mutate(_)),
+            is_mutation: plan_writes(&plan),
+            raw_body: false,
+            max_affected: None,
+            single_row: false,
         };
 
         let result = self.backend.execute(&exec_ctx, &sql, &params).await?;
@@ -286,6 +291,7 @@ impl AppState {
         caller: &CallerIdentity,
     ) -> Result<QueryResult, Error> {
         let cache = self.cache.load();
+        let params = &QueryParams::from(params);
 
         let select = params
             .get("select")
@@ -338,6 +344,9 @@ impl AppState {
             statement_timeout: self.config.statement_timeout_ms,
             tx_end: None,
             is_mutation: false,
+            raw_body: false,
+            max_affected: None,
+            single_row: false,
         };
 
         self.backend.execute(&exec_ctx, &sql, &sql_params).await
@@ -516,7 +525,7 @@ async fn handle_table_with_schema(
     method: axum::http::Method,
     Path(params): Path<HashMap<String, String>>,
     headers: HeaderMap,
-    Query(query_params): Query<HashMap<String, String>>,
+    Query(query_params): Query<Vec<(String, String)>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Response {
     let schema = params.get("schema").cloned().unwrap_or_default();
@@ -530,7 +539,7 @@ async fn handle_table_with_schema(
         request_method,
         false,
         &headers,
-        &query_params,
+        &QueryParams(query_params),
         body.map(|b| b.0),
     )
     .await
@@ -542,7 +551,7 @@ async fn handle_rpc_with_schema(
     method: axum::http::Method,
     Path(params): Path<HashMap<String, String>>,
     headers: HeaderMap,
-    Query(query_params): Query<HashMap<String, String>>,
+    Query(query_params): Query<Vec<(String, String)>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Response {
     let schema = params.get("schema").cloned().unwrap_or_default();
@@ -557,7 +566,7 @@ async fn handle_rpc_with_schema(
         request_method,
         true,
         &headers,
-        &query_params,
+        &QueryParams(query_params),
         body.map(|b| b.0),
     )
     .await
@@ -573,7 +582,7 @@ async fn handle_table_no_schema(
     method: axum::http::Method,
     Path(params): Path<HashMap<String, String>>,
     headers: HeaderMap,
-    Query(query_params): Query<HashMap<String, String>>,
+    Query(query_params): Query<Vec<(String, String)>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Response {
     let target = params.get("target").cloned().unwrap_or_default();
@@ -587,7 +596,7 @@ async fn handle_table_no_schema(
         request_method,
         false,
         &headers,
-        &query_params,
+        &QueryParams(query_params),
         body.map(|b| b.0),
     )
     .await
@@ -599,7 +608,7 @@ async fn handle_rpc_no_schema(
     method: axum::http::Method,
     Path(params): Path<HashMap<String, String>>,
     headers: HeaderMap,
-    Query(query_params): Query<HashMap<String, String>>,
+    Query(query_params): Query<Vec<(String, String)>>,
     body: Option<Json<serde_json::Value>>,
 ) -> Response {
     let function = params.get("function").cloned().unwrap_or_default();
@@ -614,7 +623,7 @@ async fn handle_rpc_no_schema(
         request_method,
         true,
         &headers,
-        &query_params,
+        &QueryParams(query_params),
         body.map(|b| b.0),
     )
     .await
@@ -626,6 +635,13 @@ async fn handle_rpc_no_schema(
 
 /// Root endpoint handler — returns available schemas or the OpenAPI spec.
 async fn handle_root(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    // The OpenAPI spec and schema list describe every exposed table and
+    // function: authenticate like the data API, so an anonymous caller can't
+    // enumerate them on a deployment that requires auth.
+    if let Err(resp) = verify_jwt(&headers, &state.config) {
+        return resp;
+    }
+
     // Check if the client accepts OpenAPI JSON
     let accept = headers
         .get("accept")
@@ -650,13 +666,12 @@ async fn handle_root(State(state): State<AppState>, headers: HeaderMap) -> Respo
         }
 
         // Use cached OpenAPI spec, regenerating only when schema cache changes.
-        let cache = state.cache.load();
-        let cache_ptr = Arc::as_ptr(&cache) as usize;
+        let cache = state.cache.load_full();
 
         // Fast path: check if we already have a cached spec for this schema version.
         let cached_val = {
             let guard = state.openapi_cache.lock().unwrap();
-            if guard.0 == cache_ptr {
+            if std::ptr::eq(guard.0.as_ptr(), Arc::as_ptr(&cache)) {
                 guard.1.clone()
             } else {
                 None
@@ -672,7 +687,7 @@ async fn handle_root(State(state): State<AppState>, headers: HeaderMap) -> Respo
         match serde_json::to_value(&spec) {
             Ok(val) => {
                 let mut guard = state.openapi_cache.lock().unwrap();
-                *guard = (cache_ptr, Some(val.clone()));
+                *guard = (Arc::downgrade(&cache), Some(val.clone()));
                 (StatusCode::OK, Json(val)).into_response()
             }
             Err(e) => (
@@ -693,11 +708,16 @@ async fn handle_root(State(state): State<AppState>, headers: HeaderMap) -> Respo
     }
 }
 
-/// Cache info endpoint — returns cache stats and current settings.
+/// Cache info endpoint — returns cache stats, current settings and pool status.
 ///
-/// `GET /pgvis/cache` → JSON with stats (hits, misses, hit_rate, entries, invalidations)
-/// and current settings (enabled, ttl_seconds, max_entries, cache_lists).
-async fn handle_cache_info(State(state): State<AppState>) -> Response {
+/// `GET /pgvis/cache` → JSON with stats (hits, misses, hit_rate, entries, invalidations),
+/// current settings (enabled, ttl_seconds, max_entries, cache_lists) and the
+/// connection pool's occupancy (`pool`: max_size, size, available, waiting).
+/// Authenticated like the data API.
+async fn handle_cache_info(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = verify_jwt(&headers, &state.config) {
+        return resp;
+    }
     let settings = serde_json::json!({
         "enabled": state.config.cache.enabled,
         "ttl_seconds": state.config.cache.ttl_seconds,
@@ -710,6 +730,7 @@ async fn handle_cache_info(State(state): State<AppState>) -> Response {
     let body = serde_json::json!({
         "settings": settings,
         "stats": stats,
+        "pool": state.backend.pool_status(),
     });
 
     (StatusCode::OK, Json(body)).into_response()
@@ -734,7 +755,7 @@ async fn dispatch_request(
     method: RequestMethod,
     is_rpc: bool,
     headers: &HeaderMap,
-    params: &HashMap<String, String>,
+    params: &QueryParams,
     body: Option<serde_json::Value>,
 ) -> Response {
     let cache = state.cache.load();
@@ -802,6 +823,18 @@ async fn dispatch_request(
         return (StatusCode::NOT_IMPLEMENTED, Json(resp)).into_response();
     }
 
+    // GET/HEAD must have no side effects: a link, a crawler or an <img> could
+    // otherwise run a volatile function and commit its writes.
+    if matches!(method, RequestMethod::Get | RequestMethod::Head) && plan_writes(&plan) {
+        let resp = serde_json::json!({
+            "code": "PGRST101",
+            "message": "Cannot call a volatile function with GET or HEAD; use POST",
+            "details": null,
+            "hint": null,
+        });
+        return (StatusCode::METHOD_NOT_ALLOWED, Json(resp)).into_response();
+    }
+
     // 3. Render the plan to SQL + parameters
     //    Postgres: uses CTE wrapper for single-row JSON response + GUC headers
     //    SQLite: uses raw SQL — Rust-side JSON assembly in execute module
@@ -819,11 +852,25 @@ async fn dispatch_request(
         }
     };
 
-    tracing::debug!(sql = %sql, params = ?params_vec, "executing query");
+    // Parameter values are request data (passwords, tokens, PII): log the count.
+    tracing::debug!(sql = %sql, params = params_vec.len(), "executing query");
 
     // 4. Build ExecContext (JWT already verified above, before planning).
-    let is_mutation = matches!(&plan, ActionPlan::Mutate(_));
-    let exec_ctx = build_exec_context(&state.config, &auth, &preferences, is_mutation);
+    let is_mutation = plan_writes(&plan);
+    let mut exec_ctx = build_exec_context(&state.config, &auth, &preferences, is_mutation);
+    // Table reads are forwarded as the database's JSON text: no parse and
+    // re-serialize. (RPC/mutation bodies are reshaped below, so stay parsed.)
+    exec_ctx.raw_body = matches!(plan, ActionPlan::Read(_));
+    // Mutation guards, enforced by the backend before it commits.
+    if let ActionPlan::Mutate(_) = &plan {
+        if preferences.handling == Some(pgvis_core::preferences::PreferHandling::Strict) {
+            exec_ctx.max_affected = preferences.max_affected;
+        }
+        exec_ctx.single_row = headers
+            .get("accept")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|s| s.contains("application/vnd.pgrst.object"));
+    }
 
     // 4b. Data cache: compute key and check for cache hit (reads only).
     //     When a `pre_request` hook is configured we bypass the read cache
@@ -833,6 +880,7 @@ async fn dispatch_request(
         None
     } else if let ActionPlan::Read(ref read_plan) = plan {
         state.data_cache.as_ref().and_then(|dc| {
+            dc.sync_schema(cache.built_at);
             dc.compute_key(
                 read_plan,
                 &sql,
@@ -852,12 +900,13 @@ async fn dispatch_request(
                 tracing::debug!(cache_key = %key, "data cache hit");
 
                 let cached_result = QueryResult {
-                    body: cached.body,
+                    body: serde_json::Value::Null,
                     total_count: cached.total_count,
                     page_total: cached.page_total,
                     response_status: None,
                     response_headers: None,
                     was_insert: None,
+                    raw_body: Some(cached.body),
                 };
 
                 let cursor_column = if let ActionPlan::Read(ref read_plan) = plan {
@@ -897,7 +946,7 @@ async fn dispatch_request(
     // 5b. Data cache: store result on cache miss. `cache_key` is `Some` only for
     // cacheable reads, so no need to re-match the plan here.
     if let (Some(key), Some(dc)) = (&cache_key, &state.data_cache) {
-        dc.store(key, result.body.clone(), result.total_count, result.page_total);
+        dc.store(key, result.json_bytes(), result.total_count, result.page_total);
         tracing::debug!(cache_key = %key, "data cache store");
     }
 
@@ -1031,11 +1080,12 @@ fn build_api_request(
     method: RequestMethod,
     is_rpc: bool,
     _headers: &HeaderMap,
-    params: &HashMap<String, String>,
+    params: &QueryParams,
     body: Option<serde_json::Value>,
     preferences: &Preferences,
 ) -> Result<ApiRequest, Error> {
     let _ = preferences; // Will be used for count strategy, etc.
+    params.reject_repeated_reserved()?;
 
     // Parse select parameter — a malformed select is a 400 (PGRST100), NOT a
     // silent fall back to `SELECT *` (which would over-expose columns).
@@ -1147,9 +1197,9 @@ fn build_api_request(
 /// The result of JWT verification — either authenticated claims or anonymous.
 pub(crate) struct AuthResult {
     /// The role to SET LOCAL to (from JWT claim or anon_role).
-    role: Option<String>,
+    pub(crate) role: Option<String>,
     /// The full JWT claims as a JSON value (for GUC propagation).
-    claims: Option<serde_json::Value>,
+    pub(crate) claims: Option<serde_json::Value>,
 }
 
 /// Verify the JWT from the Authorization header and extract role + claims.
@@ -1253,10 +1303,14 @@ pub(crate) fn verify_jwt(headers: &HeaderMap, config: &Config) -> Result<AuthRes
 
     let mut validation = Validation::new(algorithm);
     validation.validate_exp = true;
-    // PostgREST ignores the `aud` claim unless `jwt-aud` is configured. Disable
-    // aud validation (jsonwebtoken 9 defaults it on), otherwise any token that
-    // carries an `aud` is rejected.
-    validation.validate_aud = false;
+    validation.validate_nbf = true;
+    // PostgREST ignores the `aud` claim unless `jwt-aud` is configured; without
+    // it, disable aud validation (jsonwebtoken 9 defaults it on), otherwise
+    // any token that carries an `aud` is rejected.
+    match &config.jwt_aud {
+        Some(aud) => validation.set_audience(&[aud]),
+        None => validation.validate_aud = false,
+    }
     // Don't require specific claims beyond exp
     validation.required_spec_claims = std::collections::HashSet::new();
 
@@ -1269,9 +1323,23 @@ pub(crate) fn verify_jwt(headers: &HeaderMap, config: &Config) -> Result<AuthRes
                 .and_then(|v| v.as_str())
                 .map(String::from)
                 .or_else(|| config.anon_role.clone());
+            // No role to switch to would run the request as the DSN's own role
+            // (often the table owner). Many IdPs omit a role claim by default.
+            let Some(role) = role else {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "code": "PGRST301",
+                        "message": "JWT has no role claim and no anon_role is configured",
+                        "details": null,
+                        "hint": format!("Add a `{}` claim to the token or set anon_role", config.role_claim_key),
+                    })),
+                )
+                    .into_response());
+            };
 
             Ok(AuthResult {
-                role,
+                role: Some(role),
                 claims: Some(claims),
             })
         }
@@ -1296,7 +1364,7 @@ pub(crate) fn verify_jwt(headers: &HeaderMap, config: &Config) -> Result<AuthRes
 }
 
 /// Build an [`ExecContext`] from configuration, auth result, and request preferences.
-fn build_exec_context(
+pub(crate) fn build_exec_context(
     config: &Config,
     auth: &AuthResult,
     preferences: &Preferences,
@@ -1320,6 +1388,9 @@ fn build_exec_context(
         statement_timeout: config.statement_timeout_ms,
         tx_end,
         is_mutation,
+        raw_body: false,
+        max_affected: None,
+        single_row: false,
     }
 }
 
@@ -1327,30 +1398,68 @@ fn build_exec_context(
 // Helper functions
 // ---------------------------------------------------------------------------
 
+/// Query-string keys that configure the request rather than filter a column.
+const RESERVED: &[&str] = &[
+    "select",
+    "order",
+    "limit",
+    "offset",
+    "on_conflict",
+    "columns",
+    "cursor_column",
+    "cursor_value",
+];
+
+/// Query-string pairs in request order.
+///
+/// Not a map: a repeated key keeps every value, so `id=gte.5&id=lte.10` is two
+/// filters. A map kept only the last one, which silently widened a PATCH or
+/// DELETE to rows the caller had excluded.
+pub(crate) struct QueryParams(pub(crate) Vec<(String, String)>);
+
+impl QueryParams {
+    /// The value of a reserved key (see [`Self::reject_repeated_reserved`]).
+    fn get(&self, key: &str) -> Option<&String> {
+        self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.0.iter().map(|(k, v)| (k, v))
+    }
+
+    /// A reserved key given twice is ambiguous (which `limit` applies?): 400.
+    fn reject_repeated_reserved(&self) -> Result<(), Error> {
+        for key in RESERVED {
+            if self.0.iter().filter(|(k, _)| k == key).count() > 1 {
+                return Err(Error::invalid_filter(format!(
+                    "query parameter `{key}` given more than once"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl From<&HashMap<String, String>> for QueryParams {
+    fn from(map: &HashMap<String, String>) -> Self {
+        Self(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+    }
+}
+
 /// Parse filter expressions from query parameters.
 ///
-/// Any parameter whose key is not a reserved keyword (`select`, `order`, `limit`,
-/// `offset`, `on_conflict`, `columns`) is treated as a column filter.
+/// Any parameter whose key is not in [`RESERVED`] is treated as a column filter;
+/// a key repeated with different operators yields one filter per value.
 ///
 /// Filters are sorted by column name for deterministic SQL output,
 /// which improves Postgres prepared-statement cache hit rates and
 /// makes debugging/logging reproducible.
 fn parse_filters_from_params(
-    params: &HashMap<String, String>,
+    params: &QueryParams,
 ) -> Result<Vec<pgvis_core::query_params::Filter>, Error> {
-    const RESERVED: &[&str] = &[
-        "select",
-        "order",
-        "limit",
-        "offset",
-        "on_conflict",
-        "columns",
-        "cursor_column",
-        "cursor_value",
-    ];
     let mut filters = Vec::new();
 
-    for (key, value) in params {
+    for (key, value) in params.iter() {
         if RESERVED.contains(&key.as_str()) {
             continue;
         }
@@ -1375,27 +1484,19 @@ fn parse_filters_from_params(
 ///
 /// Every non-reserved query parameter becomes a named argument. Values are
 /// passed as JSON strings (the function's parameter types drive coercion in the
-/// database), except `select` which is reserved for the response projection.
-fn rpc_args_from_params(params: &HashMap<String, String>) -> serde_json::Value {
+/// database). [`RESERVED`] keys (`select`, `limit`, …) are not arguments: the
+/// planner rejects unknown argument names, so passing them through would 404.
+fn rpc_args_from_params(params: &QueryParams) -> serde_json::Value {
     use serde_json::Value;
     let mut obj = serde_json::Map::new();
-    for (key, value) in params {
-        if key == "select" {
+    for (key, value) in params.iter() {
+        if RESERVED.contains(&key.as_str()) {
             continue;
         }
-        // Coerce obvious scalar literals so bound parameters carry the right JSON
-        // type (e.g. an integer argument binds as a number, not text). Anything
-        // else stays a string; the function's parameter type drives final casting.
-        let coerced = if let Ok(i) = value.parse::<i64>() {
-            Value::from(i)
-        } else if let Ok(f) = value.parse::<f64>() {
-            Value::from(f)
-        } else if value == "true" || value == "false" {
-            Value::from(value == "true")
-        } else {
-            Value::String(value.clone())
-        };
-        obj.insert(key.clone(), coerced);
+        // Pass the text through untouched: parameters bind as text and the
+        // function's declared types cast them. Guessing a JSON type here
+        // corrupted values (`02134` → `2134`, `+15551234` → `15551234`).
+        obj.insert(key.clone(), Value::String(value.clone()));
     }
     Value::Object(obj)
 }
@@ -1411,11 +1512,11 @@ fn is_logic_filter_key(key: &str) -> bool {
 ///
 /// Returns parsed `LogicTree` nodes that express boolean combinations of leaf filters.
 fn parse_logic_filters_from_params(
-    params: &HashMap<String, String>,
+    params: &QueryParams,
 ) -> Result<Vec<LogicTree>, Error> {
     let mut trees = Vec::new();
 
-    for (key, value) in params {
+    for (key, value) in params.iter() {
         if !is_logic_filter_key(key) {
             continue;
         }
@@ -1449,10 +1550,10 @@ fn parse_logic_filters_from_params(
 /// silently ignored — silently ignoring an invalid `limit` would return the
 /// full unpaginated set.
 fn parse_range_from_params(
-    params: &HashMap<String, String>,
+    params: &QueryParams,
 ) -> Result<Option<pgvis_core::query_params::RangeSpec>, Error> {
     fn parse_u64(
-        params: &HashMap<String, String>,
+        params: &QueryParams,
         key: &str,
     ) -> Result<Option<u64>, Error> {
         match params.get(key) {
@@ -1479,7 +1580,7 @@ fn parse_range_from_params(
 ///
 /// Returns `Some(CursorSpec)` if either parameter is present, activating cursor mode.
 /// When `cursor_column` is omitted, the planner defaults to the table's primary key.
-fn parse_cursor_from_params(params: &HashMap<String, String>) -> Option<CursorSpec> {
+fn parse_cursor_from_params(params: &QueryParams) -> Option<CursorSpec> {
     let column = params.get("cursor_column").cloned();
     let value = params.get("cursor_value").cloned();
 
@@ -1503,6 +1604,20 @@ fn resolve_schema_from_headers(headers: &HeaderMap, config: &Config) -> String {
         .unwrap_or_else(|| config.routing.default_schema.clone())
 }
 
+/// Whether executing `plan` can write: a mutation, or a call to a volatile
+/// function. Writes must reach the primary (never a read replica), and are
+/// refused on GET/HEAD.
+fn plan_writes(plan: &ActionPlan) -> bool {
+    match plan {
+        ActionPlan::Mutate(_) => true,
+        ActionPlan::Call(call) => matches!(
+            call.function_info.volatility,
+            pgvis_core::cache::Volatility::Volatile
+        ),
+        _ => false,
+    }
+}
+
 /// Convert an axum HTTP method to our [`RequestMethod`].
 fn http_method_to_request_method(method: &axum::http::Method) -> RequestMethod {
     match *method {
@@ -1513,5 +1628,93 @@ fn http_method_to_request_method(method: &axum::http::Method) -> RequestMethod {
         axum::http::Method::PUT => RequestMethod::Put,
         axum::http::Method::DELETE => RequestMethod::Delete,
         _ => RequestMethod::Get,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonwebtoken::{EncodingKey, Header, encode};
+
+    const SECRET: &str = "a-test-secret-that-is-long-enough";
+
+    fn config(anon_role: Option<&str>, jwt_aud: Option<&str>) -> Config {
+        Config {
+            jwt_secret: Some(SECRET.into()),
+            anon_role: anon_role.map(String::from),
+            jwt_aud: jwt_aud.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    fn bearer(claims: serde_json::Value) -> HeaderMap {
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(SECRET.as_bytes()),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        headers
+    }
+
+    fn exp() -> i64 {
+        (std::time::SystemTime::now() + std::time::Duration::from_secs(600))
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    #[test]
+    fn a_token_without_a_role_claim_is_refused_rather_than_run_as_the_dsn_role() {
+        let headers = bearer(serde_json::json!({ "sub": "u1", "exp": exp() }));
+        let err = verify_jwt(&headers, &config(None, None)).err().expect("401");
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+
+        // With anon_role configured the request falls back to it, as before.
+        let auth = verify_jwt(&headers, &config(Some("web_anon"), None)).unwrap();
+        assert_eq!(auth.role.as_deref(), Some("web_anon"));
+    }
+
+    #[test]
+    fn a_role_claim_is_used() {
+        let headers = bearer(serde_json::json!({ "role": "app_user", "exp": exp() }));
+        let auth = verify_jwt(&headers, &config(None, None)).unwrap();
+        assert_eq!(auth.role.as_deref(), Some("app_user"));
+    }
+
+    #[test]
+    fn jwt_aud_rejects_tokens_for_another_audience() {
+        let other = bearer(serde_json::json!({ "role": "r", "aud": "other-app", "exp": exp() }));
+        let mine = bearer(serde_json::json!({ "role": "r", "aud": "pgvis", "exp": exp() }));
+        let cfg = config(None, Some("pgvis"));
+        assert!(verify_jwt(&other, &cfg).is_err());
+        assert!(verify_jwt(&mine, &cfg).is_ok());
+        // Unset jwt_aud keeps ignoring `aud`.
+        assert!(verify_jwt(&other, &config(None, None)).is_ok());
+    }
+
+    #[test]
+    fn a_token_not_yet_valid_is_rejected() {
+        let headers = bearer(serde_json::json!({ "role": "r", "nbf": exp(), "exp": exp() + 60 }));
+        assert!(verify_jwt(&headers, &config(None, None)).is_err());
+    }
+
+    #[test]
+    fn string_typed_exp_and_nbf_cannot_bypass_validation() {
+        // CVE-2026-25537 (jsonwebtoken < 10.3): a string `exp` was never
+        // treated as expired, and a string `nbf` was ignored.
+        let expired = bearer(serde_json::json!({ "role": "r", "exp": "1" }));
+        assert!(verify_jwt(&expired, &config(None, None)).is_err());
+        let not_yet = bearer(serde_json::json!({ "role": "r", "nbf": exp().to_string(), "exp": exp() }));
+        assert!(verify_jwt(&not_yet, &config(None, None)).is_err());
+    }
+
+    #[test]
+    fn without_a_secret_embedders_keep_the_dsn_role() {
+        // In-process embedders (no jwt_secret) do their own auth; unchanged.
+        let auth = verify_jwt(&HeaderMap::new(), &Config::default()).unwrap();
+        assert_eq!(auth.role, None);
     }
 }

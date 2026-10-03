@@ -52,10 +52,19 @@ arguments AS (
       WHEN 1 THEN (array_agg(type))[1] IN ('bytea'::regtype, 'json'::regtype, 'jsonb'::regtype, 'text'::regtype, 'xml'::regtype)
       ELSE false
     END AS callable
-  FROM pg_proc,
-       unnest(proargnames, proargtypes, proargmodes)
-         WITH ORDINALITY AS _ (name, type, mode, idx)
-  WHERE type IS NOT NULL -- only input arguments
+  -- proargnames/proargmodes cover every argument; proargtypes only the inputs.
+  -- Zip names with proallargtypes (all arguments, aligned) and keep the input
+  -- modes, renumbering them: zipping with proargtypes gave an input the name
+  -- of an OUT argument declared before it.
+  FROM (
+    SELECT p.oid, p.pronargs, p.pronargdefaults, a.name, a.type, a.mode,
+           row_number() OVER (PARTITION BY p.oid ORDER BY a.ord) AS idx
+    FROM pg_proc p,
+         unnest(p.proargnames, COALESCE(p.proallargtypes, p.proargtypes::oid[]), p.proargmodes)
+           WITH ORDINALITY AS a (name, type, mode, ord)
+    WHERE a.type IS NOT NULL
+      AND COALESCE(a.mode, 'i') IN ('i', 'b', 'v') -- only input arguments
+  ) input_args
   GROUP BY oid
 )
 SELECT

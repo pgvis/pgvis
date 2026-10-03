@@ -86,11 +86,11 @@ pub fn build_mcp_tools(cache: &SchemaCache, config: &Config) -> Vec<McpToolDefin
         // from the catalogue, so under read_only we drop them entirely too;
         // exposing them while disallowing mutations would be misleading.
         if !config.read_only {
-            for (_ident, routine_group) in &cache.routines {
-                for routine in routine_group {
-                    if routine.ident.schema == *schema {
-                        tools.push(make_call_tool(routing, schema, routine));
-                    }
+            // One tool per function name: overloads share it, and the planner
+            // picks the overload from the argument names at call time.
+            for (ident, routine_group) in &cache.routines {
+                if ident.schema == *schema {
+                    tools.push(make_call_tool(routing, schema, &ident.name, routine_group));
                 }
             }
         }
@@ -242,11 +242,22 @@ pub async fn handle_tool_call(
     // 3. Build ApiRequest from tool arguments
     let args = call.arguments.as_object();
 
-    let select = args
+    let select = match args
         .and_then(|a| a.get("select"))
         .and_then(|v| v.as_str())
-        .map(|s| parse_mcp_select(s))
-        .unwrap_or_else(|| vec![SelectItem::Star]);
+        .map(parse_mcp_select)
+        .unwrap_or_else(|| Ok(vec![SelectItem::Star]))
+    {
+        Ok(select) => select,
+        Err(e) => {
+            return McpToolResult::error_structured(
+                pgvis_core::error::ErrorCode::InvalidSelect.as_str(),
+                e,
+                None,
+                None,
+            );
+        }
+    };
 
     let filters = match parse_mcp_filters(args) {
         Ok(filters) => filters,
@@ -321,7 +332,28 @@ pub async fn handle_tool_call(
     let is_table_mutation = matches!(verb, "create" | "update" | "delete");
 
     // Parse logic filters (MCP-17): support "or" and "and" arguments
-    let logic_filters = parse_mcp_logic_filters(args);
+    let logic_filters = match parse_mcp_logic_filters(args) {
+        Ok(trees) => trees,
+        Err(e) => {
+            return McpToolResult::error_structured(
+                pgvis_core::error::ErrorCode::InvalidFilter.as_str(),
+                e,
+                None,
+                None,
+            );
+        }
+    };
+
+    // The tool schema marks `filters` required, but that's advisory: an
+    // UPDATE/DELETE with no condition at all would touch every row.
+    if matches!(verb, "update" | "delete") && filters.is_empty() && logic_filters.is_empty() {
+        return McpToolResult::error_structured(
+            pgvis_core::error::ErrorCode::InvalidFilter.as_str(),
+            format!("refusing to {verb} every row of {target}: pass at least one filter"),
+            None,
+            Some("e.g. {\"filters\": {\"id\": \"eq.5\"}}".to_string()),
+        );
+    }
 
     // Parse preferences (MCP-18 + MCP-20). return/resolution prefs only apply to
     // table mutations, so gate on that (not on RPC volatility).
@@ -400,42 +432,13 @@ pub async fn handle_tool_call(
         Err(err) => return McpToolResult::from_core_error(&err),
     };
 
-    // 6. Resolve the execution role and refuse anonymous access when the
-    //    deployment requires auth.
-    //
-    // The MCP surface currently has no token-passing / CallerIdentity
-    // mechanism (see the fn-level "Auth model" doc), so every call is
-    // anonymous. If a `jwt_secret` is configured the operator has opted into
-    // auth; when there is ALSO no `anon_role`, REST rejects anonymous requests
-    // (PGRST300/302) rather than running as the pool's connection role. MCP
-    // must do the same — otherwise it would execute as the DSN role (often the
-    // table owner, bypassing RLS), a privilege escalation. Mirror REST and
-    // refuse with the anonymous-access-disabled code (PGRST302).
-    if config.jwt_secret.is_some() && config.anon_role.is_none() {
-        return McpToolResult::error_structured(
-            pgvis_core::error::ErrorCode::JwtMissing.as_str(),
-            "Anonymous access is disabled: this server requires authentication \
-             (jwt_secret is set) and no anon_role is configured.",
-            None,
-            Some(
-                "Configure an anon_role to allow unauthenticated MCP tool calls, \
-                 or place an auth proxy in front of the MCP endpoint."
-                    .to_string(),
-            ),
-        );
+    // 6. Refuse anonymous access when the deployment requires auth.
+    if let Err(denied) = require_anonymous_access(config) {
+        return denied;
     }
 
-    // 7. Build ExecContext. Role is the configured anon_role (may be None when
-    // no jwt_secret is set — the guard above ensures we never fall through to
-    // the connection role while auth is required).
-    let exec_ctx = ExecContext {
-        role: config.anon_role.clone(),
-        claims: None,
-        pre_request: config.pre_request.clone(),
-        statement_timeout: config.statement_timeout_ms,
-        tx_end: None,
-        is_mutation,
-    };
+    // 7. Build ExecContext.
+    let exec_ctx = anonymous_exec_context(config, is_mutation);
 
     // 8. Execute via backend, bounded by a per-call deadline.
     //
@@ -493,6 +496,51 @@ pub async fn handle_tool_call(
             }
         }
         Err(err) => McpToolResult::from_core_error(&err),
+    }
+}
+
+/// Refuse an MCP call when the deployment requires auth.
+///
+/// The MCP surface currently has no token-passing / CallerIdentity
+/// mechanism (see [`handle_tool_call`]'s "Auth model" doc), so every call is
+/// anonymous. If a `jwt_secret` is configured the operator has opted into
+/// auth; when there is ALSO no `anon_role`, REST rejects anonymous requests
+/// (PGRST300/302) rather than running as the pool's connection role. MCP
+/// must do the same — otherwise it would execute as the DSN role (often the
+/// table owner, bypassing RLS), a privilege escalation. Mirror REST and
+/// refuse with the anonymous-access-disabled code (PGRST302).
+pub(crate) fn require_anonymous_access(config: &Config) -> Result<(), McpToolResult> {
+    if config.jwt_secret.is_some() && config.anon_role.is_none() {
+        return Err(McpToolResult::error_structured(
+            pgvis_core::error::ErrorCode::JwtMissing.as_str(),
+            "Anonymous access is disabled: this server requires authentication \
+             (jwt_secret is set) and no anon_role is configured.",
+            None,
+            Some(
+                "Configure an anon_role to allow unauthenticated MCP tool calls, \
+                 or place an auth proxy in front of the MCP endpoint."
+                    .to_string(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The [`ExecContext`] every MCP call runs under. Role is the configured
+/// anon_role (may be None when no jwt_secret is set —
+/// [`require_anonymous_access`] ensures we never fall through to the
+/// connection role while auth is required).
+pub(crate) fn anonymous_exec_context(config: &Config, is_mutation: bool) -> ExecContext {
+    ExecContext {
+        role: config.anon_role.clone(),
+        claims: None,
+        pre_request: config.pre_request.clone(),
+        statement_timeout: config.statement_timeout_ms,
+        tx_end: None,
+        is_mutation,
+        raw_body: false,
+        max_affected: None,
+        single_row: false,
     }
 }
 
@@ -705,34 +753,51 @@ fn make_delete_tool(routing: &RoutingConfig, schema: &str, table: &Table) -> Mcp
     }
 }
 
-fn make_call_tool(routing: &RoutingConfig, schema: &str, routine: &Routine) -> McpToolDefinition {
-    let name = mcp_tool_name(routing, schema, "call", &routine.ident.name);
+/// One tool for all overloads of `fn_name`: the input schema is the union of
+/// their parameters, and only a parameter every overload requires is required.
+/// The planner resolves the overload from the argument names at call time.
+fn make_call_tool(
+    routing: &RoutingConfig,
+    schema: &str,
+    fn_name: &str,
+    routines: &[Routine],
+) -> McpToolDefinition {
+    let name = mcp_tool_name(routing, schema, "call", fn_name);
 
-    // Build parameter description from routine params
-    let param_desc: Vec<String> = routine
-        .params
+    // Build parameter description from each overload's params
+    let signatures: Vec<String> = routines
         .iter()
-        .map(|p| {
+        .map(|routine| {
+            let param_desc: Vec<String> = routine
+                .params
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{}: {}{}",
+                        p.name,
+                        p.typ,
+                        if p.is_variadic { " (variadic)" } else { "" }
+                    )
+                })
+                .collect();
             format!(
-                "{}: {}{}",
-                p.name,
-                p.typ,
-                if p.is_variadic { " (variadic)" } else { "" }
+                "{}.{}({}) → {}",
+                schema,
+                fn_name,
+                param_desc.join(", "),
+                routine.return_type,
             )
         })
         .collect();
-    let description = format!(
-        "Call function {}.{}({}) → {}",
-        schema,
-        routine.ident.name,
-        param_desc.join(", "),
-        routine.return_type,
-    );
+    let description = format!("Call function {}", signatures.join(" | "));
 
-    // Build input schema from routine parameters
+    // Build input schema from the union of the overloads' parameters
     let mut properties = serde_json::Map::new();
     let mut required = Vec::new();
-    for param in &routine.params {
+    for param in routines.iter().flat_map(|r| &r.params) {
+        if properties.contains_key(&param.name) {
+            continue;
+        }
         properties.insert(
             param.name.clone(),
             serde_json::json!({
@@ -740,7 +805,10 @@ fn make_call_tool(routing: &RoutingConfig, schema: &str, routine: &Routine) -> M
                 "description": format!("Parameter: {} ({})", param.name, param.typ),
             }),
         );
-        if param.required {
+        let required_by_all = routines
+            .iter()
+            .all(|r| r.params.iter().any(|p| p.name == param.name && p.required));
+        if required_by_all {
             required.push(serde_json::Value::String(param.name.clone()));
         }
     }
@@ -860,10 +928,17 @@ fn parse_mcp_filters(
     args: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Vec<Filter>, String> {
     let mut filters = Vec::new();
-    if let Some(filter_obj) = args
+    let filters_arg = args
         .and_then(|a| a.get("filters"))
-        .and_then(|v| v.as_object())
-    {
+        .filter(|v| !v.is_null());
+    // LLMs often send `"id.eq.5"` or `[{"id": "eq.5"}]` here. Ignoring a
+    // non-object would leave an UPDATE/DELETE with no WHERE clause.
+    if let Some(v) = filters_arg {
+        if !v.is_object() {
+            return Err("`filters` must be an object of column → \"op.value\"".to_string());
+        }
+    }
+    if let Some(filter_obj) = filters_arg.and_then(|v| v.as_object()) {
         for (column, value) in filter_obj {
             let value_str = value.as_str().ok_or_else(|| {
                 format!("filter for column '{column}' must be a string like \"op.value\"")
@@ -909,14 +984,15 @@ fn pg_type_to_json_type(pg_type: &str) -> &'static str {
 /// Supports the complete grammar: columns, aliases, JSON paths, casts,
 /// aggregates, embeddings with hints/joins, and spreads.
 ///
-/// Falls back to `[SelectItem::Star]` if parsing fails.
-fn parse_mcp_select(s: &str) -> Vec<SelectItem> {
+/// A malformed select is an error, as on REST: falling back to `*` would
+/// return columns the caller deliberately left out.
+fn parse_mcp_select(s: &str) -> Result<Vec<SelectItem>, String> {
     let trimmed = s.trim();
     if trimmed.is_empty() || trimmed == "*" {
-        return vec![SelectItem::Star];
+        return Ok(vec![SelectItem::Star]);
     }
 
-    query_params::parse_select(trimmed).unwrap_or_else(|_| vec![SelectItem::Star])
+    query_params::parse_select(trimmed)
 }
 
 /// Parse logic filter arguments from MCP tool call into `LogicTree` nodes.
@@ -926,33 +1002,37 @@ fn parse_mcp_select(s: &str) -> Vec<SelectItem> {
 /// { "or": "(status.eq.active,status.eq.pending)" }
 /// { "and": "(age.gte.18,age.lte.65)" }
 /// ```
+///
+/// A malformed expression is an error: skipping it would drop the condition
+/// and widen the rows an UPDATE/DELETE touches.
 fn parse_mcp_logic_filters(
     args: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> Vec<LogicTree> {
+) -> Result<Vec<LogicTree>, String> {
     let mut trees = Vec::new();
     let args = match args {
         Some(a) => a,
-        None => return trees,
+        None => return Ok(trees),
     };
 
     for key in &["and", "or", "not.and", "not.or"] {
-        if let Some(value) = args.get(*key).and_then(|v| v.as_str()) {
-            match query_params::parse_logic_tree(key, value) {
-                Ok(node) => match node {
-                    LogicNode::Tree(tree) => trees.push(tree),
-                    LogicNode::Not(inner) => {
-                        trees.push(LogicTree::And(vec![LogicNode::Not(inner)]));
-                    }
-                    LogicNode::Filter(f) => {
-                        trees.push(LogicTree::And(vec![LogicNode::Filter(f)]));
-                    }
-                },
-                Err(_) => {} // Silently skip malformed logic filters in MCP
+        let Some(value) = args.get(*key).filter(|v| !v.is_null()) else {
+            continue;
+        };
+        let value = value
+            .as_str()
+            .ok_or_else(|| format!("`{key}` must be a string like \"(a.eq.1,b.eq.2)\""))?;
+        match query_params::parse_logic_tree(key, value)? {
+            LogicNode::Tree(tree) => trees.push(tree),
+            LogicNode::Not(inner) => {
+                trees.push(LogicTree::And(vec![LogicNode::Not(inner)]));
+            }
+            LogicNode::Filter(f) => {
+                trees.push(LogicTree::And(vec![LogicNode::Filter(f)]));
             }
         }
     }
 
-    trees
+    Ok(trees)
 }
 
 /// Parse MCP preferences from tool arguments.
@@ -1114,6 +1194,34 @@ mod tests {
         assert!(parse_mcp_filters(a.as_ref()).is_err());
     }
 
+    #[test]
+    fn non_object_filters_are_an_error_not_no_filters() {
+        // Common LLM shapes; ignoring them left a DELETE with no WHERE.
+        for bad in [json!("id.eq.5"), json!([{ "id": "eq.5" }]), json!(5)] {
+            let a = args(json!({ "filters": bad }));
+            assert!(parse_mcp_filters(a.as_ref()).is_err(), "{bad}");
+        }
+        let a = args(json!({ "filters": null }));
+        assert!(parse_mcp_filters(a.as_ref()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_logic_filters_are_an_error_not_skipped() {
+        let a = args(json!({ "or": "(id.eq.5,id.eq.6" }));
+        assert!(parse_mcp_logic_filters(a.as_ref()).is_err());
+        let a = args(json!({ "or": ["id.eq.5"] }));
+        assert!(parse_mcp_logic_filters(a.as_ref()).is_err());
+        let a = args(json!({ "or": "(id.eq.5,id.eq.6)" }));
+        assert_eq!(parse_mcp_logic_filters(a.as_ref()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn malformed_select_is_an_error_not_star() {
+        assert!(parse_mcp_select("id,(").is_err());
+        assert!(parse_mcp_select("id,name").is_ok());
+        assert!(matches!(parse_mcp_select(" * ").unwrap()[..], [SelectItem::Star]));
+    }
+
     // ---- item 5: numeric-string / bool-string coercion ----------------------
 
     #[test]
@@ -1168,5 +1276,49 @@ mod tests {
         let terms = parse_mcp_order(a.as_ref()).unwrap();
         assert_eq!(terms.len(), 1);
         assert_eq!(terms[0].field, "age");
+    }
+
+    // ---- overloads share one call tool --------------------------------------
+
+    #[test]
+    fn overloads_merge_into_one_call_tool() {
+        use pgvis_core::cache::{QualifiedIdentifier, RoutineParam};
+        let param = |name: &str, required: bool| RoutineParam {
+            name: name.to_string(),
+            typ: "integer".to_string(),
+            required,
+            is_variadic: false,
+        };
+        let routine = |params: Vec<RoutineParam>| Routine {
+            ident: QualifiedIdentifier::new("public", "f"),
+            description: None,
+            params,
+            return_type: "integer".to_string(),
+            return_type_is_set: false,
+            return_type_is_composite: false,
+            volatility: Volatility::Stable,
+            is_variadic: false,
+            isolation_level: None,
+            settings: Vec::new(),
+        };
+        let mut cache = SchemaCache::default();
+        cache.routines.insert(
+            QualifiedIdentifier::new("public", "f"),
+            vec![
+                routine(vec![param("a", true)]),
+                routine(vec![param("a", true), param("b", true)]),
+            ],
+        );
+        let config = Config {
+            schemas: vec!["public".to_string()],
+            ..Config::default()
+        };
+
+        let tools = build_mcp_tools(&cache, &config);
+        assert_eq!(tools.len(), 1, "one tool for both overloads");
+        let schema = &tools[0].input_schema;
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 2);
+        // `b` is optional: only the second overload needs it.
+        assert_eq!(schema["required"], json!(["a"]));
     }
 }

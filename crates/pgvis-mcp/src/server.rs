@@ -28,9 +28,10 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use rmcp::ServerHandler;
 use rmcp::model::{
-    Annotated, CallToolRequestParams, CallToolResult, Content, Implementation, InitializeResult,
-    ListResourcesResult, ListToolsResult, PaginatedRequestParams, RawResource,
-    ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    InitializeResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, ServerCapabilities, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 
@@ -38,8 +39,11 @@ use pgvis_core::backend::Backend;
 use pgvis_core::pubsub::PubSubBackend;
 use pgvis_core::{Config, Dialect, SchemaCache};
 
-use crate::tools::{build_mcp_resources, build_mcp_tools, handle_tool_call};
-use crate::types::McpToolCall;
+use crate::tools::{
+    anonymous_exec_context, build_mcp_resources, build_mcp_tools, handle_tool_call,
+    require_anonymous_access,
+};
+use crate::types::{McpToolCall, McpToolResult};
 
 // ---------------------------------------------------------------------------
 // McpServer
@@ -169,11 +173,7 @@ impl ServerHandler for McpServer {
                 ));
             }
 
-            Ok(ListToolsResult {
-                meta: None,
-                tools: rmcp_tools,
-                next_cursor: None,
-            })
+            Ok(ListToolsResult::with_all_items(rmcp_tools))
         }
     }
 
@@ -181,14 +181,17 @@ impl ServerHandler for McpServer {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<CallToolResult, rmcp::ErrorData>> + Send + '_
+    ) -> impl std::future::Future<Output = Result<CallToolResponse, rmcp::ErrorData>> + Send + '_
     {
         async move {
             let tool_name = request.name.to_string();
 
             // Handle pub/sub tools
             if tool_name == "pubsub_publish" || tool_name == "pubsub_channels" {
-                return self.handle_pubsub_tool(&tool_name, &request.arguments).await;
+                return self
+                    .handle_pubsub_tool(&tool_name, &request.arguments)
+                    .await
+                    .map(Into::into);
             }
 
             let cache = self.cache.load();
@@ -207,20 +210,7 @@ impl ServerHandler for McpServer {
             let result =
                 handle_tool_call(&call, &cache, &self.dialect, &self.config, &*self.backend).await;
 
-            // Convert our McpToolResult to rmcp's CallToolResult
-            let content: Vec<Content> = result
-                .content
-                .into_iter()
-                .map(|c| match c {
-                    crate::types::McpContent::Text { text } => Content::text(text),
-                })
-                .collect();
-
-            if result.is_error {
-                Ok(CallToolResult::error(content))
-            } else {
-                Ok(CallToolResult::success(content))
-            }
+            Ok(into_call_tool_result(result).into())
         }
     }
 
@@ -237,27 +227,14 @@ impl ServerHandler for McpServer {
             let rmcp_resources = resources
                 .into_iter()
                 .map(|r| {
-                    Annotated::new(
-                        RawResource {
-                            uri: r.uri,
-                            name: r.name,
-                            title: None,
-                            description: Some(r.description),
-                            mime_type: r.mime_type,
-                            size: None,
-                            icons: None,
-                            meta: None,
-                        },
-                        None,
-                    )
+                    let mut resource =
+                        Resource::new(r.uri, r.name).with_description(r.description);
+                    resource.mime_type = r.mime_type;
+                    resource
                 })
                 .collect();
 
-            Ok(ListResourcesResult {
-                meta: None,
-                resources: rmcp_resources,
-                next_cursor: None,
-            })
+            Ok(ListResourcesResult::with_all_items(rmcp_resources))
         }
     }
 
@@ -265,7 +242,7 @@ impl ServerHandler for McpServer {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ReadResourceResult, rmcp::ErrorData>> + Send + '_
+    ) -> impl std::future::Future<Output = Result<ReadResourceResponse, rmcp::ErrorData>> + Send + '_
     {
         async move {
             let cache = self.cache.load();
@@ -340,7 +317,8 @@ impl ServerHandler for McpServer {
 
             Ok(ReadResourceResult::new(vec![ResourceContents::text(
                 content, uri,
-            )]))
+            )])
+            .into())
         }
     }
 }
@@ -363,7 +341,7 @@ impl McpServer {
         let pubsub = match &self.pubsub {
             Some(ps) if self.config.pubsub.enabled => ps,
             _ => {
-                return Ok(CallToolResult::error(vec![Content::text(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
                     "Pub/sub is not available on this server",
                 )]));
             }
@@ -373,9 +351,14 @@ impl McpServer {
         // mirroring how table/RPC mutations are refused. Listing channels is a
         // read and stays allowed.
         if tool_name == "pubsub_publish" && self.config.read_only {
-            return Ok(CallToolResult::error(vec![Content::text(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "MCP server is read-only; publishing is not permitted",
             )]));
+        }
+
+        // Same anonymous-access guard as every other tool.
+        if let Err(denied) = require_anonymous_access(&self.config) {
+            return Ok(into_call_tool_result(denied));
         }
 
         match tool_name {
@@ -391,21 +374,24 @@ impl McpServer {
                     .unwrap_or("");
 
                 if channel.is_empty() {
-                    return Ok(CallToolResult::error(vec![Content::text(
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(
                         "Missing required parameter: channel",
                     )]));
                 }
 
-                // Validate channel and payload
-                if let Err(e) = self.config.pubsub.validate_channel(channel) {
-                    return Ok(CallToolResult::error(vec![Content::text(e.to_string())]));
-                }
-                if let Err(e) = self.config.pubsub.validate_payload(payload) {
-                    return Ok(CallToolResult::error(vec![Content::text(e.to_string())]));
-                }
-
-                match pubsub.publish(channel, payload).await {
-                    Ok(()) => Ok(CallToolResult::success(vec![Content::text(
+                // Validates, runs the authorize function, and NOTIFYs as the
+                // MCP caller's role — the same path as REST publish.
+                let ctx = anonymous_exec_context(&self.config, true);
+                match pgvis_core::pubsub::publish(
+                    &*self.backend,
+                    &ctx,
+                    &self.config.pubsub,
+                    channel,
+                    payload,
+                )
+                .await
+                {
+                    Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(
                         serde_json::json!({
                             "ok": true,
                             "channel": channel,
@@ -413,7 +399,7 @@ impl McpServer {
                         })
                         .to_string(),
                     )])),
-                    Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+                    Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(e.to_string())])),
                 }
             }
             "pubsub_channels" => {
@@ -422,13 +408,30 @@ impl McpServer {
                     "channels": channels,
                     "count": channels.len()
                 });
-                Ok(CallToolResult::success(vec![Content::text(
+                Ok(CallToolResult::success(vec![ContentBlock::text(
                     serde_json::to_string_pretty(&result).unwrap_or_default(),
                 )]))
             }
-            _ => Ok(CallToolResult::error(vec![Content::text(format!(
+            _ => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Unknown pub/sub tool: {tool_name}"
             ))])),
         }
+    }
+}
+
+/// Convert our [`McpToolResult`] to rmcp's [`CallToolResult`].
+fn into_call_tool_result(result: McpToolResult) -> CallToolResult {
+    let content: Vec<ContentBlock> = result
+        .content
+        .into_iter()
+        .map(|c| match c {
+            crate::types::McpContent::Text { text } => ContentBlock::text(text),
+        })
+        .collect();
+
+    if result.is_error {
+        CallToolResult::error(content)
+    } else {
+        CallToolResult::success(content)
     }
 }

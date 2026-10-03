@@ -60,7 +60,7 @@ pub fn format_response(
     // Location header for a single-row INSERT with a primary key.
     if let Some(m) = mutation {
         if m.was_insert {
-            if let Some(loc) = build_location_header(&result.body, m) {
+            if let Some(loc) = build_location_header(&result.json(), m) {
                 if let Ok(val) = HeaderValue::from_str(&loc) {
                     headers.insert("location", val);
                 }
@@ -76,7 +76,7 @@ pub fn format_response(
 
     // X-Next-Cursor header (for cursor-based pagination)
     if let Some(col) = cursor_column {
-        if let Some(cursor_val) = extract_next_cursor(&result.body, col) {
+        if let Some(cursor_val) = extract_next_cursor(&result.json(), col) {
             if let Ok(val) = HeaderValue::from_str(&cursor_val) {
                 headers.insert("x-next-cursor", val);
             }
@@ -155,10 +155,12 @@ pub fn format_response(
     }
 
     // Build body
-    let body = if is_singular {
+    let body: bytes::Bytes = if is_singular {
         // Singular: unwrap first element from array
-        match &result.body {
-            Value::Array(arr) if arr.len() == 1 => serde_json::to_vec(&arr[0]).unwrap_or_default(),
+        match &*result.json() {
+            Value::Array(arr) if arr.len() == 1 => {
+                serde_json::to_vec(&arr[0]).unwrap_or_default().into()
+            }
             Value::Array(arr) if arr.is_empty() => {
                 // 406 Not Acceptable for singular with no rows
                 status = StatusCode::NOT_ACCEPTABLE;
@@ -167,6 +169,7 @@ pub fn format_response(
                     "message": "JSON object requested, multiple (or no) rows returned",
                 }))
                 .unwrap_or_default()
+                .into()
             }
             Value::Array(arr) if arr.len() > 1 => {
                 // 406 for singular with multiple rows
@@ -176,11 +179,13 @@ pub fn format_response(
                     "message": "JSON object requested, multiple (or no) rows returned",
                 }))
                 .unwrap_or_default()
+                .into()
             }
-            other => serde_json::to_vec(other).unwrap_or_default(),
+            other => serde_json::to_vec(other).unwrap_or_default().into(),
         }
     } else {
-        serde_json::to_vec(&result.body).unwrap_or_default()
+        // Usually the database's JSON text, forwarded without a re-serialize.
+        result.json_bytes()
     };
 
     (status, headers, body).into_response()
@@ -252,7 +257,8 @@ fn build_content_range(result: &QueryResult, request_offset: Option<u64>) -> Str
         format!("*/{total}")
     } else {
         let offset = request_offset.unwrap_or(0);
-        let range_end = offset + (page as u64) - 1;
+        // `offset` comes straight from the client, so don't let it overflow.
+        let range_end = offset.saturating_add(page.cast_unsigned() - 1);
         format!("{offset}-{range_end}/{total}")
     }
 }
@@ -337,4 +343,35 @@ fn extract_next_cursor(body: &Value, cursor_column: &str) -> Option<String> {
         Value::Null => return None,
         other => other.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(rows: i64) -> QueryResult {
+        QueryResult {
+            body: Value::Array(vec![]),
+            total_count: None,
+            page_total: Some(rows),
+            response_status: None,
+            response_headers: None,
+            was_insert: None,
+            raw_body: None,
+        }
+    }
+
+    #[test]
+    fn content_range_is_offset_based() {
+        assert_eq!(build_content_range(&page(3), Some(10)), "10-12/*");
+        assert_eq!(build_content_range(&page(0), Some(10)), "*/*");
+    }
+
+    #[test]
+    fn content_range_does_not_overflow_on_huge_client_offset() {
+        assert_eq!(
+            build_content_range(&page(5), Some(u64::MAX - 1)),
+            format!("{}-{}/*", u64::MAX - 1, u64::MAX)
+        );
+    }
 }

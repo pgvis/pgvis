@@ -19,7 +19,7 @@
 //! Table-scoped: a mutation on table T bumps its generation counter, causing all
 //! existing cache entries for that table to become stale misses (the generation
 //! in the key no longer matches). Volatile RPCs bump a global generation that
-//! affects all tables. Old stale entries are cleaned up by TTL/LRU eviction.
+//! affects all tables. Old stale entries are cleaned up by TTL/SIEVE eviction.
 //!
 //! ## Thread Safety
 //!
@@ -27,7 +27,7 @@
 //! axum handler tasks. The underlying `svcache` uses `DashMap` on native targets.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
@@ -51,8 +51,9 @@ use svcache::{CacheKey, SvCache};
 pub struct CachedEntry {
     /// The computed cache key (e.g., `"role:pk:public.users:9f3a7c1b40e2d5a8"`).
     pub key: String,
-    /// The JSON body (array or object).
-    pub body: Value,
+    /// The JSON body (array or object), serialized: a cache hit is a
+    /// refcount bump, not a deep clone of a `Value` tree.
+    pub body: bytes::Bytes,
     /// Total count (if count was requested).
     pub total_count: Option<i64>,
     /// Page total.
@@ -130,6 +131,13 @@ pub struct DataCache {
     table_generations: RwLock<HashMap<String, u64>>,
     /// Global generation counter — bumped by volatile RPCs that can affect anything.
     global_generation: AtomicU64,
+    /// Per-process random SipHash key for cache keys: the hashed inputs
+    /// include request data, so an unkeyed hash would let a caller craft a
+    /// collision with another caller's entry.
+    key_hasher: RandomState,
+    /// `built_at` (ns) of the schema cache the stored entries were made
+    /// against; see [`DataCache::sync_schema`].
+    schema_stamp: AtomicU64,
     /// Atomic stats counters.
     stat_hits: AtomicU64,
     stat_misses: AtomicU64,
@@ -149,6 +157,8 @@ impl DataCache {
             cache_lists: config.cache_lists,
             table_generations: RwLock::new(HashMap::new()),
             global_generation: AtomicU64::new(0),
+            key_hasher: RandomState::new(),
+            schema_stamp: AtomicU64::new(0),
             stat_hits: AtomicU64::new(0),
             stat_misses: AtomicU64::new(0),
             stat_invalidations: AtomicU64::new(0),
@@ -233,7 +243,7 @@ impl DataCache {
 
         // Hash the security context (claims) + the executed query (sql + params).
         // Uses a streaming hash of the Value tree to avoid allocating a String.
-        let mut hasher = FnvHasher::new();
+        let mut hasher = self.key_hasher.build_hasher();
         if let Some(claims) = claims {
             hash_json_value(claims, &mut hasher);
         }
@@ -258,7 +268,7 @@ impl DataCache {
     }
 
     /// Store a response in the cache under the given key.
-    pub fn store(&self, key: &str, body: Value, total_count: Option<i64>, page_total: Option<i64>) {
+    pub fn store(&self, key: &str, body: bytes::Bytes, total_count: Option<i64>, page_total: Option<i64>) {
         let entry = CachedEntry {
             key: key.to_string(),
             body,
@@ -269,10 +279,23 @@ impl DataCache {
         self.store.insert(entry);
     }
 
+    /// Invalidate every entry when the schema cache has been rebuilt (after
+    /// DDL, a cached response may no longer match the table). Called with the
+    /// current schema's `built_at` before each lookup; one atomic swap when
+    /// nothing changed.
+    pub fn sync_schema(&self, built_at: Option<std::time::SystemTime>) {
+        let stamp = built_at
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos() as u64);
+        if self.schema_stamp.swap(stamp, Ordering::Relaxed) != stamp {
+            self.invalidate_all();
+        }
+    }
+
     /// Invalidate all cached entries (for volatile RPCs that can affect anything).
     ///
     /// Bumps the global generation counter so all existing keys become stale.
-    /// Stale entries are cleaned up by TTL/LRU eviction naturally.
+    /// Stale entries are cleaned up by TTL/SIEVE eviction naturally.
     pub fn invalidate_all(&self) {
         self.global_generation.fetch_add(1, Ordering::Relaxed);
         self.stat_invalidations.fetch_add(1, Ordering::Relaxed);
@@ -322,38 +345,6 @@ impl DataCache {
                     )
             })
         })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// FnvHasher — fast non-cryptographic hash for internal cache keys
-// ---------------------------------------------------------------------------
-
-/// A simple FNV-1a hasher — faster than SipHash for non-adversarial data.
-///
-/// Used only for internal cache key computation where DoS resistance is not
-/// needed (the inputs are server-generated SQL + trusted JWT claims).
-struct FnvHasher(u64);
-
-impl FnvHasher {
-    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x00000100000001B3;
-
-    fn new() -> Self {
-        Self(Self::OFFSET_BASIS)
-    }
-}
-
-impl Hasher for FnvHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 ^= u64::from(b);
-            self.0 = self.0.wrapping_mul(Self::PRIME);
-        }
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
     }
 }
 
@@ -613,7 +604,7 @@ mod tests {
 
         cache.store(
             key,
-            serde_json::json!([{"id": 42, "name": "Alice"}]),
+            bytes::Bytes::from_static(br#"[{"id":42,"name":"Alice"}]"#),
             None,
             Some(1),
         );
@@ -621,7 +612,7 @@ mod tests {
         let entry = cache.get(key);
         assert!(entry.is_some());
         let entry = entry.unwrap();
-        assert_eq!(entry.body, serde_json::json!([{"id": 42, "name": "Alice"}]));
+        assert_eq!(&entry.body[..], br#"[{"id":42,"name":"Alice"}]"#);
         assert_eq!(entry.page_total, Some(1));
     }
 
@@ -635,7 +626,7 @@ mod tests {
             .compute_key(&plan, "SELECT 1", &[], Some("user1"), None)
             .unwrap();
 
-        cache.store(&key_before, serde_json::json!([{"id": 42}]), None, Some(1));
+        cache.store(&key_before, bytes::Bytes::from_static(b"[{\"id\":42}]"), None, Some(1));
         assert!(cache.get(&key_before).is_some());
 
         // Invalidate the table — bumps its generation counter
@@ -666,7 +657,7 @@ mod tests {
         let key_before = cache
             .compute_key(&plan, "SELECT 1", &[], Some("user1"), None)
             .unwrap();
-        cache.store(&key_before, serde_json::json!([{"id": 1}]), None, Some(1));
+        cache.store(&key_before, bytes::Bytes::from_static(b"[{\"id\":1}]"), None, Some(1));
         assert!(cache.get(&key_before).is_some());
 
         // Global invalidation bumps global_generation, affecting all tables

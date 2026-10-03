@@ -17,9 +17,10 @@
 //! ```
 
 use winnow::combinator::{alt, delimited, opt, preceded, separated, terminated};
+use winnow::token::take_while;
 use winnow::{Parser, Result};
 
-use super::common::{alias_sep, field_name, identifier, json_path};
+use super::common::{alias_sep, check_nesting, field_name, json_path};
 use crate::select_ast::{
     AggregateFunction, FieldSelect, JoinType, RelationSelect, SelectItem, SpreadSelect,
 };
@@ -35,6 +36,7 @@ pub fn parse_select(input: &str) -> Result<Vec<SelectItem>, String> {
     if input.is_empty() {
         return Ok(vec![]);
     }
+    check_nesting(input).map_err(|e| format!("failed to parse select: {e}"))?;
     select_list
         .parse(input)
         .map_err(|e| format!("failed to parse select: {e}"))
@@ -74,7 +76,7 @@ fn field_or_relation(input: &mut &str) -> Result<SelectItem> {
     // `count()` is special — no column name.
     if input.starts_with("count()") {
         "count()".parse_next(input)?;
-        let agg_cast = opt(preceded("::", identifier)).parse_next(input)?;
+        let agg_cast = opt(preceded("::", cast_type)).parse_next(input)?;
         return Ok(SelectItem::Field(FieldSelect {
             name: String::new(),
             alias,
@@ -107,10 +109,10 @@ fn field_or_relation(input: &mut &str) -> Result<SelectItem> {
     }
 
     let json = json_path(input)?;
-    let cast = opt(preceded("::", identifier)).parse_next(input)?;
+    let cast = opt(preceded("::", cast_type)).parse_next(input)?;
     let aggregate = opt(preceded('.', terminated(aggregation, "()"))).parse_next(input)?;
     let aggregate_cast = if aggregate.is_some() {
-        opt(preceded("::", identifier)).parse_next(input)?
+        opt(preceded("::", cast_type)).parse_next(input)?
     } else {
         None
     };
@@ -191,6 +193,19 @@ fn aggregation(input: &mut &str) -> Result<AggregateFunction> {
     .parse_next(input)
 }
 
+/// A `::cast` target type, e.g. `text`, `double precision`, `int[]`.
+///
+/// Accepts exactly the characters the renderer emits, so a cast is never
+/// silently altered or dropped between parse and SQL. A blank type is rejected.
+fn cast_type(input: &mut &str) -> Result<String> {
+    take_while(1.., |c: char| {
+        c.is_ascii_alphanumeric() || matches!(c, '_' | ' ' | '[' | ']')
+    })
+    .map(|s: &str| s.trim().to_string())
+    .verify(|s: &String| !s.is_empty())
+    .parse_next(input)
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -203,6 +218,22 @@ mod tests {
     #[test]
     fn parse_empty() {
         assert_eq!(parse_select("").unwrap(), vec![]);
+    }
+
+    #[test]
+    fn deep_nesting_is_rejected_not_a_stack_overflow() {
+        // 100k levels used to recurse until the stack overflowed (process abort).
+        let deep = format!("{}*{}", "a(".repeat(100_000), ")".repeat(100_000));
+        assert!(parse_select(&deep).is_err());
+        let ok = format!("{}*{}", "a(".repeat(8), ")".repeat(8));
+        assert!(parse_select(&ok).is_ok());
+    }
+
+    #[test]
+    fn oversized_json_index_is_an_error_not_a_panic() {
+        // Used to panic in `digits.parse().unwrap()`.
+        let _ = parse_select("data->99999999999999999999");
+        assert!(parse_select("data->1").is_ok());
     }
 
     #[test]
@@ -325,6 +356,31 @@ mod tests {
         } else {
             panic!("expected field");
         }
+    }
+
+    #[test]
+    fn parse_cast_accepts_what_the_renderer_emits() {
+        let result = parse_select("tags::text[],price::double precision").unwrap();
+        let casts: Vec<_> = result
+            .iter()
+            .map(|item| match item {
+                SelectItem::Field(f) => f.cast.clone(),
+                _ => panic!("expected field"),
+            })
+            .collect();
+        assert_eq!(
+            casts,
+            [Some("text[]".into()), Some("double precision".into())]
+        );
+    }
+
+    #[test]
+    fn parse_cast_rejects_types_the_renderer_would_drop() {
+        // Previously `$` parsed but was stripped at render, silently dropping the cast.
+        assert!(parse_select("x::$").is_err());
+        assert!(parse_select("x::int$").is_err());
+        assert!(parse_select("x:: ").is_err());
+        assert!(parse_select("count()::$").is_err());
     }
 
     #[test]

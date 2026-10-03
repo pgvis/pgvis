@@ -106,8 +106,7 @@ impl SqliteBackend {
         // Initialize writer with PRAGMAs
         writer
             .call(|conn| {
-                conn.execute_batch(INIT_PRAGMAS)?;
-                Ok(())
+                conn.execute_batch(INIT_PRAGMAS)
             })
             .await
             .map_err(|e| Error::Introspection(format!("failed to init writer: {e}")))?;
@@ -121,8 +120,7 @@ impl SqliteBackend {
 
             reader
                 .call(|conn| {
-                    conn.execute_batch(INIT_PRAGMAS)?;
-                    Ok(())
+                    conn.execute_batch(INIT_PRAGMAS)
                 })
                 .await
                 .map_err(|e| Error::Introspection(format!("failed to init reader {i}: {e}")))?;
@@ -145,8 +143,7 @@ impl SqliteBackend {
         let writer = self.writer.lock().await;
         writer
             .call(move |conn| {
-                conn.execute_batch(&sql)?;
-                Ok(())
+                conn.execute_batch(&sql)
             })
             .await
             .map_err(|e| Error::Execution {

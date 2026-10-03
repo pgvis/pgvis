@@ -12,11 +12,39 @@
 
 use winnow::ascii::digit1;
 use winnow::combinator::{alt, delimited, not, opt, peek, preceded, repeat, separated};
+use winnow::error::ContextError;
 use winnow::token::{any, one_of, take_while};
 use winnow::{Parser, Result};
 
 use super::types::{Operator, Quantifier};
 use crate::select_ast::{JsonOperand, JsonOperation};
+
+/// Deepest `(` … `)` nesting a `select=` or `and=`/`or=` value may use.
+///
+/// Both parsers recurse once per level; unbounded input overflows the stack,
+/// which aborts the whole process rather than failing one request.
+pub const MAX_NESTING: usize = 32;
+
+/// Reject input nested deeper than [`MAX_NESTING`], before any recursion.
+/// Counts every parenthesis (quoted ones included), which only errs towards
+/// rejecting absurd input.
+pub fn check_nesting(input: &str) -> Result<(), String> {
+    let (mut depth, mut max) = (0usize, 0usize);
+    for b in input.bytes() {
+        match b {
+            b'(' => {
+                depth += 1;
+                max = max.max(depth);
+            }
+            b')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    if max > MAX_NESTING {
+        return Err(format!("nesting deeper than {MAX_NESTING} levels"));
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Field name
@@ -102,7 +130,8 @@ fn json_operand(input: &mut &str) -> Result<JsonOperand> {
 fn json_index(input: &mut &str) -> Result<JsonOperand> {
     let neg = opt('-').parse_next(input)?.is_some();
     let digits: &str = digit1.parse_next(input)?;
-    let n: i64 = digits.parse().unwrap();
+    // Request data: an index past i64 must be a parse error, not a panic.
+    let n: i64 = digits.parse().map_err(|_| ContextError::new())?;
     Ok(JsonOperand::Index(if neg { -n } else { n }))
 }
 

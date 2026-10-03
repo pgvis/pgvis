@@ -30,11 +30,11 @@ pub async fn query_relationships(
 
         for table_name in &table_names {
             let table_rels = query_table_fks(conn, table_name, &tables_clone)
-                .map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
+                ?;
             rels.extend(table_rels);
         }
 
-        Ok(rels)
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(rels)
     })
     .await
     .map_err(|e| Error::Introspection(format!("SQLite relationships introspection failed: {e}")))

@@ -17,12 +17,12 @@ workspace = true
 [dependencies]
 pgvis-core = { path = "../pgvis-core" }
 pgvis-lib = { path = "../pgvis-lib" }
-arc-swap.workspace = true
 clap.workspace = true
 figment.workspace = true
+toml.workspace = true
+serde_ignored.workspace = true
 tokio.workspace = true
 axum.workspace = true
-tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
@@ -36,6 +36,7 @@ serde_json.workspace = true
 tokio-postgres.workspace = true
 pgvis-lib = { path = "../pgvis-lib" }
 axum.workspace = true
+jsonwebtoken.workspace = true
 
 [features]
 default = ["mcp"]

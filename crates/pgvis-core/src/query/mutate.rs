@@ -54,7 +54,22 @@ fn render_insert(
     let col_list: Vec<String> = columns.iter().map(|c| ctx.quote_ident(c)).collect();
     let col_sql = col_list.join(", ");
 
-    let mut sql = if body_objects.len() <= 1 {
+    let mut sql = if ctx.dialect.supports_json_recordset {
+        // The payload is one JSON parameter read into the table's row type:
+        // constant SQL for any row count, no bind-parameter limit, and JSON
+        // arrays/objects convert to array/composite/json columns (one text
+        // parameter per value can't express an array).
+        let rows = match &plan.body {
+            Some(RequestBody::Bulk(rows)) => Value::Array(rows.clone()),
+            Some(RequestBody::Single(row)) => Value::Array(vec![row.clone()]),
+            _ => Value::Array(vec![]),
+        };
+        let rows = ctx.push_param(rows);
+        format!(
+            "INSERT INTO {table_ref} ({col_sql}) SELECT {col_sql} \
+             FROM json_populate_recordset(NULL::{table_ref}, {rows}::json)"
+        )
+    } else if body_objects.len() <= 1 {
         // Single-row INSERT
         let obj = body_objects.first();
         let placeholders: Vec<String> = columns
@@ -152,10 +167,7 @@ fn render_update(
 
     let mut sql = format!("UPDATE {table_ref} SET {}", set_clauses.join(", "));
 
-    // WHERE clause
-    if let Some(wc) =
-        fragment::render_where_clause(&plan.filters, &plan.logic_filters, Some(table_alias), ctx)
-    {
+    if let Some(wc) = render_mutation_where(table_ref, table_alias, plan, ctx) {
         sql.push_str(" WHERE ");
         sql.push_str(&wc);
     }
@@ -177,16 +189,45 @@ fn render_delete(
 
     let mut sql = format!("DELETE FROM {table_ref}");
 
-    // WHERE clause
-    if let Some(wc) =
-        fragment::render_where_clause(&plan.filters, &plan.logic_filters, Some(table_alias), ctx)
-    {
+    if let Some(wc) = render_mutation_where(table_ref, table_alias, plan, ctx) {
         sql.push_str(" WHERE ");
         sql.push_str(&wc);
     }
 
     append_returning(&mut sql, plan, ctx);
     Ok(sql)
+}
+
+/// The WHERE clause of an UPDATE/DELETE. With a client `limit`/`offset`,
+/// the rows are chosen by a subquery on the row identifier, honouring
+/// `order`: `<id> IN (SELECT <id> FROM t WHERE ... ORDER BY ... LIMIT n)`.
+/// (UPDATE/DELETE have no LIMIT of their own; ignoring it changed every
+/// matching row.)
+fn render_mutation_where(
+    table_ref: &str,
+    table_alias: &str,
+    plan: &MutatePlan,
+    ctx: &mut RenderContext<'_>,
+) -> Option<String> {
+    let wc =
+        fragment::render_where_clause(&plan.filters, &plan.logic_filters, Some(table_alias), ctx);
+    let Some(limit_offset) = fragment::render_limit_offset(plan.range.limit, plan.range.offset)
+    else {
+        return wc; // not limited: the plain filter
+    };
+    let id = ctx.dialect.row_identifier;
+    let mut sub = format!("SELECT {id} FROM {table_ref}");
+    if let Some(wc) = wc {
+        sub.push_str(" WHERE ");
+        sub.push_str(&wc);
+    }
+    if let Some(ob) = fragment::render_order_clause(&plan.order, Some(table_alias), ctx) {
+        sub.push_str(" ORDER BY ");
+        sub.push_str(&ob);
+    }
+    sub.push(' ');
+    sub.push_str(&limit_offset);
+    Some(format!("{id} IN ({sub})"))
 }
 
 // ---------------------------------------------------------------------------
@@ -277,8 +318,21 @@ mod tests {
 
         assert!(sql.contains("INSERT INTO \"public\".\"users\""));
         assert!(sql.contains("(\"name\", \"email\")"));
-        assert!(sql.contains("VALUES ($1, $2)"));
+        // Postgres: the whole payload is one JSON parameter.
+        assert!(sql.contains(
+            "SELECT \"name\", \"email\" FROM json_populate_recordset(NULL::\"public\".\"users\", $1::json)"
+        ));
+        assert_eq!(ctx.params().len(), 1);
         assert!(sql.contains("RETURNING *"));
+    }
+
+    #[test]
+    fn test_simple_insert_binds_each_value_without_json_recordset() {
+        let plan = make_insert_plan();
+        let mut ctx = RenderContext::new(&crate::dialect::SQLITE);
+        let sql = render_mutate(&plan, &mut ctx).unwrap();
+        assert!(sql.contains("VALUES ("), "{sql}");
+        assert_eq!(ctx.params().len(), 2);
     }
 
     #[test]

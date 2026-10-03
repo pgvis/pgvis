@@ -33,7 +33,9 @@ use std::pin::Pin;
 use futures::Stream;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+use crate::backend::{Backend, ExecContext};
 use crate::error::Error;
 
 // ---------------------------------------------------------------------------
@@ -184,7 +186,9 @@ pub trait PubSubBackend: Send + Sync + 'static {
 /// channel_prefix = "pgvis:"
 /// max_payload_bytes = 7500
 /// max_subscribers = 1000
+/// max_subscribers_per_identity = 100
 /// channel_buffer_size = 64
+/// authorize_function = "auth.pubsub_authorize"  # optional
 /// reconnect_base_ms = 500
 /// reconnect_max_ms = 30000
 /// ```
@@ -240,6 +244,16 @@ pub struct PubSubConfig {
     #[serde(default = "default_max_subscribers")]
     pub max_subscribers: usize,
 
+    /// Maximum concurrent SSE subscribers per identity (JWT role + `sub` claim).
+    ///
+    /// Stops one caller from taking every `max_subscribers` slot. Callers
+    /// without a `sub` claim (e.g. anonymous clients) can't be told apart, so
+    /// only `max_subscribers` bounds them. `0` disables the per-identity cap.
+    ///
+    /// Default: `100`.
+    #[serde(default = "default_max_subscribers_per_identity")]
+    pub max_subscribers_per_identity: usize,
+
     /// Per-channel broadcast buffer size.
     ///
     /// Number of messages buffered for slow subscribers before they start
@@ -260,6 +274,22 @@ pub struct PubSubConfig {
     /// Default: `[]` (allow all).
     #[serde(default)]
     pub allowed_channels: Vec<String>,
+
+    /// Qualified name of a SQL function that authorizes channel access.
+    ///
+    /// Called as `SELECT fn(channel text, op text)` (`op` is `'subscribe'` or
+    /// `'publish'`) inside a transaction running as the caller's role with
+    /// their JWT claims set, exactly like a data API request. Anything but
+    /// `true` (false, NULL, or an error) denies with 403. Publish runs the
+    /// check and the `pg_notify` in the same statement.
+    ///
+    /// When unset, any caller that passes JWT verification may subscribe to
+    /// or publish on every channel in `allowed_channels`; publishes still run
+    /// as the caller's role.
+    ///
+    /// Default: `None`.
+    #[serde(default)]
+    pub authorize_function: Option<String>,
 
     /// Reconnection backoff base in milliseconds.
     ///
@@ -295,8 +325,10 @@ impl Default for PubSubConfig {
             channel_prefix: default_channel_prefix(),
             max_payload_bytes: default_max_payload_bytes(),
             max_subscribers: default_max_subscribers(),
+            max_subscribers_per_identity: default_max_subscribers_per_identity(),
             channel_buffer_size: default_channel_buffer_size(),
             allowed_channels: Vec::new(),
+            authorize_function: None,
             reconnect_base_ms: default_reconnect_base_ms(),
             reconnect_max_ms: default_reconnect_max_ms(),
             keepalive_interval_secs: default_keepalive_interval_secs(),
@@ -389,6 +421,119 @@ impl PubSubConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Caller-scoped authorization and publish
+// ---------------------------------------------------------------------------
+
+/// Check `config.authorize_function` for `op` (`"subscribe"` or `"publish"`)
+/// on `channel`, running as the caller described by `ctx`.
+///
+/// A no-op when no authorize function is configured.
+///
+/// # Errors
+///
+/// `ChannelDenied` (403) unless the function returns `true`.
+pub async fn authorize(
+    backend: &dyn Backend,
+    ctx: &ExecContext,
+    config: &PubSubConfig,
+    channel: &str,
+    op: &str,
+) -> Result<(), Error> {
+    let Some(func) = &config.authorize_function else {
+        return Ok(());
+    };
+    let sql = format!(
+        "SELECT to_json({}($1::text, $2::text) IS TRUE) AS body",
+        quote_function(func)
+    );
+    let params = [Value::from(channel), Value::from(op)];
+    let result = backend
+        .execute(ctx, &sql, &params)
+        .await
+        .map_err(|e| denied_by_db(channel, e))?;
+    allowed_or_denied(&result.body, channel)
+}
+
+/// Publish `payload` to `channel` as the caller described by `ctx`.
+///
+/// The `pg_notify` goes through [`Backend::execute`], so it runs under the
+/// caller's role and claims (and `pre_request`). When an authorize function is
+/// configured, the check and the NOTIFY are one statement: `CASE` only
+/// evaluates the volatile `pg_notify` when the function returned `true`.
+///
+/// # Errors
+///
+/// Validation errors, `ChannelDenied` (403) when the authorize function
+/// refuses, or the backend's error.
+pub async fn publish(
+    backend: &dyn Backend,
+    ctx: &ExecContext,
+    config: &PubSubConfig,
+    channel: &str,
+    payload: &str,
+) -> Result<(), Error> {
+    config.validate_channel(channel)?;
+    config.validate_payload(payload)?;
+
+    let notify = "pg_notify($1::text, $2::text)::text = ''";
+    let mut params = vec![
+        Value::from(config.pg_channel(channel)),
+        Value::from(payload),
+    ];
+    let sql = match &config.authorize_function {
+        Some(func) => {
+            params.push(Value::from(channel));
+            format!(
+                "SELECT to_json(CASE WHEN {}($3::text, 'publish') IS TRUE THEN {notify} END) AS body",
+                quote_function(func)
+            )
+        }
+        None => format!("SELECT to_json({notify}) AS body"),
+    };
+    let result = match backend.execute(ctx, &sql, &params).await {
+        Ok(result) => result,
+        Err(e) if config.authorize_function.is_some() => return Err(denied_by_db(channel, e)),
+        Err(e) => return Err(e),
+    };
+    allowed_or_denied(&result.body, channel)
+}
+
+/// Quote a qualified function name (`schema.fn`) part by part.
+fn quote_function(name: &str) -> String {
+    let ctx = crate::query::RenderContext::new(&crate::dialect::POSTGRES);
+    name.split('.')
+        .map(|part| ctx.quote_ident(part))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn allowed_or_denied(body: &Value, channel: &str) -> Result<(), Error> {
+    if *body == Value::Bool(true) {
+        return Ok(());
+    }
+    Err(Error::PubSub {
+        message: format!("access to channel '{channel}' denied"),
+        code: PubSubErrorCode::ChannelDenied,
+    })
+}
+
+/// A database error from the authorization statement (the function raised, or
+/// the caller's role may not execute it) denies access.
+fn denied_by_db(channel: &str, err: Error) -> Error {
+    match err {
+        Error::Execution {
+            db_code: Some(_),
+            message,
+            ..
+        } => Error::PubSub {
+            message: format!("access to channel '{channel}' denied: {message}"),
+            code: PubSubErrorCode::ChannelDenied,
+        },
+        other => other,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PubSubErrorCode — structured error codes for pub/sub operations
 // ---------------------------------------------------------------------------
 
@@ -451,6 +596,10 @@ fn default_max_payload_bytes() -> usize {
 
 fn default_max_subscribers() -> usize {
     1000
+}
+
+fn default_max_subscribers_per_identity() -> usize {
+    100
 }
 
 fn default_channel_buffer_size() -> usize {
@@ -670,5 +819,17 @@ mod tests {
         assert_eq!(PubSubErrorCode::ChannelDenied.as_str(), "PGVIS_PUBSUB_CHANNEL_DENIED");
         assert_eq!(PubSubErrorCode::NotAvailable.http_status(), 501);
         assert_eq!(PubSubErrorCode::MaxSubscribersExceeded.http_status(), 503);
+    }
+
+    #[test]
+    fn test_pubsub_error_reports_its_code_through_generic_accessors() {
+        // The REST and MCP error builders use `Error::code()`; it must not
+        // degrade a pub/sub error to Internal/PGV500.
+        let err = Error::PubSub {
+            message: "denied".into(),
+            code: PubSubErrorCode::ChannelDenied,
+        };
+        assert_eq!(err.code().as_str(), "PGVIS_PUBSUB_CHANNEL_DENIED");
+        assert_eq!(err.http_status(), 403);
     }
 }

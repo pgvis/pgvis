@@ -30,7 +30,14 @@ channel_prefix = "pgvis:"      # optional, default "pgvis:"
 max_payload_bytes = 7500        # optional, default 7500
 channel_buffer_size = 64        # optional, default 64
 allowed_channels = []           # empty = allow all
+authorize_function = "auth.pubsub_authorize"  # optional, see below
 ```
+
+## Authentication
+
+The pub/sub endpoints verify the caller exactly like the data API: the same `jwt_secret`, `anon_role`, `role_claim_key` and `jwt_aud` settings apply, and a request without a token runs as `anon_role` (or gets `401` when no `anon_role` is configured). The verified role and JWT claims are what `authorize_function` and `pg_notify` run as — see [Per-Channel Authorization](#per-channel-authorization-security).
+
+The `curl` examples below assume an `anon_role` is configured; otherwise add `-H "Authorization: Bearer $TOKEN"`.
 
 ## REST API (Server-Sent Events)
 
@@ -62,7 +69,9 @@ event: message
 data: {"channel":"chat","payload":"{\"user\":\"alice\",\"text\":\"hi\"}","timestamp":"2026-06-01T10:00:01.123Z"}
 ```
 
-The connection stays open until the client disconnects. A keepalive comment (`: keepalive`) is sent every 30 seconds to prevent proxy timeouts.
+The connection stays open until the client disconnects. A keepalive comment (`: keepalive`) is sent every `keepalive_interval_secs` (default 15 seconds) to prevent proxy timeouts. A subscriber that falls more than `channel_buffer_size` messages behind receives a `: lagged N messages` comment in place of the messages it missed.
+
+Before the stream opens, pgvis validates the channel name, runs `authorize_function` with `op = 'subscribe'` (if configured) and reserves a subscriber slot; any failure is returned as an [error response](#errors) instead of a stream.
 
 ### Publish to a Channel
 
@@ -89,7 +98,7 @@ curl -X POST http://localhost:3000/pubsub/notifications \
   -d '{"event":"order_placed","order_id":42}'
 ```
 
-**Response:** `200 OK` with `{"ok": true}` on success, or an error JSON body with the appropriate status code.
+**Response:** `200 OK` with `{"ok": true}` on success, or an [error response](#errors). The `pg_notify` runs as the caller's database role, in the same statement as the `authorize_function` check when one is configured.
 
 ### Channel Status
 
@@ -98,25 +107,48 @@ GET /pubsub
 Accept: application/json
 ```
 
-Returns active channels and subscriber counts:
+Returns the channels with subscribers on this instance and their counts:
 
 ```json
 {
-  "active_channels": [
+  "total_subscribers": 4,
+  "channels": [
     { "name": "chat", "subscribers": 3 },
     { "name": "notifications", "subscribers": 1 }
-  ],
-  "total_subscribers": 4
+  ]
 }
 ```
 
+The status endpoint requires the same authentication as subscribe/publish (it reveals channel names); `authorize_function` is not consulted for it.
+
+### Errors
+
+Pub/sub failures return a JSON body with a `PGVIS_PUBSUB_*` code:
+
+```json
+{ "error": "pubsub error: access to channel 'admin' denied", "code": "PGVIS_PUBSUB_CHANNEL_DENIED" }
+```
+
+| Code | Status | When |
+|------|--------|------|
+| `PGVIS_PUBSUB_INVALID_CHANNEL` | 400 | Empty name, null byte, or prefix + name longer than 63 bytes |
+| `PGVIS_PUBSUB_PAYLOAD_TOO_LARGE` | 400 | Payload over `max_payload_bytes` |
+| `PGVIS_PUBSUB_CHANNEL_DENIED` | 403 | Channel not in `allowed_channels`, or `authorize_function` did not return `true` |
+| `PGVIS_PUBSUB_MAX_SUBSCRIBERS` | 503 | `max_subscribers` or `max_subscribers_per_identity` reached |
+| `PGVIS_PUBSUB_CONNECTION_LOST` | 503 | The listener connection is down |
+| `PGVIS_PUBSUB_NOT_AVAILABLE` | 501 | Pub/sub unavailable |
+
+Authentication failures (`401`) use the data API's `PGRST3xx` error format.
+
 ## MCP Tools (AI Agents)
 
-When pub/sub is enabled, two additional MCP tools become available:
+When pub/sub is enabled, two additional MCP tools become available on the Streamable HTTP MCP endpoint (`serve --mcp-http`). The stdio server (`pgvis mcp`) does not offer them.
+
+MCP calls carry no JWT, so these tools run as the `anon_role` with no claims, and are refused when `jwt_secret` is set without an `anon_role` — the same rule as every other [MCP tool](/guides/mcp#authentication).
 
 ### `pubsub_publish`
 
-Publish a message to a channel.
+Publish a message to a channel. Goes through the same validation, `authorize_function` check (`op = 'publish'`) and caller-role `pg_notify` as `POST /pubsub/{channel}`. Refused when the server is read-only.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -140,14 +172,14 @@ Publish a message to a channel.
 ```json
 {
   "content": [
-    { "type": "text", "text": "Published to channel 'alerts'" }
+    { "type": "text", "text": "{\"ok\":true,\"channel\":\"alerts\",\"payload_bytes\":46}" }
   ]
 }
 ```
 
 ### `pubsub_channels`
 
-List active channels and subscriber counts.
+List the channels this instance is currently listening on (channels with at least one local subscriber).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -160,7 +192,7 @@ List active channels and subscriber counts.
   "content": [
     {
       "type": "text",
-      "text": "{\"active_channels\":[{\"name\":\"alerts\",\"subscribers\":2}],\"total_subscribers\":2}"
+      "text": "{\"channels\":[\"alerts\"],\"count\":1}"
     }
   ]
 }
@@ -179,16 +211,19 @@ AI agents can use pub/sub to:
 
 When embedding pgvis in your Rust application, the `PubSubHub` is available on the `Components` struct.
 
+The hub is a **trusted, in-process** API. Channel validation and `allowed_channels` still apply, but `hub.publish()` sends `NOTIFY` as the DSN's role with no `authorize_function` check, and `hub.subscribe()` skips `authorize_function` and the per-identity cap (only `max_subscribers` applies; use `subscribe_as(channel, Some(identity))` / `unsubscribe_as` to count against `max_subscribers_per_identity`). Authorize your own callers before using it on their behalf.
+
 ### Basic Setup
 
 ```rust
 use pgvis_lib::Builder;
-use pgvis_core::pubsub::PubSubConfig;
-use pgvis_core::config::Config;
+use pgvis_lib::pgvis_core::pubsub::PubSubConfig;
+use pgvis_lib::pgvis_core::config::Config;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = Config {
+        anon_role: Some("web_anon".into()),
         pubsub: PubSubConfig {
             enabled: true,
             channel_prefix: "myapp:".to_string(),
@@ -219,7 +254,7 @@ async fn main() -> anyhow::Result<()> {
 
         // Check status
         let status = hub.status().await;
-        println!("Active channels: {}", status.active_channels.len());
+        println!("Active channels: {}", status.channels.len());
     }
 
     // Serve the router (includes /pubsub endpoints)
@@ -234,10 +269,10 @@ async fn main() -> anyhow::Result<()> {
 For lower-level control, use `PgPubSub` directly without the hub:
 
 ```rust
-use pgvis_postgres::PgPubSub;
-use pgvis_core::pubsub::{PubSubBackend, PubSubConfig};
-use pgvis_core::config::PoolConfig;
-use std::sync::Arc;
+use futures::StreamExt;
+use pgvis_lib::pgvis_postgres::PgPubSub;
+use pgvis_lib::pgvis_core::pubsub::{PubSubBackend, PubSubConfig};
+use pgvis_lib::pgvis_core::config::PoolConfig;
 
 let config = PubSubConfig::default();
 let pool_config = PoolConfig::default();
@@ -251,11 +286,15 @@ let backend = PgPubSub::new(
 // Listen to a channel at the Postgres level
 backend.listen("my_channel").await?;
 
-// Get a stream of notifications
+// Get a stream of notifications (all listened channels)
 let mut stream = backend.notification_stream().await?;
 
-// Publish (sends NOTIFY via a pooled connection)
+// Publish (sends NOTIFY via a pooled connection, as the DSN's role)
 backend.publish("my_channel", "hello").await?;
+
+if let Some(msg) = stream.next().await {
+    println!("{}: {}", msg.channel, msg.payload);
+}
 
 // Clean up
 backend.unlisten("my_channel").await?;
@@ -265,14 +304,14 @@ backend.unlisten("my_channel").await?;
 
 ```rust
 use pgvis_lib::Builder;
-use pgvis_core::config::Config;
-use pgvis_core::pubsub::PubSubConfig;
+use pgvis_lib::pgvis_core::config::Config;
+use pgvis_lib::pgvis_core::pubsub::PubSubConfig;
 use axum::{Router, routing::post, extract::State, Json};
 use std::sync::Arc;
 
 #[derive(Clone)]
 struct AppState {
-    hub: Arc<pgvis_router::PubSubHub>,
+    hub: Arc<pgvis_lib::pgvis_router::PubSubHub>,
 }
 
 async fn notify_users(
@@ -287,6 +326,7 @@ async fn notify_users(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = Config {
+        anon_role: Some("web_anon".into()),
         pubsub: PubSubConfig { enabled: true, ..Default::default() },
         ..Default::default()
     };
@@ -320,6 +360,12 @@ async fn main() -> anyhow::Result<()> {
 | `max_payload_bytes` | usize | `7500` | Maximum payload size (Postgres limit is ~8000) |
 | `channel_buffer_size` | usize | `64` | In-process broadcast buffer per channel |
 | `allowed_channels` | string[] | `[]` | Channel allowlist (empty = allow all). Supports glob patterns: `chat.*`, `events.*` |
+| `authorize_function` | string | none | SQL function `fn(channel text, op text) returns boolean` that authorizes each subscribe/publish as the caller's role |
+| `max_subscribers` | usize | `1000` | Maximum concurrent SSE subscribers on this instance |
+| `max_subscribers_per_identity` | usize | `100` | Maximum concurrent SSE subscribers per JWT role + `sub` (`0` = no limit); callers without `sub` are bounded by `max_subscribers` only |
+| `keepalive_interval_secs` | u64 | `15` | Interval between SSE `: keepalive` comments |
+| `reconnect_base_ms` | u64 | `500` | Listener reconnect backoff base |
+| `reconnect_max_ms` | u64 | `30000` | Listener reconnect backoff cap |
 
 ### Environment Variables
 
@@ -327,6 +373,7 @@ async fn main() -> anyhow::Result<()> {
 |----------|---------|
 | `PGVIS_PUBSUB_ENABLED` | `pubsub.enabled` |
 | `PGVIS_PUBSUB_CHANNEL_PREFIX` | `pubsub.channel_prefix` |
+| `PGVIS_PUBSUB__<FIELD>` | Any `pubsub.<field>`, e.g. `PGVIS_PUBSUB__AUTHORIZE_FUNCTION`, `PGVIS_PUBSUB__MAX_SUBSCRIBERS` |
 
 ### CLI Flags
 
@@ -362,7 +409,7 @@ async fn main() -> anyhow::Result<()> {
 └──────────────────────────────────────────────────────┘
 ```
 
-1. **Publish:** Any surface calls `hub.publish(channel, payload)` → hub validates → backend sends `NOTIFY` to Postgres
+1. **Publish:** REST and MCP validate the channel and payload, then run `authorize_function` (if set) and `pg_notify` in one statement as the caller's role; embedded code calling `hub.publish(channel, payload)` validates and sends `NOTIFY` as the DSN's role
 2. **Delivery:** Postgres broadcasts the notification to ALL connected listeners (including other pgvis instances)
 3. **Fan-out:** The dedicated listener task receives the notification → broadcasts to all local subscribers via `tokio::sync::broadcast`
 4. **Subscribe:** REST returns SSE frames; MCP returns tool results; embedded code receives from the broadcast channel
@@ -372,6 +419,7 @@ async fn main() -> anyhow::Result<()> {
 | Constraint | Value | Reason |
 |------------|-------|--------|
 | Max payload | ~7,500 bytes | Postgres NOTIFY limit is 8,000 bytes including channel name |
+| Max channel name | 63 bytes including `channel_prefix` | Postgres identifier length limit |
 | Delivery guarantee | At-most-once | No persistence; missed during disconnection |
 | Ordering | Per-connection FIFO | Postgres guarantees order within a single session |
 | No history | — | New subscribers only see future messages |
@@ -415,7 +463,33 @@ enabled = true
 allowed_channels = ["chat.*", "notifications", "events.*"]
 ```
 
-Only channels matching these patterns will be accepted. Attempts to subscribe or publish to other channels return `403 Forbidden`.
+Only channels matching these patterns will be accepted (`*` matches any sequence of characters). Attempts to subscribe or publish to other channels return `403 Forbidden` with `PGVIS_PUBSUB_CHANNEL_DENIED`.
+
+### Per-Channel Authorization (Security)
+
+The allowlist applies to every caller alike. To decide per caller, let the database decide, as it does for tables:
+
+```toml
+[pubsub]
+authorize_function = "auth.pubsub_authorize"
+```
+
+```sql
+CREATE FUNCTION auth.pubsub_authorize(channel text, op text) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+  SELECT channel = 'user.' || (nullif(current_setting('request.jwt.claims', true), '')::json->>'sub')
+$$;
+```
+
+pgvis calls it with `op` = `'subscribe'` or `'publish'` in a transaction running as the caller's role with their JWT claims set, exactly like a data API request. Anything but `true` (false, NULL, or an error) returns `403 Forbidden`. Publishing always runs `pg_notify` as the caller's role, in the same statement as the check. Subscriptions are authorized once, when the stream opens.
+
+The caller's role needs `EXECUTE` on the function (granted to `PUBLIC` by default); a permission error counts as a denial. MCP's `pubsub_publish` goes through the same check, as the `anon_role` with no claims. The embedded `PubSubHub` API does not.
+
+Without `authorize_function`, any caller that passes JWT verification may subscribe to or publish on every allowed channel; publishes still run `pg_notify` as the caller's role.
+
+### Subscriber Limits
+
+`max_subscribers` caps concurrent SSE streams on the instance. `max_subscribers_per_identity` additionally caps each identity — the verified role plus the JWT `sub` claim — so one user can't take every slot. Callers without a `sub` (including anonymous ones) can't be told apart, so they are bounded only by `max_subscribers` rather than sharing one per-identity pool. Either limit returns `503` with `PGVIS_PUBSUB_MAX_SUBSCRIBERS`; slots are released when the stream closes.
 
 ### Cross-Instance Coordination
 

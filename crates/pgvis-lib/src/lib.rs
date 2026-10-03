@@ -86,6 +86,9 @@
 
 use std::sync::Arc;
 
+mod reload;
+pub use reload::SchemaReloader;
+
 use arc_swap::ArcSwap;
 use pgvis_core::Config;
 use pgvis_core::backend::{Backend, IntrospectConfig};
@@ -129,6 +132,9 @@ pub struct Components {
     pub router: axum::Router,
     /// The pub/sub hub (if enabled). `None` when pub/sub is disabled or unsupported.
     pub pubsub: Option<Arc<pgvis_router::PubSubHub>>,
+    /// Keeps `cache` current after DDL; call `reload()` / `reload_now()` to
+    /// refresh it on demand (e.g. after running migrations).
+    pub reloader: SchemaReloader,
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +255,7 @@ impl Builder {
             backend.introspect(&introspect_config).await?,
         )));
         let dialect = Arc::new(backend.dialect().clone());
+        let reloader = SchemaReloader::spawn(backend.clone(), cache.clone(), introspect_config);
 
         // Build REST router
         let mut app = pgvis_router::build_app(
@@ -277,9 +284,10 @@ impl Builder {
                 )
                 .await?;
 
-                // Mount pub/sub router (config threads JWT settings for auth)
+                // Mount pub/sub router (config threads JWT settings for auth;
+                // the backend authorizes and publishes as the caller's role)
                 let pubsub_router =
-                    pgvis_router::build_pubsub_router(hub.clone(), config.clone());
+                    pgvis_router::build_pubsub_router(hub.clone(), config.clone(), backend.clone());
                 app = app.nest("/pubsub", pubsub_router);
 
                 Some(hub)
@@ -316,6 +324,7 @@ impl Builder {
             dialect,
             router: app,
             pubsub,
+            reloader,
         })
     }
 
@@ -348,6 +357,8 @@ impl Builder {
             backend.introspect(&introspect_config).await?,
         )));
         let dialect = Arc::new(backend.dialect().clone());
+        // Runs for the life of the process, keeping the MCP tool list current.
+        SchemaReloader::spawn(backend.clone(), cache.clone(), introspect_config);
 
         Ok(pgvis_mcp::McpServer::new(cache, config, dialect, backend))
     }

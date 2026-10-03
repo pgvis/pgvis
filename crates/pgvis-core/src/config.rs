@@ -199,6 +199,16 @@ pub struct Config {
     #[serde(default = "default_jwt_algo")]
     pub jwt_algo: JwtAlgorithm,
 
+    /// Required JWT audience (`aud`). When set, tokens without this audience
+    /// are rejected; when `None`, `aud` is not checked.
+    ///
+    /// Set it when the signing key is shared across applications (one IdP
+    /// tenant): otherwise a token minted for any of them is accepted here.
+    ///
+    /// PostgREST equivalent: `jwt-aud`.
+    #[serde(default)]
+    pub jwt_aud: Option<String>,
+
     /// The role used for unauthenticated requests.
     ///
     /// On Postgres, this role's permissions define what anonymous users can access.
@@ -353,6 +363,7 @@ impl Default for Config {
             extra_search_path: Vec::new(),
             jwt_secret: None,
             jwt_algo: default_jwt_algo(),
+            jwt_aud: None,
             anon_role: None,
             role_claim_key: default_role_claim_key(),
             aggregates_enabled: false,

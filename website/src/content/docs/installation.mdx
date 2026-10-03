@@ -5,9 +5,14 @@ description: All the ways to install and run pgvis.
 
 # Installation
 
+## Requirements
+
+- **PostgreSQL 17 or newer.** PostgreSQL 17 and 18 are tested; pgvis refuses to start against an older server. No libpq or other system Postgres library is needed — the driver is pure Rust.
+- **Or SQLite** — bundled into the binary, no system dependency.
+
 ## From Source (Cargo)
 
-Requires Rust 2024 edition toolchain (1.85+).
+Requires a current stable Rust toolchain (edition 2024; the repository's `rust-toolchain.toml` pins the `stable` channel).
 
 ```bash
 # Clone the repository
@@ -23,18 +28,24 @@ cargo build --release --bin pgvis
 
 ### Feature flags
 
-The workspace supports compile-time feature selection:
+The `pgvis` binary always includes the PostgreSQL and SQLite backends. It has one feature:
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `postgres` | ✓ | PostgreSQL backend (requires libpq at runtime) |
+| `mcp` | ✓ | The `pgvis mcp` subcommand (stdio) and `serve --mcp-http` (Streamable HTTP) |
+
+Backend selection is a feature of the `pgvis-lib` crate, for embedding pgvis in your own application:
+
+| `pgvis-lib` feature | Default | Description |
+|---------|---------|-------------|
+| `postgres` | ✓ | PostgreSQL backend (pure Rust driver, rustls for TLS) |
 | `sqlite` | ✓ | SQLite backend (bundled, no system dependency) |
 | `mcp` | ✓ | MCP server support (stdio + Streamable HTTP) |
 
-To build without SQLite, for example:
+For example, a Postgres-only embedding:
 
-```bash
-cargo build --release --bin pgvis --no-default-features --features postgres,mcp
+```toml
+pgvis-lib = { git = "https://github.com/pgvis/pgvis", default-features = false, features = ["postgres"] }
 ```
 
 ## Nix
@@ -45,10 +56,10 @@ If you have Nix with flakes enabled:
 # Build the binary
 nix build github:pgvis/pgvis
 
-# Run directly without installing
-nix run github:pgvis/pgvis -- serve --dsn "postgres://localhost/mydb"
+# Run directly without installing (local experiment: no auth)
+nix run github:pgvis/pgvis -- --dsn "postgres://localhost/mydb" serve --insecure-no-auth
 
-# Development shell (includes Rust toolchain, PostgreSQL client, sqlx-cli)
+# Development shell (Rust toolchain, PostgreSQL, pgcli, PostgREST, cargo-nextest, Node.js for the website)
 nix develop
 ```
 
@@ -58,8 +69,9 @@ The flake provides a complete development environment with all system dependenci
 
 ```bash
 docker run -e PGVIS_DSN="postgres://host.docker.internal/mydb" \
+  -e PGVIS_ANON_ROLE="web_anon" \
   -p 3000:3000 \
-  ghcr.io/pgvis/pgvis serve
+  ghcr.io/pgvis/pgvis serve --bind 0.0.0.0:3000
 ```
 
 ## Verifying Installation
@@ -78,7 +90,7 @@ pgvis --dsn "postgres://localhost/mydb" inspect | head -20
 ## CLI Reference
 
 ```
-pgvis [OPTIONS] <COMMAND>
+pgvis [OPTIONS] [COMMAND]
 
 Options:
   -d, --dsn <DSN>        Database connection string [env: PGVIS_DSN]
@@ -93,17 +105,31 @@ Commands:
   inspect  Dump the introspected schema cache as JSON
 ```
 
+Global options go before the command: `pgvis --dsn … serve`, not `pgvis serve --dsn …`.
+
 ### `pgvis serve`
 
 ```
 pgvis serve [OPTIONS]
 
 Options:
-  -b, --bind <ADDR>      Bind address [default: 0.0.0.0:3000] [env: PGVIS_BIND]
-  -s, --schema <NAME>    Schemas to expose (repeatable or comma-separated)
-                         [default: public] [env: PGVIS_SCHEMAS]
-      --mcp-http         Also serve MCP at /mcp endpoint via Streamable HTTP
+  -b, --bind <ADDR>                  Bind address [default: 127.0.0.1:3000] [env: PGVIS_BIND]
+      --insecure-no-auth             Serve without jwt_secret or anon_role (every request
+                                     runs as the DSN's role) [env: PGVIS_INSECURE_NO_AUTH]
+  -s, --schema <NAME>                Schemas to expose (repeatable or comma-separated)
+                                     [default: public] [env: PGVIS_SCHEMAS]
+      --mcp-http                     Also serve MCP at /mcp endpoint via Streamable HTTP
+      --replica-dsn <DSN>            Read replica DSNs (repeatable or comma-separated)
+                                     [env: PGVIS_REPLICA_DSNS]
+      --cache-enabled                Enable the in-memory data cache [env: PGVIS_CACHE_ENABLED]
+      --cache-ttl <SECS>             Cache TTL in seconds [env: PGVIS_CACHE_TTL]
+      --cache-max-entries <N>        Maximum cache entries [env: PGVIS_CACHE_MAX_ENTRIES]
+      --cache-lists                  Also cache list queries [env: PGVIS_CACHE_LISTS]
+      --pubsub-enabled               Enable pub/sub (LISTEN/NOTIFY) [env: PGVIS_PUBSUB_ENABLED]
+      --pubsub-channel-prefix <P>    Pub/sub channel prefix [env: PGVIS_PUBSUB_CHANNEL_PREFIX]
 ```
+
+`serve` refuses to start when neither `jwt_secret` nor `anon_role` is configured unless `--insecure-no-auth` is passed. It reloads the schema cache on `SIGUSR1` (or `NOTIFY pgrst, 'reload schema'`) and shuts down gracefully on `SIGTERM`/Ctrl-C.
 
 ### `pgvis mcp`
 
@@ -149,24 +175,31 @@ pgvis auto-detects the backend from the connection string:
 
 ```bash
 # Full URI
-pgvis --dsn "postgres://user:password@localhost:5432/mydb"
+pgvis --dsn "postgres://user:password@localhost:5432/mydb" serve
 
 # Unix socket
-pgvis --dsn "postgres:///mydb?host=/var/run/postgresql"
+pgvis --dsn "postgres:///mydb?host=/var/run/postgresql" serve
+
+# TLS required (certificate verified against the system trust store)
+pgvis --dsn "postgres://user:password@db.example.com/mydb?sslmode=require" serve
 ```
+
+TLS follows the DSN's `sslmode`: `disable`, `prefer` (the default — TLS whenever the server offers it), or `require`. The server certificate is always verified against the platform trust store; set `SSL_CERT_FILE` to a CA bundle if your server's CA isn't in it. With `prefer`, a certificate that fails verification is a connection error — pgvis does not fall back to plaintext. `verify-ca`/`verify-full` and libpq's `sslrootcert` are not supported. The password is redacted in pgvis's logs.
 
 ### SQLite examples
 
 ```bash
 # File path
-pgvis --dsn "sqlite:./data/app.db"
+pgvis --dsn "sqlite:./data/app.db" serve --schema main --insecure-no-auth
 
 # In-memory (for testing)
-pgvis --dsn "sqlite::memory:"
+pgvis --dsn "sqlite::memory:" serve --schema main --insecure-no-auth
 
 # Bare file path (auto-detected by extension)
-pgvis --dsn "./mydata.sqlite3"
+pgvis --dsn "./mydata.sqlite3" serve --schema main --insecure-no-auth
 ```
+
+SQLite tables live in the `main` schema, so pass `--schema main`: with the default `public`, the OpenAPI document and MCP tool list come out empty.
 
 ## Next Steps
 

@@ -153,8 +153,11 @@ pub async fn execute_query(
     let params = params.to_vec();
     let is_mutation = ctx.is_mutation;
     let should_rollback = matches!(ctx.tx_end, Some(TxEnd::Rollback));
+    let guards = ctx.clone();
 
-    conn.call(move |conn| {
+    // Outer error: SQLite failure. Inner error: a mutation guard (max-affected,
+    // singular) that rolled the transaction back.
+    conn.call(move |conn| -> Result<Result<QueryResult, Error>, SqliteInternalError> {
         // Begin transaction
         let tx_behavior = if is_mutation {
             rusqlite::TransactionBehavior::Immediate
@@ -163,48 +166,52 @@ pub async fn execute_query(
         };
         let tx = conn
             .transaction_with_behavior(tx_behavior)
-            .map_err(|e| tokio_rusqlite::Error::Rusqlite(e))?;
+            .map_err(|e| SqliteInternalError::from_rusqlite("BEGIN failed", &e))?;
 
         // Execute and collect results
         let result = execute_and_collect(&tx, &sql, &params);
+
+        // Mutation guards are checked before committing; dropping the
+        // transaction rolls the writes back.
+        if let Ok(qr) = &result {
+            if let Err(guard) = guards.check_affected(qr.page_total.unwrap_or(0)) {
+                return Ok(Err(guard));
+            }
+        }
 
         // Commit or rollback
         match &result {
             Ok(_) if should_rollback => {
                 tx.rollback()
-                    .map_err(|e| tokio_rusqlite::Error::Rusqlite(e))?;
+                    .map_err(|e| SqliteInternalError::from_rusqlite("ROLLBACK failed", &e))?;
             }
             Ok(_) => {
                 tx.commit()
-                    .map_err(|e| tokio_rusqlite::Error::Rusqlite(e))?;
+                    .map_err(|e| SqliteInternalError::from_rusqlite("COMMIT failed", &e))?;
             }
             Err(_) => {
                 // Transaction will auto-rollback on drop
             }
         }
 
-        result.map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))
+        result.map(Ok)
     })
     .await
     .map_err(|e| {
-        // Recover the SQLSTATE-equivalent db_code from our internal error, which
-        // is wrapped in `tokio_rusqlite::Error::Other`. The extended SQLite code
-        // was captured at the failure site (before stringification) so constraint
-        // violations map to the right HTTP status instead of a blanket 500.
-        let db_code = if let tokio_rusqlite::Error::Other(boxed) = &e {
-            boxed
-                .downcast_ref::<SqliteInternalError>()
-                .and_then(|err| err.db_code.clone())
-        } else {
-            None
+        // The SQLSTATE-equivalent db_code was captured at the failure site
+        // (before stringification), so constraint violations map to the
+        // right HTTP status instead of a blanket 500.
+        let (message, db_code) = match e {
+            tokio_rusqlite::Error::Error(err) => (err.message, err.db_code),
+            other => (other.to_string(), None),
         };
         Error::Execution {
-            message: format!("SQLite execution failed: {e}"),
+            message: format!("SQLite execution failed: {message}"),
             db_code,
             detail: None,
             hint: None,
         }
-    })
+    })?
 }
 
 /// Inner execution: prepare, bind, iterate rows, build JSON.
@@ -265,6 +272,7 @@ fn execute_and_collect(
         response_status: None,  // No GUC mechanism
         response_headers: None, // No GUC mechanism
         was_insert: None,       // No GUC mechanism
+        raw_body: None,         // Always parsed (ExecContext::raw_body is a hint)
     })
 }
 

@@ -185,6 +185,22 @@ RETURNS void
 LANGUAGE sql VOLATILE
 AS $$ SELECT NULL::void $$;
 
+-- An OUT argument declared before the input: introspection must still name
+-- the input `x` (zipping names with input-only types called it `doubled`).
+CREATE FUNCTION test.out_first(OUT doubled integer, IN x integer)
+LANGUAGE sql STABLE
+AS $$ SELECT x * 2 $$;
+
+-- Functions that reject the request: plain RAISE (P0001 → 400) and a
+-- PostgREST-style custom status (PT402 → 402).
+CREATE FUNCTION test.raise_rejected()
+RETURNS void LANGUAGE plpgsql
+AS $$ BEGIN RAISE EXCEPTION 'rejected'; END $$;
+
+CREATE FUNCTION test.raise_payment()
+RETURNS void LANGUAGE plpgsql
+AS $$ BEGIN RAISE EXCEPTION 'payment required' USING ERRCODE = 'PT402'; END $$;
+
 CREATE FUNCTION test.echo_params(name text DEFAULT 'world', greeting text DEFAULT 'hello')
 RETURNS text
 LANGUAGE sql STABLE
@@ -202,4 +218,117 @@ AS $$
 BEGIN
     PERFORM pg_sleep(seconds);
 END;
+$$;
+
+-- Overloads resolved by argument names.
+CREATE FUNCTION test.overloaded(a integer)
+RETURNS text
+LANGUAGE sql STABLE
+AS $$ SELECT 'one:' || a $$;
+
+CREATE FUNCTION test.overloaded(a integer, b integer)
+RETURNS text
+LANGUAGE sql STABLE
+AS $$ SELECT 'two:' || (a + b) $$;
+
+-- Both overloads accept {"a": …}: ambiguous.
+CREATE FUNCTION test.ambiguous(a integer)
+RETURNS integer
+LANGUAGE sql STABLE
+AS $$ SELECT a $$;
+
+CREATE FUNCTION test.ambiguous(a integer, b integer DEFAULT 0)
+RETURNS integer
+LANGUAGE sql STABLE
+AS $$ SELECT a + b $$;
+
+CREATE FUNCTION test.sum_variadic(label text, VARIADIC nums integer[])
+RETURNS text
+LANGUAGE sql STABLE
+AS $$ SELECT label || (SELECT sum(n) FROM unnest(nums) AS n) $$;
+
+-- ============================================================================
+-- Pub/sub authorization (tests/pubsub.rs)
+-- ============================================================================
+-- Kept out of the exposed `test` schema so it is not an RPC endpoint.
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgvis_test_anon') THEN
+        CREATE ROLE pgvis_test_anon NOLOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgvis_test_user') THEN
+        CREATE ROLE pgvis_test_user NOLOGIN;
+    END IF;
+END
+$$;
+
+DROP SCHEMA IF EXISTS test_pubsub CASCADE;
+CREATE SCHEMA test_pubsub;
+GRANT USAGE ON SCHEMA test_pubsub TO pgvis_test_anon, pgvis_test_user;
+
+-- Every authorization check, recorded as the role and `sub` it ran under.
+CREATE TABLE test_pubsub.audit (
+    channel text NOT NULL,
+    op text NOT NULL,
+    role name NOT NULL DEFAULT current_user,
+    sub text DEFAULT nullif(current_setting('request.jwt.claims', true), '')::json->>'sub'
+);
+GRANT INSERT ON test_pubsub.audit TO pgvis_test_anon, pgvis_test_user;
+
+-- public.*         anyone may subscribe; only pgvis_test_user may publish
+-- private.<sub>.*  only the caller whose JWT `sub` is <sub>
+-- raise.*          raises (an error denies)
+-- anything else    NULL (denied)
+CREATE FUNCTION test_pubsub.authorize(channel text, op text)
+RETURNS boolean
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    sub text := nullif(current_setting('request.jwt.claims', true), '')::json->>'sub';
+BEGIN
+    INSERT INTO test_pubsub.audit (channel, op) VALUES (channel, op);
+    IF channel LIKE 'raise.%' THEN
+        RAISE EXCEPTION 'pubsub authorize: forbidden';
+    ELSIF channel LIKE 'public.%' THEN
+        RETURN op = 'subscribe' OR current_user = 'pgvis_test_user';
+    ELSIF channel LIKE 'private.%' THEN
+        RETURN split_part(channel, '.', 2) = sub;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+REVOKE EXECUTE ON FUNCTION test_pubsub.authorize(text, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION test_pubsub.authorize(text, text) TO pgvis_test_anon, pgvis_test_user;
+
+-- ============================================================================
+-- PostgreSQL 18+ catalog features (tests/pg18.rs). Skipped on older servers.
+-- ============================================================================
+DO $$
+BEGIN
+    IF current_setting('server_version_num')::int < 180000 THEN
+        RETURN;
+    END IF;
+    CREATE EXTENSION IF NOT EXISTS btree_gist;
+    -- Virtual generated columns are the PG18 default kind (attgenerated 'v').
+    EXECUTE $ddl$
+        CREATE TABLE test.pg18_items (
+            id serial PRIMARY KEY,
+            price integer NOT NULL,
+            doubled integer GENERATED ALWAYS AS (price * 2) VIRTUAL,
+            note text
+        )
+    $ddl$;
+    -- A NOT VALID not-null constraint: existing rows may still hold NULL.
+    EXECUTE 'INSERT INTO test.pg18_items (price, note) VALUES (1, NULL)';
+    EXECUTE 'ALTER TABLE test.pg18_items ADD CONSTRAINT note_nn NOT NULL note NOT VALID';
+    -- A temporal primary key: rows match by overlap on the range column.
+    EXECUTE $ddl$
+        CREATE TABLE test.pg18_bookings (
+            room integer,
+            during tstzrange,
+            PRIMARY KEY (room, during WITHOUT OVERLAPS)
+        )
+    $ddl$;
+END
 $$;

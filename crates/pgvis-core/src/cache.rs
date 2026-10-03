@@ -176,12 +176,17 @@ impl SchemaCache {
     /// Find all relationships where `table` is either the source or target.
     ///
     /// Uses the pre-built `relationship_index` for O(1) lookup instead of
-    /// scanning all relationships. Returns an empty slice if no relationships exist.
-    pub fn find_relationships(&self, table: &QualifiedIdentifier) -> Vec<&Relationship> {
-        match self.relationship_index.get(table) {
-            Some(indices) => indices.iter().map(|&i| &self.relationships[i]).collect(),
-            None => Vec::new(),
-        }
+    /// scanning all relationships, and yields lazily so embed resolution does
+    /// not allocate. Yields nothing if no relationships exist.
+    pub fn find_relationships<'a>(
+        &'a self,
+        table: &QualifiedIdentifier,
+    ) -> impl Iterator<Item = &'a Relationship> + use<'a> {
+        self.relationship_index
+            .get(table)
+            .into_iter()
+            .flatten()
+            .map(move |&i| &self.relationships[i])
     }
 
     /// Find routines by name (across all schemas).

@@ -13,8 +13,6 @@ workspace = true
 [dependencies]
 pgvis-core = { path = "../pgvis-core" }
 axum.workspace = true
-tower.workspace = true
-tower-http.workspace = true
 http.workspace = true
 tokio.workspace = true
 serde.workspace = true

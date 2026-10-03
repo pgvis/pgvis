@@ -275,6 +275,36 @@ async fn test_rpc_get_single_item() {
 // ============================================================================
 
 #[tokio::test]
+async fn test_out_argument_before_the_input_keeps_the_input_name() {
+    // Introspection used to name the input `doubled` (the OUT argument's
+    // name), so `{"x": 3}` was rejected as an unknown argument.
+    let resp = rpc_post("out_first", json!({ "x": 3 })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body.to_string().contains('6'), "got {body}");
+}
+
+#[tokio::test]
+async fn test_raise_maps_to_client_status() {
+    // A plain RAISE EXCEPTION is the function rejecting the input, not a
+    // server fault; PTxyz picks the status explicitly.
+    let resp = rpc_post("raise_rejected", json!({})).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = rpc_post("raise_payment", json!({})).await;
+    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+}
+
+#[tokio::test]
+async fn test_get_on_a_volatile_function_is_405() {
+    // A link, crawler or <img> must not be able to run a volatile function.
+    let resp = rpc_get("void_function").await;
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    // Stable functions stay callable with GET.
+    let resp = rpc_get_params("add", "a=1&b=2").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn test_rpc_void_function() {
     let resp = rpc_post("void_function", json!({})).await;
     let status = resp.status();
@@ -347,15 +377,10 @@ async fn test_rpc_nonexistent_function() {
 async fn test_rpc_wrong_param_name() {
     // Function expects "a" and "b", we pass "x" and "y"
     let resp = rpc_post("add", json!({"x": 1, "y": 2})).await;
-    let status = resp.status();
-    // Should either fail or use defaults (which may error for non-default params)
-    assert!(
-        status.is_client_error()
-            || status.is_server_error()
-            || status == StatusCode::OK
-            || status == StatusCode::CREATED,
-        "got {status}"
-    );
+    // No overload takes x/y: PGRST202, as in PostgREST.
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "PGRST202");
 }
 
 // ============================================================================
@@ -802,14 +827,25 @@ async fn test_in_process_rpc_echo_defaults() {
 #[tokio::test]
 async fn test_in_process_rpc_with_role() {
     let ips = in_process_state();
-    // Call with a specific role — should still work for public functions
+    // Call with a specific role — should still work for public functions. Use
+    // the role the test DSN connects as: a fixed name like `postgres` doesn't
+    // exist on a locally initdb'd cluster.
+    let (client, connection) = tokio_postgres::connect(&test_dsn(), tokio_postgres::NoTls)
+        .await
+        .expect("failed to connect to test database");
+    tokio::spawn(connection);
+    let role: String = client
+        .query_one("SELECT current_user::text", &[])
+        .await
+        .expect("current_user")
+        .get(0);
     let result = ips
         .state
         .call_rpc(
             "test",
             "add",
             json!({"a": 1, "b": 2}),
-            &pgvis_router::CallerIdentity::with_role("postgres"),
+            &pgvis_router::CallerIdentity::with_role(&role),
         )
         .await
         .expect("call_rpc with role should succeed");
@@ -827,4 +863,113 @@ async fn test_in_process_rpc_with_role() {
         body.clone()
     };
     assert_eq!(value, json!(3));
+}
+
+// ============================================================================
+// Overload resolution, argument validation, VARIADIC
+// ============================================================================
+
+/// Assert a 200 response whose (unwrapped scalar) body is `expected`.
+async fn assert_scalar(resp: reqwest::Response, expected: serde_json::Value) {
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body, expected);
+}
+
+/// Assert an error response with the given status and PGRST code.
+async fn assert_error(resp: reqwest::Response, status: StatusCode, code: &str) {
+    assert_eq!(resp.status(), status);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], code, "body: {body}");
+}
+
+#[tokio::test]
+async fn test_rpc_overload_chosen_by_argument_names() {
+    assert_scalar(
+        rpc_post("overloaded", json!({"a": 1})).await,
+        json!("one:1"),
+    )
+    .await;
+    assert_scalar(
+        rpc_post("overloaded", json!({"a": 1, "b": 2})).await,
+        json!("two:3"),
+    )
+    .await;
+    assert_scalar(
+        rpc_get_params("overloaded", "a=1&b=2").await,
+        json!("two:3"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_rpc_overload_missing_required_param() {
+    // `b` alone matches neither overload (both require `a`).
+    let resp = rpc_post("overloaded", json!({"b": 2})).await;
+    assert_error(resp, StatusCode::NOT_FOUND, "PGRST202").await;
+}
+
+#[tokio::test]
+async fn test_rpc_unknown_argument_rejected() {
+    let resp = rpc_post("add", json!({"a": 1, "b": 2, "c": 3})).await;
+    assert_error(resp, StatusCode::NOT_FOUND, "PGRST202").await;
+    let resp = rpc_post("echo_params", json!({"nmae": "typo"})).await;
+    assert_error(resp, StatusCode::NOT_FOUND, "PGRST202").await;
+    let resp = rpc_get_params("echo_params", "nmae=typo").await;
+    assert_error(resp, StatusCode::NOT_FOUND, "PGRST202").await;
+}
+
+#[tokio::test]
+async fn test_rpc_ambiguous_overload() {
+    let resp = rpc_post("ambiguous", json!({"a": 1})).await;
+    assert_error(resp, StatusCode::MULTIPLE_CHOICES, "PGRST203").await;
+    // Supplying `b` leaves a single candidate.
+    assert_scalar(
+        rpc_post("ambiguous", json!({"a": 1, "b": 2})).await,
+        json!(3),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_rpc_named_variadic_argument() {
+    let resp = rpc_post("sum_variadic", json!({"label": "s=", "nums": "{1,2,3}"})).await;
+    assert_scalar(resp, json!("s=6")).await;
+    let resp = rpc_get_params("sum_variadic", "label=s%3D&nums=%7B4,5%7D").await;
+    assert_scalar(resp, json!("s=9")).await;
+}
+
+#[tokio::test]
+async fn test_rpc_get_reserved_keys_are_not_arguments() {
+    // `limit`/`order` are request options, not function arguments.
+    let resp = rpc_get_params("get_items", "limit=3&order=id.asc").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_in_process_rpc_overload_resolution() {
+    let ips = in_process_state();
+    let result = ips
+        .state
+        .call_rpc(
+            "test",
+            "overloaded",
+            json!({"a": 1, "b": 2}),
+            &pgvis_router::CallerIdentity::anonymous(),
+        )
+        .await
+        .expect("call_rpc should pick the two-argument overload");
+    assert_eq!(result.body, json!([{"result": "two:3"}]));
+
+    let err = ips
+        .state
+        .call_rpc(
+            "test",
+            "overloaded",
+            json!({"a": 1, "c": 2}),
+            &pgvis_router::CallerIdentity::anonymous(),
+        )
+        .await
+        .expect_err("unknown argument must be rejected");
+    assert_eq!(err.code().as_str(), "PGRST202");
 }

@@ -17,7 +17,6 @@ tokio.workspace = true
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-indexmap.workspace = true
 arc-swap.workspace = true
 tracing.workspace = true
 thiserror.workspace = true

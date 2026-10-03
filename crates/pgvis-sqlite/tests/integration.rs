@@ -154,8 +154,7 @@ async fn test_introspect_relationships() {
 
     // items.user_id → users.id should create M2O
     let items_ident = pgvis_core::QualifiedIdentifier::new("main", "items");
-    let item_rels = cache.find_relationships(&items_ident);
-    let user_rel = item_rels.iter().find(|r| {
+    let user_rel = cache.find_relationships(&items_ident).find(|r| {
         r.source_table.name == "items"
             && r.target_table.name == "users"
             && matches!(r.cardinality, Cardinality::M2O)
@@ -173,8 +172,7 @@ async fn test_introspect_inverse_relationships() {
 
     // Should have O2M from users to items (inverse of items→users M2O)
     let users_ident = pgvis_core::QualifiedIdentifier::new("main", "users");
-    let user_rels = cache.find_relationships(&users_ident);
-    let o2m_rel = user_rels.iter().find(|r| {
+    let o2m_rel = cache.find_relationships(&users_ident).find(|r| {
         r.source_table.name == "users"
             && r.target_table.name == "items"
             && matches!(r.cardinality, Cardinality::O2M)
@@ -216,8 +214,7 @@ async fn test_introspect_self_referential() {
         .unwrap();
 
     let cat_ident = pgvis_core::QualifiedIdentifier::new("main", "categories");
-    let cat_rels = cache.find_relationships(&cat_ident);
-    let self_rel = cat_rels.iter().find(|r| r.is_self);
+    let self_rel = cache.find_relationships(&cat_ident).find(|r| r.is_self);
     assert!(
         self_rel.is_some(),
         "categories should have a self-referential FK"
@@ -510,6 +507,36 @@ async fn test_transaction_rollback() {
     // But it should NOT persist (was rolled back)
     let body = query(&backend, "SELECT * FROM users WHERE id = 99", &[]).await;
     assert_eq!(body.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn test_mutation_guards_roll_back_before_commit() {
+    let backend = setup_backend().await;
+    let before = query(&backend, "SELECT * FROM users", &[]).await;
+    let all = before.as_array().unwrap().len();
+    assert!(all > 1, "fixture needs several users");
+
+    for ctx in [
+        ExecContext {
+            is_mutation: true,
+            max_affected: Some(1),
+            ..Default::default()
+        },
+        ExecContext {
+            is_mutation: true,
+            single_row: true,
+            ..Default::default()
+        },
+    ] {
+        let err = backend
+            .execute(&ctx, "UPDATE users SET is_active = 9 RETURNING *", &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(err.http_status(), 400 | 406), "{err}");
+        // Rolled back: no row changed.
+        let after = query(&backend, "SELECT * FROM users WHERE is_active = 9", &[]).await;
+        assert_eq!(after.as_array().unwrap().len(), 0);
+    }
 }
 
 // ===========================================================================

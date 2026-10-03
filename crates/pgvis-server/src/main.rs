@@ -26,9 +26,16 @@ struct Cli {
 enum Cmd {
     /// Start the HTTP server (REST + optional MCP over Streamable HTTP).
     Serve {
-        /// Bind address for the HTTP server.
-        #[arg(short, long, default_value = "0.0.0.0:3000", env = "PGVIS_BIND")]
+        /// Bind address for the HTTP server. Loopback by default; pass e.g.
+        /// `0.0.0.0:3000` to expose it.
+        #[arg(short, long, default_value = "127.0.0.1:3000", env = "PGVIS_BIND")]
         bind: String,
+
+        /// Serve without `jwt_secret` or `anon_role`. Every request then runs
+        /// as the DSN's own role (often the table owner, bypassing RLS), so
+        /// this must be asked for explicitly.
+        #[arg(long, env = "PGVIS_INSECURE_NO_AUTH")]
+        insecure_no_auth: bool,
 
         /// Which database schemas to expose (comma-separated or repeated).
         /// Defaults to "public".
@@ -111,7 +118,8 @@ async fn main() -> anyhow::Result<()> {
     let mut config = load_config(cli.config.as_deref())?;
 
     match cli.cmd.unwrap_or(Cmd::Serve {
-        bind: "0.0.0.0:3000".into(),
+        bind: "127.0.0.1:3000".into(),
+        insecure_no_auth: false,
         schema: vec![],
         mcp_http: false,
         replica_dsn: vec![],
@@ -124,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
     }) {
         Cmd::Serve {
             bind,
+            insecure_no_auth,
             schema,
             mcp_http,
             replica_dsn,
@@ -166,8 +175,15 @@ async fn main() -> anyhow::Result<()> {
                 config.pubsub.channel_prefix = prefix;
             }
 
+            if config.jwt_secret.is_none() && config.anon_role.is_none() && !insecure_no_auth {
+                anyhow::bail!(
+                    "refusing to serve without auth: set jwt_secret and/or anon_role, \
+                     or pass --insecure-no-auth to run every request as the DSN's role"
+                );
+            }
+
             tracing::info!(
-                dsn = %cli.dsn,
+                dsn = %redact_dsn(&cli.dsn),
                 bind = %bind,
                 schemas = ?config.schemas,
                 replicas = config.replica.replica_dsns.len(),
@@ -185,9 +201,27 @@ async fn main() -> anyhow::Result<()> {
 
             let components = builder.build_components().await?;
 
+            // SIGUSR1 reloads the schema cache (as PostgREST does).
+            #[cfg(unix)]
+            {
+                let reloader = components.reloader.clone();
+                let mut usr1 = tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::user_defined1(),
+                )?;
+                tokio::spawn(async move {
+                    while usr1.recv().await.is_some() {
+                        tracing::info!("SIGUSR1: reloading the schema cache");
+                        reloader.reload();
+                    }
+                });
+            }
+
             let listener = tokio::net::TcpListener::bind(&bind).await?;
             tracing::info!("listening on {bind}");
-            axum::serve(listener, components.router).await?;
+            // Finish in-flight requests on SIGTERM / Ctrl-C instead of cutting them off.
+            axum::serve(listener, components.router)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
         }
 
         #[cfg(feature = "mcp")]
@@ -201,7 +235,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             tracing::info!(
-                dsn = %cli.dsn,
+                dsn = %redact_dsn(&cli.dsn),
                 schemas = ?config.schemas,
                 read_only = config.read_only,
                 "starting pgvis MCP server (stdio)",
@@ -258,7 +292,8 @@ fn load_config(path: Option<&std::path::Path>) -> anyhow::Result<Config> {
 
     // Layer 2: TOML config file (if provided)
     if let Some(path) = path {
-        figment = figment.merge(Toml::file(path));
+        let text = read_strict_config(path)?;
+        figment = figment.merge(Toml::string(&text));
     }
 
     // Layer 3: Environment variables.
@@ -284,4 +319,124 @@ fn load_config(path: Option<&std::path::Path>) -> anyhow::Result<Config> {
 
     let config: Config = figment.extract()?;
     Ok(config)
+}
+
+/// Read a config file, failing on anything pgvis would silently ignore.
+///
+/// figment treats a missing file as empty and drops unknown keys, so a typo'd
+/// path or a PostgREST-style key (`jwt-secret`) started the server with
+/// defaults: no JWT, every request as the DSN's role.
+fn read_strict_config(path: &std::path::Path) -> anyhow::Result<String> {
+    use anyhow::Context;
+
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading config file {}", path.display()))?;
+    let mut unknown = Vec::new();
+    let _: Config = serde_ignored::deserialize(toml::Deserializer::new(&text), |key| {
+        unknown.push(key.to_string())
+    })
+    .with_context(|| format!("parsing config file {}", path.display()))?;
+    if !unknown.is_empty() {
+        anyhow::bail!(
+            "unknown keys in config file {}: {}",
+            path.display(),
+            unknown.join(", ")
+        );
+    }
+    Ok(text)
+}
+
+/// Resolves on Ctrl-C or (on Unix) SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                sigterm.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
+    tracing::info!("shutdown requested: finishing in-flight requests");
+}
+
+/// The DSN with any password replaced, for logging.
+///
+/// Handles both URL (`postgres://user:pass@host/db`) and key/value
+/// (`host=h password=pass`) forms.
+fn redact_dsn(dsn: &str) -> String {
+    if let Some((scheme, rest)) = dsn.split_once("://") {
+        if let Some((userinfo, host)) = rest.split_once('@') {
+            if let Some((user, _)) = userinfo.split_once(':') {
+                return format!("{scheme}://{user}:***@{host}");
+            }
+        }
+        return dsn.to_string();
+    }
+    dsn.split_whitespace()
+        .map(|kv| match kv.split_once('=') {
+            Some((key, _)) if key.eq_ignore_ascii_case("password") => format!("{key}=***"),
+            _ => kv.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(name: &str, body: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("pgvis-{}-{name}", std::process::id()));
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_missing_config_file_is_an_error() {
+        let missing = std::env::temp_dir().join("pgvis-definitely-missing.toml");
+        assert!(load_config(Some(&missing)).is_err());
+    }
+
+    #[test]
+    fn unknown_config_keys_are_an_error() {
+        // PostgREST spelling: silently ignored before, which disabled auth.
+        let path = write("unknown.toml", "jwt-secret = \"s3cret\"\n");
+        let err = load_config(Some(&path)).unwrap_err().to_string();
+        assert!(err.contains("jwt-secret"), "got: {err}");
+
+        let nested = write("nested.toml", "[pool]\nsize = 4\nmax_sise = 9\n");
+        assert!(load_config(Some(&nested)).is_err());
+    }
+
+    #[test]
+    fn a_valid_config_file_still_loads() {
+        let path = write("valid.toml", "jwt_secret = \"s3cret\"\nanon_role = \"web_anon\"\n");
+        let config = load_config(Some(&path)).unwrap();
+        assert_eq!(config.anon_role.as_deref(), Some("web_anon"));
+        assert!(config.jwt_secret.is_some());
+    }
+
+    #[test]
+    fn dsn_passwords_are_redacted() {
+        assert_eq!(
+            redact_dsn("postgres://app:hunter2@db:5432/prod"),
+            "postgres://app:***@db:5432/prod"
+        );
+        assert_eq!(redact_dsn("postgres://app@db/prod"), "postgres://app@db/prod");
+        assert_eq!(
+            redact_dsn("host=db user=app password=hunter2"),
+            "host=db user=app password=***"
+        );
+        assert_eq!(redact_dsn("sqlite:///tmp/x.db"), "sqlite:///tmp/x.db");
+    }
 }

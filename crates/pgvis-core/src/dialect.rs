@@ -233,6 +233,33 @@ pub struct Dialect {
     /// - Postgres: true
     /// - SQLite: false
     pub supports_row_to_json: bool,
+
+    /// Whether an INSERT can read its rows from one JSON parameter into the
+    /// table's row type (`json_populate_recordset(NULL::t, $1)`).
+    ///
+    /// One parameter for any row count, so the SQL text is constant and there
+    /// is no bind-parameter limit; JSON arrays and objects convert to array,
+    /// composite and json columns. Otherwise every value is its own parameter.
+    ///
+    /// - Postgres: true
+    /// - SQLite: false
+    pub supports_json_recordset: bool,
+
+    /// System column identifying a table row, for limited UPDATE/DELETE
+    /// (`WHERE <id> IN (SELECT <id> ... ORDER BY ... LIMIT n)`). Views have
+    /// none, so a limited mutation on a view is rejected.
+    ///
+    /// - Postgres: `ctid`
+    /// - SQLite: `rowid`
+    pub row_identifier: &'static str,
+
+    /// Whether string constants can be written as escape strings (`E'...'`),
+    /// whose meaning doesn't depend on `standard_conforming_strings`. Used for
+    /// JSON path keys, which come from the request.
+    ///
+    /// - Postgres: true
+    /// - SQLite: false (plain `'...'` literals never treat `\` specially)
+    pub escape_string_literals: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +291,9 @@ pub static POSTGRES: Dialect = Dialect {
     supports_set_timezone: true,
     supports_is_distinct: true,
     supports_row_to_json: true,
+    supports_json_recordset: true,
+    row_identifier: "ctid",
+    escape_string_literals: true,
 };
 
 /// The SQLite dialect — limited feature set.
@@ -298,6 +328,9 @@ pub static SQLITE: Dialect = Dialect {
     supports_set_timezone: false,
     supports_is_distinct: false, // SQLite 3.39+ — conservative default
     supports_row_to_json: false,
+    supports_json_recordset: false,
+    row_identifier: "rowid",
+    escape_string_literals: false,
 };
 
 #[cfg(test)]

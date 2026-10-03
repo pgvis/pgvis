@@ -136,6 +136,46 @@ pub struct ExecContext {
     ///
     /// On Postgres this field is informational only (all queries use pooled connections).
     pub is_mutation: bool,
+
+    /// Return the body as the database's JSON text ([`QueryResult::raw_body`])
+    /// instead of a parsed [`QueryResult::body`]: no parse and re-serialize
+    /// when the caller only forwards it. Backends may ignore it (SQLite does).
+    pub raw_body: bool,
+
+    /// `Prefer: max-affected=N` (with `handling=strict`): more affected rows
+    /// roll the transaction back with `PGRST124`.
+    pub max_affected: Option<u64>,
+
+    /// A singular response was requested for a mutation: anything but
+    /// exactly one affected row rolls the transaction back with `PGRST116`.
+    pub single_row: bool,
+}
+
+impl ExecContext {
+    /// Check the mutation guards against the number of rows the statement
+    /// affected. Backends call this *before* deciding to commit, so a
+    /// violation rolls the writes back instead of reporting after the fact.
+    pub fn check_affected(&self, rows: i64) -> Result<(), Error> {
+        if let Some(max) = self.max_affected {
+            if rows > max as i64 {
+                return Err(Error::Plan {
+                    message: format!("Query result exceeds max-affected preference constraint ({rows} > {max})"),
+                    detail: None,
+                    hint: None,
+                    code: crate::error::ErrorCode::MaxAffectedExceeded,
+                });
+            }
+        }
+        if self.single_row && rows != 1 {
+            return Err(Error::Plan {
+                message: "JSON object requested, multiple (or no) rows returned".into(),
+                detail: Some(format!("The result contains {rows} rows")),
+                hint: None,
+                code: crate::error::ErrorCode::NotSingular,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Transaction end behaviour, controlled by `Prefer: tx` header.
@@ -203,6 +243,31 @@ pub struct QueryResult {
     /// Used to distinguish 201 Created vs 200 OK for `ON CONFLICT` operations.
     /// Populated from the `pgrst.inserted` GUC. Postgres only.
     pub was_insert: Option<bool>,
+
+    /// The body as the database's JSON text, when requested with
+    /// [`ExecContext::raw_body`] and the backend supports it. `body` is then
+    /// `Null`; read through [`QueryResult::json`] or [`QueryResult::json_bytes`].
+    pub raw_body: Option<bytes::Bytes>,
+}
+
+impl QueryResult {
+    /// The body as a JSON value, parsing the raw text if that's what we have.
+    pub fn json(&self) -> std::borrow::Cow<'_, Value> {
+        match &self.raw_body {
+            Some(raw) => {
+                std::borrow::Cow::Owned(serde_json::from_slice(raw).unwrap_or(Value::Null))
+            }
+            None => std::borrow::Cow::Borrowed(&self.body),
+        }
+    }
+
+    /// The body serialized as JSON, without re-serializing when it's raw.
+    pub fn json_bytes(&self) -> bytes::Bytes {
+        match &self.raw_body {
+            Some(raw) => raw.clone(),
+            None => serde_json::to_vec(&self.body).unwrap_or_default().into(),
+        }
+    }
 }
 
 /// A stream of schema-change notifications.
@@ -329,4 +394,24 @@ pub trait Backend: Send + Sync + 'static {
     /// - Postgres backends return [`&POSTGRES`](crate::dialect::POSTGRES)
     /// - SQLite backends return [`&SQLITE`](crate::dialect::SQLITE)
     fn dialect(&self) -> &'static Dialect;
+
+    /// A snapshot of the connection pool requests run on, for monitoring.
+    /// `None` when the backend has no such pool.
+    fn pool_status(&self) -> Option<PoolStatus> {
+        None
+    }
+}
+
+/// Connection-pool occupancy, as reported by [`Backend::pool_status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct PoolStatus {
+    /// The most connections the pool will open.
+    pub max_size: usize,
+    /// Connections currently open (idle or checked out).
+    pub size: usize,
+    /// Idle connections ready to be checked out.
+    pub available: usize,
+    /// Requests waiting for a connection. Persistently above zero means the
+    /// pool is too small for the load (or connections are held too long).
+    pub waiting: usize,
 }

@@ -6,7 +6,7 @@
 //! Tree recursion is plain function calls — leaf filters reuse
 //! [`super::filter::parse_logic_filter`] so the operator grammar isn't duplicated.
 
-use super::common::split_top_level;
+use super::common::{check_nesting, split_top_level};
 use super::filter::parse_logic_filter;
 use super::types::{LogicNode, LogicTree};
 
@@ -19,6 +19,7 @@ pub fn parse_logic_tree(op: &str, value: &str) -> Result<LogicNode, String> {
         Some(rest) => (true, rest),
         None => (false, op),
     };
+    check_nesting(value)?;
 
     let inner = value
         .strip_prefix('(')
@@ -104,6 +105,14 @@ fn nested_tree(s: &str) -> Result<Option<LogicTree>, String> {
 mod tests {
     use super::*;
     use crate::query_params::types::{FilterValue, Operator};
+
+    #[test]
+    fn deep_nesting_is_rejected_not_a_stack_overflow() {
+        let deep = format!("({}id.eq.1{})", "and(".repeat(100_000), ")".repeat(100_000));
+        assert!(parse_logic_tree("and", &deep).is_err());
+        let ok = format!("({}id.eq.1{})", "and(".repeat(8), ")".repeat(8));
+        assert!(parse_logic_tree("and", &ok).is_ok());
+    }
 
     #[test]
     fn parse_simple_or() {

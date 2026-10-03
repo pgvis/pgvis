@@ -39,11 +39,21 @@ impl PgvisServer {
     ///
     /// The caller must ensure the test schema is already loaded in the DB.
     pub async fn start(dsn: &str, schema: &str) -> Self {
+        let config = pgvis_core::Config {
+            schemas: vec![schema.to_string()],
+            ..Default::default()
+        };
+        Self::start_with_config(dsn, config).await
+    }
+
+    /// Start a pgvis server in-process on a random port with the given config.
+    #[allow(dead_code)] // not every test binary uses it
+    pub async fn start_with_config(dsn: &str, config: pgvis_core::Config) -> Self {
         let port = free_port();
         let bind_addr = format!("127.0.0.1:{port}");
 
         let router = pgvis_lib::Builder::new(dsn)
-            .schemas(vec![schema.to_string()])
+            .config(config)
             .build()
             .await
             .expect("failed to build pgvis router");
@@ -184,8 +194,17 @@ impl PgvisServer {
     }
 }
 
-/// Run schema.sql and seed.sql against the test database.
+/// Run schema.sql and seed.sql against the test database, once per test binary.
+///
+/// A binary may start several shared fixtures concurrently (rpc.rs runs an HTTP
+/// server and an in-process state); schema.sql drops and recreates the schema,
+/// so a second run would pull it out from under tests already using the first.
 pub async fn setup_test_db(dsn: &str) {
+    static DONE: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    DONE.get_or_init(|| load_fixtures(dsn)).await;
+}
+
+async fn load_fixtures(dsn: &str) {
     let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
         .await
         .expect("failed to connect to test database");
