@@ -155,11 +155,45 @@ async fn test_malformed_bodies_are_rejected_not_defaulted() {
 }
 
 #[tokio::test]
-async fn test_bulk_insert_over_the_bind_parameter_limit_is_a_400() {
-    // 33k rows x 2 columns > 65535 params: used to fail as a 500.
-    let rows: Vec<_> = (0..33_000).map(|i| json!({ "name": format!("n{i}"), "price": 1 })).collect();
-    let resp = post("/api/test/items", json!(rows)).await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+async fn test_bulk_insert_past_the_bind_parameter_limit_succeeds() {
+    // 40k rows x 2 columns: past Postgres's 65535 bind parameters, which used
+    // to fail as a 500. The rows now travel as one JSON parameter.
+    let marker = "bulk-40k";
+    let rows: Vec<_> = (0..40_000)
+        .map(|i| json!({ "col_int4": i, "col_text": marker }))
+        .collect();
+    let resp = post_prefer("/api/test/menagerie", json!(rows), "return=minimal").await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = delete(&format!("/api/test/menagerie?col_text=eq.{marker}")).await;
+    assert!(resp.status().is_success());
+}
+
+#[tokio::test]
+async fn test_insert_converts_json_arrays_and_objects_to_column_types() {
+    // One text parameter per value sent `["a","b"]` as JSON text, which is
+    // not an array literal: inserting into a text[] column failed.
+    let row = json!({
+        "col_text": "typed-insert",
+        "col_text_arr": ["a", "b"],
+        "col_int_arr": [1, 2, 3],
+        "col_jsonb": { "k": [1, { "n": null }] },
+        "col_json": [true, "x"],
+        "col_bool": true,
+        "col_numeric": "12345678901234.12345",
+        "col_date": "2026-10-03",
+        "col_uuid": "0190a3f2-1b2c-7000-8000-00000000000a"
+    });
+    let resp = post_prefer("/api/test/menagerie", row, "return=representation").await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let got = &body[0];
+    assert_eq!(got["col_text_arr"], json!(["a", "b"]));
+    assert_eq!(got["col_int_arr"], json!([1, 2, 3]));
+    assert_eq!(got["col_jsonb"], json!({ "k": [1, { "n": null }] }));
+    assert_eq!(got["col_json"], json!([true, "x"]));
+    assert_eq!(got["col_date"], "2026-10-03");
+    let resp = delete("/api/test/menagerie?col_text=eq.typed-insert").await;
+    assert!(resp.status().is_success());
 }
 
 // ============================================================================

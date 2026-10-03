@@ -233,6 +233,17 @@ pub struct Dialect {
     /// - Postgres: true
     /// - SQLite: false
     pub supports_row_to_json: bool,
+
+    /// Whether an INSERT can read its rows from one JSON parameter into the
+    /// table's row type (`json_populate_recordset(NULL::t, $1)`).
+    ///
+    /// One parameter for any row count, so the SQL text is constant and there
+    /// is no bind-parameter limit; JSON arrays and objects convert to array,
+    /// composite and json columns. Otherwise every value is its own parameter.
+    ///
+    /// - Postgres: true
+    /// - SQLite: false
+    pub supports_json_recordset: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +275,7 @@ pub static POSTGRES: Dialect = Dialect {
     supports_set_timezone: true,
     supports_is_distinct: true,
     supports_row_to_json: true,
+    supports_json_recordset: true,
 };
 
 /// The SQLite dialect — limited feature set.
@@ -298,6 +310,7 @@ pub static SQLITE: Dialect = Dialect {
     supports_set_timezone: false,
     supports_is_distinct: false, // SQLite 3.39+ — conservative default
     supports_row_to_json: false,
+    supports_json_recordset: false,
 };
 
 #[cfg(test)]

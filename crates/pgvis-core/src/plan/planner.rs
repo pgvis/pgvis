@@ -224,7 +224,7 @@ fn plan_mutate(
     let mutation = match request.method {
         RequestMethod::Post => {
             let payload_columns = extract_payload_columns(&request.body);
-            validate_payload(request.method, &request.body, table, &payload_columns)?;
+            validate_payload(request.method, &request.body, table, &payload_columns, dialect)?;
             let is_bulk = matches!(&request.body, Some(RequestBody::Bulk(_)));
             // Determine the conflict target. An explicit `on_conflict=` param wins;
             // otherwise, when the client asked for upsert semantics via
@@ -260,7 +260,7 @@ fn plan_mutate(
         }
         RequestMethod::Patch | RequestMethod::Put => {
             let payload_columns = extract_payload_columns(&request.body);
-            validate_payload(request.method, &request.body, table, &payload_columns)?;
+            validate_payload(request.method, &request.body, table, &payload_columns, dialect)?;
             MutationType::Update { payload_columns }
         }
         RequestMethod::Delete => MutationType::Delete,
@@ -432,6 +432,7 @@ fn validate_payload(
     body: &Option<RequestBody>,
     table: &crate::cache::Table,
     columns: &[String],
+    dialect: &Dialect,
 ) -> Result<(), Error> {
     let rows: Vec<&serde_json::Value> = match body {
         Some(RequestBody::Single(v)) => vec![v],
@@ -451,7 +452,10 @@ fn validate_payload(
         if is_bulk && columns.is_empty() {
             return Err(Error::invalid_body("nothing to insert: no rows with columns"));
         }
-        if rows.len().saturating_mul(columns.len()) > MAX_BIND_PARAMS {
+        // One parameter per value (no JSON-recordset insert): Postgres's limit.
+        if !dialect.supports_json_recordset
+            && rows.len().saturating_mul(columns.len()) > MAX_BIND_PARAMS
+        {
             return Err(Error::invalid_body(format!(
                 "too many values for one insert (rows x columns over {MAX_BIND_PARAMS}); \
                  split the request"

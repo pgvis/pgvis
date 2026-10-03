@@ -54,7 +54,22 @@ fn render_insert(
     let col_list: Vec<String> = columns.iter().map(|c| ctx.quote_ident(c)).collect();
     let col_sql = col_list.join(", ");
 
-    let mut sql = if body_objects.len() <= 1 {
+    let mut sql = if ctx.dialect.supports_json_recordset {
+        // The payload is one JSON parameter read into the table's row type:
+        // constant SQL for any row count, no bind-parameter limit, and JSON
+        // arrays/objects convert to array/composite/json columns (one text
+        // parameter per value can't express an array).
+        let rows = match &plan.body {
+            Some(RequestBody::Bulk(rows)) => Value::Array(rows.clone()),
+            Some(RequestBody::Single(row)) => Value::Array(vec![row.clone()]),
+            _ => Value::Array(vec![]),
+        };
+        let rows = ctx.push_param(rows);
+        format!(
+            "INSERT INTO {table_ref} ({col_sql}) SELECT {col_sql} \
+             FROM json_populate_recordset(NULL::{table_ref}, {rows}::json)"
+        )
+    } else if body_objects.len() <= 1 {
         // Single-row INSERT
         let obj = body_objects.first();
         let placeholders: Vec<String> = columns
@@ -277,8 +292,21 @@ mod tests {
 
         assert!(sql.contains("INSERT INTO \"public\".\"users\""));
         assert!(sql.contains("(\"name\", \"email\")"));
-        assert!(sql.contains("VALUES ($1, $2)"));
+        // Postgres: the whole payload is one JSON parameter.
+        assert!(sql.contains(
+            "SELECT \"name\", \"email\" FROM json_populate_recordset(NULL::\"public\".\"users\", $1::json)"
+        ));
+        assert_eq!(ctx.params().len(), 1);
         assert!(sql.contains("RETURNING *"));
+    }
+
+    #[test]
+    fn test_simple_insert_binds_each_value_without_json_recordset() {
+        let plan = make_insert_plan();
+        let mut ctx = RenderContext::new(&crate::dialect::SQLITE);
+        let sql = render_mutate(&plan, &mut ctx).unwrap();
+        assert!(sql.contains("VALUES ("), "{sql}");
+        assert_eq!(ctx.params().len(), 2);
     }
 
     #[test]
