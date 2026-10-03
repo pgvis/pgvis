@@ -242,11 +242,22 @@ pub async fn handle_tool_call(
     // 3. Build ApiRequest from tool arguments
     let args = call.arguments.as_object();
 
-    let select = args
+    let select = match args
         .and_then(|a| a.get("select"))
         .and_then(|v| v.as_str())
-        .map(|s| parse_mcp_select(s))
-        .unwrap_or_else(|| vec![SelectItem::Star]);
+        .map(parse_mcp_select)
+        .unwrap_or_else(|| Ok(vec![SelectItem::Star]))
+    {
+        Ok(select) => select,
+        Err(e) => {
+            return McpToolResult::error_structured(
+                pgvis_core::error::ErrorCode::InvalidSelect.as_str(),
+                e,
+                None,
+                None,
+            );
+        }
+    };
 
     let filters = match parse_mcp_filters(args) {
         Ok(filters) => filters,
@@ -321,7 +332,28 @@ pub async fn handle_tool_call(
     let is_table_mutation = matches!(verb, "create" | "update" | "delete");
 
     // Parse logic filters (MCP-17): support "or" and "and" arguments
-    let logic_filters = parse_mcp_logic_filters(args);
+    let logic_filters = match parse_mcp_logic_filters(args) {
+        Ok(trees) => trees,
+        Err(e) => {
+            return McpToolResult::error_structured(
+                pgvis_core::error::ErrorCode::InvalidFilter.as_str(),
+                e,
+                None,
+                None,
+            );
+        }
+    };
+
+    // The tool schema marks `filters` required, but that's advisory: an
+    // UPDATE/DELETE with no condition at all would touch every row.
+    if matches!(verb, "update" | "delete") && filters.is_empty() && logic_filters.is_empty() {
+        return McpToolResult::error_structured(
+            pgvis_core::error::ErrorCode::InvalidFilter.as_str(),
+            format!("refusing to {verb} every row of {target}: pass at least one filter"),
+            None,
+            Some("e.g. {\"filters\": {\"id\": \"eq.5\"}}".to_string()),
+        );
+    }
 
     // Parse preferences (MCP-18 + MCP-20). return/resolution prefs only apply to
     // table mutations, so gate on that (not on RPC volatility).
@@ -860,10 +892,17 @@ fn parse_mcp_filters(
     args: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Vec<Filter>, String> {
     let mut filters = Vec::new();
-    if let Some(filter_obj) = args
+    let filters_arg = args
         .and_then(|a| a.get("filters"))
-        .and_then(|v| v.as_object())
-    {
+        .filter(|v| !v.is_null());
+    // LLMs often send `"id.eq.5"` or `[{"id": "eq.5"}]` here. Ignoring a
+    // non-object would leave an UPDATE/DELETE with no WHERE clause.
+    if let Some(v) = filters_arg {
+        if !v.is_object() {
+            return Err("`filters` must be an object of column → \"op.value\"".to_string());
+        }
+    }
+    if let Some(filter_obj) = filters_arg.and_then(|v| v.as_object()) {
         for (column, value) in filter_obj {
             let value_str = value.as_str().ok_or_else(|| {
                 format!("filter for column '{column}' must be a string like \"op.value\"")
@@ -909,14 +948,15 @@ fn pg_type_to_json_type(pg_type: &str) -> &'static str {
 /// Supports the complete grammar: columns, aliases, JSON paths, casts,
 /// aggregates, embeddings with hints/joins, and spreads.
 ///
-/// Falls back to `[SelectItem::Star]` if parsing fails.
-fn parse_mcp_select(s: &str) -> Vec<SelectItem> {
+/// A malformed select is an error, as on REST: falling back to `*` would
+/// return columns the caller deliberately left out.
+fn parse_mcp_select(s: &str) -> Result<Vec<SelectItem>, String> {
     let trimmed = s.trim();
     if trimmed.is_empty() || trimmed == "*" {
-        return vec![SelectItem::Star];
+        return Ok(vec![SelectItem::Star]);
     }
 
-    query_params::parse_select(trimmed).unwrap_or_else(|_| vec![SelectItem::Star])
+    query_params::parse_select(trimmed)
 }
 
 /// Parse logic filter arguments from MCP tool call into `LogicTree` nodes.
@@ -926,33 +966,37 @@ fn parse_mcp_select(s: &str) -> Vec<SelectItem> {
 /// { "or": "(status.eq.active,status.eq.pending)" }
 /// { "and": "(age.gte.18,age.lte.65)" }
 /// ```
+///
+/// A malformed expression is an error: skipping it would drop the condition
+/// and widen the rows an UPDATE/DELETE touches.
 fn parse_mcp_logic_filters(
     args: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> Vec<LogicTree> {
+) -> Result<Vec<LogicTree>, String> {
     let mut trees = Vec::new();
     let args = match args {
         Some(a) => a,
-        None => return trees,
+        None => return Ok(trees),
     };
 
     for key in &["and", "or", "not.and", "not.or"] {
-        if let Some(value) = args.get(*key).and_then(|v| v.as_str()) {
-            match query_params::parse_logic_tree(key, value) {
-                Ok(node) => match node {
-                    LogicNode::Tree(tree) => trees.push(tree),
-                    LogicNode::Not(inner) => {
-                        trees.push(LogicTree::And(vec![LogicNode::Not(inner)]));
-                    }
-                    LogicNode::Filter(f) => {
-                        trees.push(LogicTree::And(vec![LogicNode::Filter(f)]));
-                    }
-                },
-                Err(_) => {} // Silently skip malformed logic filters in MCP
+        let Some(value) = args.get(*key).filter(|v| !v.is_null()) else {
+            continue;
+        };
+        let value = value
+            .as_str()
+            .ok_or_else(|| format!("`{key}` must be a string like \"(a.eq.1,b.eq.2)\""))?;
+        match query_params::parse_logic_tree(key, value)? {
+            LogicNode::Tree(tree) => trees.push(tree),
+            LogicNode::Not(inner) => {
+                trees.push(LogicTree::And(vec![LogicNode::Not(inner)]));
+            }
+            LogicNode::Filter(f) => {
+                trees.push(LogicTree::And(vec![LogicNode::Filter(f)]));
             }
         }
     }
 
-    trees
+    Ok(trees)
 }
 
 /// Parse MCP preferences from tool arguments.
@@ -1112,6 +1156,34 @@ mod tests {
         // turn a filtered DELETE into a full-table DELETE).
         let a = args(json!({ "filters": { "id": "totallybogus.5" } }));
         assert!(parse_mcp_filters(a.as_ref()).is_err());
+    }
+
+    #[test]
+    fn non_object_filters_are_an_error_not_no_filters() {
+        // Common LLM shapes; ignoring them left a DELETE with no WHERE.
+        for bad in [json!("id.eq.5"), json!([{ "id": "eq.5" }]), json!(5)] {
+            let a = args(json!({ "filters": bad }));
+            assert!(parse_mcp_filters(a.as_ref()).is_err(), "{bad}");
+        }
+        let a = args(json!({ "filters": null }));
+        assert!(parse_mcp_filters(a.as_ref()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_logic_filters_are_an_error_not_skipped() {
+        let a = args(json!({ "or": "(id.eq.5,id.eq.6" }));
+        assert!(parse_mcp_logic_filters(a.as_ref()).is_err());
+        let a = args(json!({ "or": ["id.eq.5"] }));
+        assert!(parse_mcp_logic_filters(a.as_ref()).is_err());
+        let a = args(json!({ "or": "(id.eq.5,id.eq.6)" }));
+        assert_eq!(parse_mcp_logic_filters(a.as_ref()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn malformed_select_is_an_error_not_star() {
+        assert!(parse_mcp_select("id,(").is_err());
+        assert!(parse_mcp_select("id,name").is_ok());
+        assert!(matches!(parse_mcp_select(" * ").unwrap()[..], [SelectItem::Star]));
     }
 
     // ---- item 5: numeric-string / bool-string coercion ----------------------
