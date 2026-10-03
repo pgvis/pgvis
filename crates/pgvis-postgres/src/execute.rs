@@ -158,7 +158,7 @@ pub async fn execute_query(
     }
 
     // Decode only now, with the transaction (and its locks) already released.
-    extract_cte_result(&result?)
+    extract_cte_result(&result?, ctx.raw_body)
 }
 
 /// `SELECT set_config($1, $2, true), set_config($3, $4, true), …` for `n`
@@ -222,24 +222,31 @@ fn collect_guc_settings(ctx: &ExecContext) -> Vec<(String, String)> {
 /// - `total_count` — total count (only when Prefer: count=exact)
 /// - `response_status` — GUC override (Postgres only)
 /// - `response_headers` — GUC override (Postgres only)
-fn extract_cte_result(rows: &[tokio_postgres::Row]) -> Result<QueryResult, Error> {
-    if rows.is_empty() {
+///
+/// With `raw`, the body is kept as the database's JSON text (`raw_body`).
+fn extract_cte_result(rows: &[tokio_postgres::Row], raw: bool) -> Result<QueryResult, Error> {
+    let empty = || bytes::Bytes::from_static(b"[]");
+    let Some(row) = rows.first() else {
         // No rows from CTE means something went wrong, but we handle gracefully
         return Ok(QueryResult {
-            body: Value::Array(vec![]),
+            body: if raw { Value::Null } else { Value::Array(vec![]) },
             total_count: None,
             page_total: Some(0),
             response_status: None,
             response_headers: None,
             was_insert: None,
+            raw_body: raw.then(empty),
         });
-    }
+    };
 
-    let row = &rows[0];
-
-    // body — json_agg result. With `with-serde_json-1` feature, tokio-postgres
-    // can directly deserialize json/jsonb columns to serde_json::Value.
-    let body: Value = try_get_column(row, "body").unwrap_or(Value::Array(vec![]));
+    // body — json_agg result: as raw JSON text, or parsed (tokio-postgres's
+    // `with-serde_json-1` deserializes json/jsonb to serde_json::Value).
+    let (body, raw_body) = if raw {
+        let text = try_get_column::<RawJson>(row, "body").map_or_else(empty, |r| r.0);
+        (Value::Null, Some(text))
+    } else {
+        (try_get_column(row, "body").unwrap_or(Value::Array(vec![])), None)
+    };
 
     // page_total
     let page_total: Option<i64> = try_get_column(row, "page_total");
@@ -264,7 +271,30 @@ fn extract_cte_result(rows: &[tokio_postgres::Row]) -> Result<QueryResult, Error
         response_status,
         response_headers,
         was_insert: None,
+        raw_body,
     })
+}
+
+/// A json/jsonb/text column as the database sent it: JSON text, never parsed.
+struct RawJson(bytes::Bytes);
+
+impl<'a> tokio_postgres::types::FromSql<'a> for RawJson {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        // jsonb's binary format is a version byte (1) followed by the text.
+        let text = if *ty == Type::JSONB {
+            raw.strip_prefix(&[1]).ok_or("unsupported jsonb binary version")?
+        } else {
+            raw
+        };
+        Ok(Self(bytes::Bytes::copy_from_slice(text)))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::JSON | Type::JSONB | Type::TEXT)
+    }
 }
 
 /// Try to get a column value, returning None if the column doesn't exist or is NULL.
@@ -480,12 +510,45 @@ mod tests {
             statement_timeout: Some(30000),
             tx_end: None,
             is_mutation: false,
+            raw_body: false,
         };
         let settings = collect_guc_settings(&ctx);
         // role must come first so subsequent settings run under the target role.
         assert_eq!(settings[0].0, "role");
         assert!(guc(&settings, "request.jwt.claims").is_some());
         assert_eq!(guc(&settings, "statement_timeout"), Some("30000ms"));
+    }
+
+    #[test]
+    fn raw_json_keeps_the_text_and_strips_the_jsonb_version_byte() {
+        use tokio_postgres::types::FromSql;
+        let text = br#"[{"id":1}]"#;
+        let json = RawJson::from_sql(&Type::JSON, text).unwrap();
+        assert_eq!(&json.0[..], text);
+        let mut jsonb = vec![1u8];
+        jsonb.extend_from_slice(text);
+        assert_eq!(&RawJson::from_sql(&Type::JSONB, &jsonb).unwrap().0[..], text);
+        assert!(RawJson::from_sql(&Type::JSONB, &[2, b'1']).is_err());
+    }
+
+    #[test]
+    fn query_result_reads_raw_and_parsed_bodies_alike() {
+        let parsed = QueryResult {
+            body: json!([{"id": 1}]),
+            total_count: None,
+            page_total: Some(1),
+            response_status: None,
+            response_headers: None,
+            was_insert: None,
+            raw_body: None,
+        };
+        let raw = QueryResult {
+            body: Value::Null,
+            raw_body: Some(bytes::Bytes::from_static(br#"[{"id":1}]"#)),
+            ..parsed.clone()
+        };
+        assert_eq!(*raw.json(), *parsed.json());
+        assert_eq!(raw.json_bytes(), parsed.json_bytes());
     }
 
     #[test]

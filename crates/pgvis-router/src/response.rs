@@ -60,7 +60,7 @@ pub fn format_response(
     // Location header for a single-row INSERT with a primary key.
     if let Some(m) = mutation {
         if m.was_insert {
-            if let Some(loc) = build_location_header(&result.body, m) {
+            if let Some(loc) = build_location_header(&result.json(), m) {
                 if let Ok(val) = HeaderValue::from_str(&loc) {
                     headers.insert("location", val);
                 }
@@ -76,7 +76,7 @@ pub fn format_response(
 
     // X-Next-Cursor header (for cursor-based pagination)
     if let Some(col) = cursor_column {
-        if let Some(cursor_val) = extract_next_cursor(&result.body, col) {
+        if let Some(cursor_val) = extract_next_cursor(&result.json(), col) {
             if let Ok(val) = HeaderValue::from_str(&cursor_val) {
                 headers.insert("x-next-cursor", val);
             }
@@ -155,10 +155,12 @@ pub fn format_response(
     }
 
     // Build body
-    let body = if is_singular {
+    let body: bytes::Bytes = if is_singular {
         // Singular: unwrap first element from array
-        match &result.body {
-            Value::Array(arr) if arr.len() == 1 => serde_json::to_vec(&arr[0]).unwrap_or_default(),
+        match &*result.json() {
+            Value::Array(arr) if arr.len() == 1 => {
+                serde_json::to_vec(&arr[0]).unwrap_or_default().into()
+            }
             Value::Array(arr) if arr.is_empty() => {
                 // 406 Not Acceptable for singular with no rows
                 status = StatusCode::NOT_ACCEPTABLE;
@@ -167,6 +169,7 @@ pub fn format_response(
                     "message": "JSON object requested, multiple (or no) rows returned",
                 }))
                 .unwrap_or_default()
+                .into()
             }
             Value::Array(arr) if arr.len() > 1 => {
                 // 406 for singular with multiple rows
@@ -176,11 +179,13 @@ pub fn format_response(
                     "message": "JSON object requested, multiple (or no) rows returned",
                 }))
                 .unwrap_or_default()
+                .into()
             }
-            other => serde_json::to_vec(other).unwrap_or_default(),
+            other => serde_json::to_vec(other).unwrap_or_default().into(),
         }
     } else {
-        serde_json::to_vec(&result.body).unwrap_or_default()
+        // Usually the database's JSON text, forwarded without a re-serialize.
+        result.json_bytes()
     };
 
     (status, headers, body).into_response()
@@ -352,6 +357,7 @@ mod tests {
             response_status: None,
             response_headers: None,
             was_insert: None,
+            raw_body: None,
         }
     }
 

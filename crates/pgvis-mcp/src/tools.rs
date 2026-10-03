@@ -538,6 +538,7 @@ pub(crate) fn anonymous_exec_context(config: &Config, is_mutation: bool) -> Exec
         statement_timeout: config.statement_timeout_ms,
         tx_end: None,
         is_mutation,
+        raw_body: false,
     }
 }
 

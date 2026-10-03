@@ -51,8 +51,9 @@ use svcache::{CacheKey, SvCache};
 pub struct CachedEntry {
     /// The computed cache key (e.g., `"role:pk:public.users:9f3a7c1b40e2d5a8"`).
     pub key: String,
-    /// The JSON body (array or object).
-    pub body: Value,
+    /// The JSON body (array or object), serialized: a cache hit is a
+    /// refcount bump, not a deep clone of a `Value` tree.
+    pub body: bytes::Bytes,
     /// Total count (if count was requested).
     pub total_count: Option<i64>,
     /// Page total.
@@ -258,7 +259,7 @@ impl DataCache {
     }
 
     /// Store a response in the cache under the given key.
-    pub fn store(&self, key: &str, body: Value, total_count: Option<i64>, page_total: Option<i64>) {
+    pub fn store(&self, key: &str, body: bytes::Bytes, total_count: Option<i64>, page_total: Option<i64>) {
         let entry = CachedEntry {
             key: key.to_string(),
             body,
@@ -613,7 +614,7 @@ mod tests {
 
         cache.store(
             key,
-            serde_json::json!([{"id": 42, "name": "Alice"}]),
+            bytes::Bytes::from_static(br#"[{"id":42,"name":"Alice"}]"#),
             None,
             Some(1),
         );
@@ -621,7 +622,7 @@ mod tests {
         let entry = cache.get(key);
         assert!(entry.is_some());
         let entry = entry.unwrap();
-        assert_eq!(entry.body, serde_json::json!([{"id": 42, "name": "Alice"}]));
+        assert_eq!(&entry.body[..], br#"[{"id":42,"name":"Alice"}]"#);
         assert_eq!(entry.page_total, Some(1));
     }
 
@@ -635,7 +636,7 @@ mod tests {
             .compute_key(&plan, "SELECT 1", &[], Some("user1"), None)
             .unwrap();
 
-        cache.store(&key_before, serde_json::json!([{"id": 42}]), None, Some(1));
+        cache.store(&key_before, bytes::Bytes::from_static(b"[{\"id\":42}]"), None, Some(1));
         assert!(cache.get(&key_before).is_some());
 
         // Invalidate the table — bumps its generation counter
@@ -666,7 +667,7 @@ mod tests {
         let key_before = cache
             .compute_key(&plan, "SELECT 1", &[], Some("user1"), None)
             .unwrap();
-        cache.store(&key_before, serde_json::json!([{"id": 1}]), None, Some(1));
+        cache.store(&key_before, bytes::Bytes::from_static(b"[{\"id\":1}]"), None, Some(1));
         assert!(cache.get(&key_before).is_some());
 
         // Global invalidation bumps global_generation, affecting all tables

@@ -136,6 +136,11 @@ pub struct ExecContext {
     ///
     /// On Postgres this field is informational only (all queries use pooled connections).
     pub is_mutation: bool,
+
+    /// Return the body as the database's JSON text ([`QueryResult::raw_body`])
+    /// instead of a parsed [`QueryResult::body`]: no parse and re-serialize
+    /// when the caller only forwards it. Backends may ignore it (SQLite does).
+    pub raw_body: bool,
 }
 
 /// Transaction end behaviour, controlled by `Prefer: tx` header.
@@ -203,6 +208,31 @@ pub struct QueryResult {
     /// Used to distinguish 201 Created vs 200 OK for `ON CONFLICT` operations.
     /// Populated from the `pgrst.inserted` GUC. Postgres only.
     pub was_insert: Option<bool>,
+
+    /// The body as the database's JSON text, when requested with
+    /// [`ExecContext::raw_body`] and the backend supports it. `body` is then
+    /// `Null`; read through [`QueryResult::json`] or [`QueryResult::json_bytes`].
+    pub raw_body: Option<bytes::Bytes>,
+}
+
+impl QueryResult {
+    /// The body as a JSON value, parsing the raw text if that's what we have.
+    pub fn json(&self) -> std::borrow::Cow<'_, Value> {
+        match &self.raw_body {
+            Some(raw) => {
+                std::borrow::Cow::Owned(serde_json::from_slice(raw).unwrap_or(Value::Null))
+            }
+            None => std::borrow::Cow::Borrowed(&self.body),
+        }
+    }
+
+    /// The body serialized as JSON, without re-serializing when it's raw.
+    pub fn json_bytes(&self) -> bytes::Bytes {
+        match &self.raw_body {
+            Some(raw) => raw.clone(),
+            None => serde_json::to_vec(&self.body).unwrap_or_default().into(),
+        }
+    }
 }
 
 /// A stream of schema-change notifications.

@@ -188,6 +188,7 @@ impl AppState {
             statement_timeout: self.config.statement_timeout_ms,
             tx_end: None,
             is_mutation: plan_writes(&plan),
+            raw_body: false,
         };
 
         let result = self.backend.execute(&exec_ctx, &sql, &params).await?;
@@ -341,6 +342,7 @@ impl AppState {
             statement_timeout: self.config.statement_timeout_ms,
             tx_end: None,
             is_mutation: false,
+            raw_body: false,
         };
 
         self.backend.execute(&exec_ctx, &sql, &sql_params).await
@@ -838,7 +840,10 @@ async fn dispatch_request(
 
     // 4. Build ExecContext (JWT already verified above, before planning).
     let is_mutation = plan_writes(&plan);
-    let exec_ctx = build_exec_context(&state.config, &auth, &preferences, is_mutation);
+    let mut exec_ctx = build_exec_context(&state.config, &auth, &preferences, is_mutation);
+    // Table reads are forwarded as the database's JSON text: no parse and
+    // re-serialize. (RPC/mutation bodies are reshaped below, so stay parsed.)
+    exec_ctx.raw_body = matches!(plan, ActionPlan::Read(_));
 
     // 4b. Data cache: compute key and check for cache hit (reads only).
     //     When a `pre_request` hook is configured we bypass the read cache
@@ -867,12 +872,13 @@ async fn dispatch_request(
                 tracing::debug!(cache_key = %key, "data cache hit");
 
                 let cached_result = QueryResult {
-                    body: cached.body,
+                    body: serde_json::Value::Null,
                     total_count: cached.total_count,
                     page_total: cached.page_total,
                     response_status: None,
                     response_headers: None,
                     was_insert: None,
+                    raw_body: Some(cached.body),
                 };
 
                 let cursor_column = if let ActionPlan::Read(ref read_plan) = plan {
@@ -912,7 +918,7 @@ async fn dispatch_request(
     // 5b. Data cache: store result on cache miss. `cache_key` is `Some` only for
     // cacheable reads, so no need to re-match the plan here.
     if let (Some(key), Some(dc)) = (&cache_key, &state.data_cache) {
-        dc.store(key, result.body.clone(), result.total_count, result.page_total);
+        dc.store(key, result.json_bytes(), result.total_count, result.page_total);
         tracing::debug!(cache_key = %key, "data cache store");
     }
 
@@ -1354,6 +1360,7 @@ pub(crate) fn build_exec_context(
         statement_timeout: config.statement_timeout_ms,
         tx_end,
         is_mutation,
+        raw_body: false,
     }
 }
 

@@ -1552,6 +1552,7 @@ name = "pgvis-core"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "bytes",
  "futures",
  "indexmap",
  "insta",

@@ -265,6 +265,7 @@ fn execute_and_collect(
         response_status: None,  // No GUC mechanism
         response_headers: None, // No GUC mechanism
         was_insert: None,       // No GUC mechanism
+        raw_body: None,         // Always parsed (ExecContext::raw_body is a hint)
     })
 }
 
