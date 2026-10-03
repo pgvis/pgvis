@@ -275,6 +275,16 @@ async fn test_rpc_get_single_item() {
 // ============================================================================
 
 #[tokio::test]
+async fn test_out_argument_before_the_input_keeps_the_input_name() {
+    // Introspection used to name the input `doubled` (the OUT argument's
+    // name), so `{"x": 3}` was rejected as an unknown argument.
+    let resp = rpc_post("out_first", json!({ "x": 3 })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body.to_string().contains('6'), "got {body}");
+}
+
+#[tokio::test]
 async fn test_get_on_a_volatile_function_is_405() {
     // A link, crawler or <img> must not be able to run a volatile function.
     let resp = rpc_get("void_function").await;

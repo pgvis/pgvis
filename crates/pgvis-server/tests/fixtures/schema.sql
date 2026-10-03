@@ -185,6 +185,12 @@ RETURNS void
 LANGUAGE sql VOLATILE
 AS $$ SELECT NULL::void $$;
 
+-- An OUT argument declared before the input: introspection must still name
+-- the input `x` (zipping names with input-only types called it `doubled`).
+CREATE FUNCTION test.out_first(OUT doubled integer, IN x integer)
+LANGUAGE sql STABLE
+AS $$ SELECT x * 2 $$;
+
 CREATE FUNCTION test.echo_params(name text DEFAULT 'world', greeting text DEFAULT 'hello')
 RETURNS text
 LANGUAGE sql STABLE
