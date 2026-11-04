@@ -69,6 +69,7 @@ pub struct McpServer {
     pub backend: Arc<dyn Backend>,
     /// Optional pub/sub backend for publish operations via MCP tools.
     pub pubsub: Option<Arc<dyn PubSubBackend>>,
+    lifetime_guard: Option<Arc<dyn Send + Sync>>,
 }
 
 impl McpServer {
@@ -88,7 +89,15 @@ impl McpServer {
             dialect,
             backend,
             pubsub: None,
+            lifetime_guard: None,
         }
+    }
+
+    /// Retain a service owner (for example the schema reloader) until the last
+    /// server clone is dropped. The MCP crate does not depend on the builder.
+    pub fn with_lifetime_guard<T: Send + Sync + 'static>(mut self, guard: T) -> Self {
+        self.lifetime_guard = Some(Arc::new(guard));
+        self
     }
 
     fn require_metadata_access(&self) -> Result<(), rmcp::ErrorData> {

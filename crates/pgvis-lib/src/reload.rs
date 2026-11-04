@@ -107,12 +107,18 @@ async fn run(inner: Arc<Inner>) {
         // Let a burst of changes settle, then reload once.
         tokio::time::sleep(DEBOUNCE).await;
         if let Some(stream) = &mut changes {
-            while let Some(Some(())) = stream.next().now_or_never() {}
+            // Bound draining even if an embedding backend produces notifications
+            // continuously; introspection and task cancellation must make progress.
+            for _ in 0..256 {
+                if !matches!(stream.next().now_or_never(), Some(Some(()))) {
+                    break;
+                }
+            }
         }
         match reload(&inner).await {
             Ok(()) => tracing::info!("schema cache reloaded"),
             Err(e) => {
-                tracing::error!(error = %e, "schema cache reload failed; keeping the current cache")
+                tracing::error!(error = %e, "schema cache reload failed; keeping the current cache");
             }
         }
     }

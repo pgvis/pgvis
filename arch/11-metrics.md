@@ -9,8 +9,11 @@ increases/decreases. Query counters include dropped requests; errors and
 cancellations are separate. Checkout counters include schema introspection.
 Metrics have no SQL, credentials, table names or other high-cardinality labels.
 Direct use of `PgBackend::pool()` bypasses admission, deadlines and counters.
-Replica backend snapshots currently report the primary pool only; per-reader
-metrics, histograms and a Prometheus exporter remain unimplemented.
+Replica `pool_status()` reports the primary pool. `reader_pool_status()` and
+`GET /pgvis/cache`'s `readers` array expose each reader's index, last sampled
+eligibility and pool counters. `is_primary` identifies the shared primary pool
+so aggregate accounting does not double-count it. Histograms, sampled lag bytes
+and a Prometheus exporter remain unimplemented.
 
 pgvis sits between every caller and the database, so it is the natural place to
 answer two questions an operator or an embedding application keeps asking:

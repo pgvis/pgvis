@@ -121,10 +121,11 @@ pub struct PgReplicaBackend {
     primary_dsn: String,
     /// All reader pools in order: replicas first, then optionally primary.
     readers: Vec<ManagedPool>,
+    replica_count: usize,
     /// Shared health state for routing decisions.
     health: Arc<HealthState>,
     /// Handle to the background health monitor task.
-    _monitor_handle: tokio::task::JoinHandle<()>,
+    monitor_handle: tokio::task::JoinHandle<()>,
 }
 
 impl PgReplicaBackend {
@@ -232,8 +233,9 @@ impl PgReplicaBackend {
             primary,
             primary_dsn: primary_dsn.to_string(),
             readers,
+            replica_count,
             health,
-            _monitor_handle: monitor_handle,
+            monitor_handle,
         })
     }
 
@@ -257,7 +259,7 @@ impl Drop for PgReplicaBackend {
     fn drop(&mut self) {
         // Dropping JoinHandle alone detaches the task and retains every probe
         // pool indefinitely (including when an application replaces a backend).
-        self._monitor_handle.abort();
+        self.monitor_handle.abort();
     }
 }
 
@@ -327,6 +329,20 @@ impl Backend for PgReplicaBackend {
     /// eligible). See [`PgReplicaBackend::eligible_readers`] for read health.
     fn pool_status(&self) -> Option<pgvis_core::backend::PoolStatus> {
         Some(self.primary.status())
+    }
+
+    fn reader_pool_status(&self) -> Vec<pgvis_core::backend::ReaderPoolStatus> {
+        let eligible = self.health.eligible.load(Ordering::Relaxed);
+        self.readers
+            .iter()
+            .enumerate()
+            .map(|(index, pool)| pgvis_core::backend::ReaderPoolStatus {
+                index,
+                is_primary: index >= self.replica_count,
+                eligible: eligible & (1u64 << index) != 0,
+                pool: pool.status(),
+            })
+            .collect()
     }
 }
 
@@ -420,10 +436,8 @@ async fn health_monitor_loop(
                         );
                     }
                 }
-            } else {
-                if primary_healthy {
-                    eligible |= 1u64 << i;
-                }
+            } else if primary_healthy {
+                eligible |= 1u64 << i;
             }
         }
 
@@ -489,16 +503,21 @@ async fn check_replica(pool: &Pool, primary_lsn: Option<u64>, max_lag_bytes: u64
     // Query the replica's replayed LSN — the position actually visible to
     // queries on the replica (per plans/replica-support.md), not merely received.
     let row = match client
-        .query_one("SELECT pg_last_wal_replay_lsn() AS lsn", &[])
+        .query_one(
+            "SELECT pg_last_wal_replay_lsn() AS lsn, pg_is_in_recovery() AS replaying",
+            &[],
+        )
         .await
     {
         Ok(r) => r,
         Err(e) => return ReplicaStatus::Unreachable(format!("query: {e}")),
     };
 
-    // pg_last_wal_replay_lsn() is NULL when the node is not in recovery (e.g. the
-    // "replica" DSN actually points at a primary). Treat NULL/error as
-    // ineligible rather than panicking (which would kill the monitor task).
+    // A promoted standby retains its last replay LSN. Only an actual standby
+    // can satisfy replica lag semantics; promotion belongs to the HA system.
+    if !row.try_get::<_, bool>("replaying").unwrap_or(false) {
+        return ReplicaStatus::Unreachable("endpoint is not a replaying standby".into());
+    }
     let replica_lsn: tokio_postgres::types::PgLsn = match row.try_get("lsn") {
         Ok(v) => v,
         Err(e) => {

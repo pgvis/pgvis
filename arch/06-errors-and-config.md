@@ -175,3 +175,15 @@ into the backend's `execute`
 ([execute.rs](../crates/pgvis-postgres/src/execute.rs)); `return` and `count`
 shape the SQL and the response. MCP tool calls carry no `Prefer` header: they
 run with the defaults, as `anon_role`.
+
+
+### JWT cryptography provider
+
+The workspace uses jsonwebtoken 11 with its `aws_lc_rs` provider. This removes
+the RustCrypto dependency paths affected by RUSTSEC-2023-0071 (`rsa`, no patched
+release) and RUSTSEC-2026-0387 (older `crypto-bigint`). JWT algorithms and token
+validation remain the same. Building AWS-LC requires the native C build tools
+provided by the development shell. Embedders enabling both jsonwebtoken 11
+providers through Cargo feature unification must choose their process provider
+explicitly, as required by jsonwebtoken. A Linux `cargo audit` on the updated
+lockfile on 2026-11-04 reported zero vulnerabilities and zero warnings.

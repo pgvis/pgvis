@@ -410,3 +410,25 @@ requests still need error handling. Promotion and writer endpoint selection
 belong to the PostgreSQL HA system; pgvis does not elect or promote a primary.
 Schema listeners reconnect with backoff and coalesce notifications. Dropping a
 backend/reloader stops its monitoring tasks and dedicated connections.
+
+
+The opt-in `failover` integration test starts and removes its own primary and
+streaming standby (`initdb`, `pg_basebackup`, `pg_ctl` required). It exercises
+paused replay, catch-up, primary loss, external promotion, a multi-host
+`target_session_attrs=read-write` writer DSN, and a timed-out mutation whose
+nontransactional attempt counter must remain one. A promoted node retains its
+last replay LSN, so lag-based readers also require `pg_is_in_recovery()`.
+
+```sh
+cargo test -p pgvis-server --test failover -- --ignored --nocapture
+cargo test -p pgvis-server --test pool compare_fixed_and_adaptive -- --ignored --nocapture
+```
+
+A local PostgreSQL 18.4 run on 2026-11-04, with 2048 concurrent callers, 8192
+2 ms sleeping queries per mode, and a 16-connection ceiling, completed without
+checkout/query errors or exceeding that ceiling. Fixed sizing took 1.296 s
+(p95 request latency 325 ms); adaptive 2→16 took 1.419 s (p95 402 ms), including
+its ramp-up. This synthetic single-process run validates bounds and records
+ramp-up cost; it does not model a multi-node production workload, network
+partitions, or compare PgBouncer throughput. A separate regression verifies
+that shrinking preserves active work and retires excess connections on return.

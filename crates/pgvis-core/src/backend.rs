@@ -402,12 +402,29 @@ pub trait Backend: Send + Sync + 'static {
     fn pool_status(&self) -> Option<PoolStatus> {
         None
     }
+
+    /// Reader pools and last sampled eligibility; empty for non-replica backends.
+    fn reader_pool_status(&self) -> Vec<ReaderPoolStatus> {
+        Vec::new()
+    }
+}
+
+/// One reader's bounded pool counters and last sampled routing eligibility.
+/// Index is configuration order; no connection strings are exposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ReaderPoolStatus {
+    pub index: usize,
+    /// True for the shared primary pool when primary reads are enabled.
+    pub is_primary: bool,
+    pub eligible: bool,
+    pub pool: PoolStatus,
 }
 
 /// Connection-pool occupancy, as reported by [`Backend::pool_status`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct PoolStatus {
-    /// The most connections the pool will open.
+    /// Current admission limit. Active connections can exceed a recently reduced
+    /// adaptive limit until they return; `hard_max_size` is the configured ceiling.
     pub max_size: usize,
     /// Connections currently open (idle or checked out).
     pub size: usize,

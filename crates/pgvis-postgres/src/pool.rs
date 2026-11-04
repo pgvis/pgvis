@@ -87,16 +87,15 @@ impl ManagedPool {
                 "pool size and max_waiters must be positive".into(),
             ));
         }
-        if let Some(adaptive) = &config.adaptive {
-            if adaptive.min_size == 0
+        if let Some(adaptive) = &config.adaptive
+            && (adaptive.min_size == 0
                 || adaptive.min_size > config.size as usize
                 || adaptive.target_query_time_ms == 0
                 || adaptive.adjustment_interval_ms == 0
                 || config.timeout_ms == 0
-                || config.query_timeout_ms == 0
-            {
-                return Err(Error::Introspection("adaptive pool requires positive deadlines/interval/target and min_size within size".into()));
-            }
+                || config.query_timeout_ms == 0)
+        {
+            return Err(Error::Introspection("adaptive pool requires positive deadlines/interval/target and min_size within size".into()));
         }
         let raw = crate::create_pool(dsn, config)?;
         let adaptive = config.adaptive.clone().map(|config| {
@@ -321,7 +320,7 @@ impl Drop for Running<'_> {
 }
 
 fn micros(elapsed: Duration) -> u64 {
-    elapsed.as_micros().min(u128::from(u64::MAX)) as u64
+    u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

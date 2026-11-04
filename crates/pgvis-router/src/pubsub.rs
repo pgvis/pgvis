@@ -27,8 +27,8 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 
 use futures::StreamExt;
 use pgvis_core::Config;
@@ -56,6 +56,7 @@ pub struct PubSubHub {
     subscriber_count: AtomicUsize,
     /// Subscriber count per identity key, for `max_subscribers_per_identity`.
     identity_counts: std::sync::Mutex<HashMap<String, usize>>,
+    dispatch_task: OnceLock<tokio::task::AbortHandle>,
 }
 
 /// State for a single channel's local broadcast.
@@ -63,6 +64,23 @@ struct ChannelState {
     tx: broadcast::Sender<PubSubMessage>,
     /// Number of active local subscribers for this channel.
     local_subscribers: usize,
+}
+
+/// Roll back admission if subscribe is cancelled while waiting on a lock or
+/// LISTEN command. Once installed in a channel, unsubscribe owns the slot.
+struct SubscriptionReservation<'a> {
+    hub: &'a PubSubHub,
+    identity: Option<&'a str>,
+    active: bool,
+}
+
+impl Drop for SubscriptionReservation<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.hub.subscriber_count.fetch_sub(1, Ordering::AcqRel);
+            self.hub.release_identity(self.identity);
+        }
+    }
 }
 
 impl PubSubHub {
@@ -87,11 +105,12 @@ impl PubSubHub {
             channels: Mutex::new(HashMap::new()),
             subscriber_count: AtomicUsize::new(0),
             identity_counts: std::sync::Mutex::new(HashMap::new()),
+            dispatch_task: OnceLock::new(),
         });
 
         // Start the dispatch task that reads from the backend notification stream
-        let dispatch_hub = hub.clone();
-        tokio::spawn(dispatch_loop(dispatch_hub));
+        let dispatch = tokio::spawn(dispatch_loop(Arc::downgrade(&hub), backend));
+        let _ = hub.dispatch_task.set(dispatch.abort_handle());
 
         Ok(hub)
     }
@@ -149,17 +168,18 @@ impl PubSubHub {
             return Err(e);
         }
 
+        let mut reservation = SubscriptionReservation {
+            hub: self,
+            identity,
+            active: true,
+        };
         let mut channels = self.channels.lock().await;
         let rx = if let Some(state) = channels.get_mut(channel) {
             state.local_subscribers += 1;
             state.tx.subscribe()
         } else {
             // First subscriber for this channel — issue LISTEN
-            if let Err(e) = self.backend.listen(channel).await {
-                self.subscriber_count.fetch_sub(1, Ordering::AcqRel);
-                self.release_identity(identity);
-                return Err(e);
-            }
+            self.backend.listen(channel).await?;
 
             let (tx, rx) = broadcast::channel(self.config.channel_buffer_size.max(16));
             channels.insert(
@@ -172,6 +192,7 @@ impl PubSubHub {
             rx
         };
 
+        reservation.active = false;
         Ok(rx)
     }
 
@@ -319,6 +340,14 @@ pub struct ChannelInfo {
 // Dispatch loop — reads from backend and fans out to local broadcasts
 // ---------------------------------------------------------------------------
 
+impl Drop for PubSubHub {
+    fn drop(&mut self) {
+        if let Some(task) = self.dispatch_task.get() {
+            task.abort();
+        }
+    }
+}
+
 /// Reads messages from the backend notification stream and dispatches them
 /// to the appropriate per-channel broadcast sender.
 ///
@@ -326,11 +355,14 @@ pub struct ChannelInfo {
 /// sender is stable across reconnects). If it ever ends or fails to open, the
 /// loop re-opens it after a short delay so the hub never becomes a zombie that
 /// holds subscribers but delivers nothing.
-async fn dispatch_loop(hub: Arc<PubSubHub>) {
+async fn dispatch_loop(hub: Weak<PubSubHub>, backend: Arc<dyn PubSubBackend>) {
     loop {
-        match hub.backend.notification_stream().await {
+        match backend.notification_stream().await {
             Ok(mut stream) => {
                 while let Some(msg) = stream.next().await {
+                    let Some(hub) = hub.upgrade() else {
+                        return;
+                    };
                     let channels = hub.channels.lock().await;
                     if let Some(state) = channels.get(&msg.channel) {
                         // Broadcast to local subscribers — ignore "no receivers".

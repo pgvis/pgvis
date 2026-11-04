@@ -266,6 +266,7 @@ impl Builder {
         );
 
         // Build pub/sub hub (Postgres only, when enabled)
+        #[cfg(feature = "mcp")]
         let mut pubsub_backend: Option<Arc<dyn pgvis_core::pubsub::PubSubBackend>> = None;
         let pubsub = if config.pubsub.enabled && db_kind == DbKind::Postgres {
             #[cfg(feature = "postgres")]
@@ -273,7 +274,10 @@ impl Builder {
                 let pg_pubsub: Arc<dyn pgvis_core::pubsub::PubSubBackend> = Arc::new(
                     pgvis_postgres::PgPubSub::new(&self.dsn, &config.pubsub, &config.pool)?,
                 );
-                pubsub_backend = Some(pg_pubsub.clone());
+                #[cfg(feature = "mcp")]
+                {
+                    pubsub_backend = Some(pg_pubsub.clone());
+                }
 
                 let hub = pgvis_router::PubSubHub::new(pg_pubsub, config.pubsub.clone()).await?;
 
@@ -351,10 +355,12 @@ impl Builder {
             backend.introspect(&introspect_config).await?,
         )));
         let dialect = Arc::new(backend.dialect().clone());
-        // Runs for the life of the process, keeping the MCP tool list current.
-        SchemaReloader::spawn(backend.clone(), cache.clone(), introspect_config);
+        let reloader = SchemaReloader::spawn(backend.clone(), cache.clone(), introspect_config);
 
-        Ok(pgvis_mcp::McpServer::new(cache, config, dialect, backend))
+        Ok(
+            pgvis_mcp::McpServer::new(cache, config, dialect, backend)
+                .with_lifetime_guard(reloader),
+        )
     }
 
     /// Create the appropriate backend based on DSN detection.

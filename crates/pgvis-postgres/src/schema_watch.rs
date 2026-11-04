@@ -62,10 +62,10 @@ async fn listen(dsn: String, changes: mpsc::Sender<()>) {
                     while let Some(Ok(message)) =
                         std::future::poll_fn(|cx| connection.poll_message(cx)).await
                     {
-                        if let AsyncMessage::Notification(n) = message {
-                            if is_reload(n.payload()) {
-                                let _ = notifications.try_send(());
-                            }
+                        if let AsyncMessage::Notification(n) = message
+                            && is_reload(n.payload())
+                        {
+                            let _ = notifications.try_send(());
                         }
                     }
                 });

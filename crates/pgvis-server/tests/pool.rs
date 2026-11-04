@@ -193,6 +193,10 @@ async fn adaptive_pool_grows_under_load_then_reduces_after_slow_work() {
         start.elapsed()
     );
     assert_eq!(backend.pool_status().unwrap().max_size, 4);
+    let mut held = Vec::new();
+    for _ in 0..3 {
+        held.push(backend.pool().get().await.unwrap());
+    }
     backend
         .execute(
             &ExecContext::default(),
@@ -206,4 +210,77 @@ async fn adaptive_pool_grows_under_load_then_reduces_after_slow_work() {
     assert!(status.metrics.adaptive_increases >= 3 && status.metrics.adaptive_decreases >= 1);
     assert_eq!(status.metrics.queries, 401);
     assert_eq!(status.metrics.query_errors, 0);
+    assert!(status.size >= 3 && status.size <= 4);
+    for connection in &held {
+        connection
+            .query_one("SELECT 1", &[])
+            .await
+            .expect("shrinking cancelled active work");
+    }
+    drop(held);
+    assert!(backend.pool_status().unwrap().size <= 2);
+}
+
+/// Local comparative load test, not a PgBouncer benchmark or production SLO.
+#[tokio::test]
+#[ignore = "runs 16384 queries with 2048 simultaneous callers"]
+async fn compare_fixed_and_adaptive_pools_under_2048_callers() {
+    use pgvis_lib::pgvis_core::config::AdaptivePoolConfig;
+    for adaptive in [false, true] {
+        let config = PoolConfig {
+            size: 16,
+            max_waiters: 4096,
+            timeout_ms: 10000,
+            adaptive: adaptive.then_some(AdaptivePoolConfig {
+                min_size: 2,
+                target_query_time_ms: 100,
+                adjustment_interval_ms: 20,
+            }),
+            ..Default::default()
+        };
+        let backend = Arc::new(PgBackend::new(&test_dsn(), &config).unwrap());
+        let mut tasks = tokio::task::JoinSet::new();
+        let started = Instant::now();
+        for _ in 0..2048 {
+            let backend = backend.clone();
+            tasks.spawn(async move {
+                let mut times = Vec::new();
+                for _ in 0..4 {
+                    let started = Instant::now();
+                    backend
+                        .execute(
+                            &ExecContext::default(),
+                            "SELECT pg_sleep(0.002)::text AS x, '[]'::json AS body",
+                            &[],
+                        )
+                        .await
+                        .unwrap();
+                    times.push(started.elapsed().as_micros());
+                    assert!(backend.pool_status().unwrap().size <= 16);
+                }
+                times
+            });
+        }
+        let mut times = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            times.extend(result.unwrap());
+        }
+        times.sort_unstable();
+        let status = backend.pool_status().unwrap();
+        assert_eq!(status.metrics.queries, 8192);
+        assert_eq!(status.metrics.query_errors, 0);
+        assert_eq!(status.metrics.checkout_errors, 0);
+        assert_eq!(status.metrics.checkout_rejected, 0);
+        eprintln!(
+            "adaptive={adaptive}: queries=8192 callers=2048 elapsed={:?} request_p50_us={} request_p95_us={} request_p99_us={} final_limit={} increases={} decreases={} checkout_wait_us={}",
+            started.elapsed(),
+            times[times.len() / 2],
+            times[times.len() * 95 / 100],
+            times[times.len() * 99 / 100],
+            status.max_size,
+            status.metrics.adaptive_increases,
+            status.metrics.adaptive_decreases,
+            status.metrics.checkout_duration_us
+        );
+    }
 }

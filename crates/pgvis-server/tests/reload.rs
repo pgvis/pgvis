@@ -144,7 +144,10 @@ async fn dropping_components_stops_the_reloader_and_its_connections() {
         test_dsn(),
         if test_dsn().contains('?') { "&" } else { "?" }
     );
+    let mut config = pgvis_core::Config::default();
+    config.pubsub.enabled = true;
     let components = pgvis_lib::Builder::new(&dsn)
+        .config(config)
         .build_components()
         .await
         .unwrap();
@@ -152,17 +155,20 @@ async fn dropping_components_stops_the_reloader_and_its_connections() {
         .await
         .unwrap();
     let driver = tokio::spawn(conn);
-    eventually("component schema listener connected", async || {
-        client
-            .query_one(
-                "SELECT count(*) FROM pg_stat_activity WHERE application_name=$1",
-                &[&name],
-            )
-            .await
-            .unwrap()
-            .get::<_, i64>(0)
-            >= 2
-    })
+    eventually(
+        "component schema and pubsub listeners connected",
+        async || {
+            client
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity WHERE application_name=$1",
+                    &[&name],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
+                >= 3
+        },
+    )
     .await;
     drop(components);
     eventually("dropped component connections closed", async || {
@@ -177,5 +183,73 @@ async fn dropping_components_stops_the_reloader_and_its_connections() {
             == 0
     })
     .await;
+    driver.abort();
+}
+
+#[tokio::test]
+async fn standalone_mcp_keeps_schema_reload_alive_until_drop() {
+    let name = "pgvis_mcp_reload_regression";
+    let dsn = format!(
+        "{}{}application_name={name}",
+        test_dsn(),
+        if test_dsn().contains('?') { "&" } else { "?" }
+    );
+    let (client, conn) = tokio_postgres::connect(&test_dsn(), tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let driver = tokio::spawn(conn);
+    client
+        .batch_execute("CREATE SCHEMA test_mcp_reload")
+        .await
+        .unwrap();
+    let server = pgvis_lib::Builder::new(&dsn)
+        .schemas(vec!["test_mcp_reload"])
+        .build_mcp_server()
+        .await
+        .unwrap();
+    eventually("standalone MCP schema listener connected", async || {
+        client
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name=$1",
+                &[&name],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0)
+            >= 2
+    })
+    .await;
+    client
+        .batch_execute(
+            "CREATE TABLE test_mcp_reload.new_table(id int); NOTIFY pgrst, 'reload schema'",
+        )
+        .await
+        .unwrap();
+    eventually("standalone MCP sees new table", async || {
+        server
+            .cache
+            .load()
+            .tables
+            .values()
+            .any(|table| table.schema() == "test_mcp_reload" && table.name() == "new_table")
+    })
+    .await;
+    drop(server);
+    eventually("standalone MCP connections closed", async || {
+        client
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name=$1",
+                &[&name],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0)
+            == 0
+    })
+    .await;
+    client
+        .batch_execute("DROP SCHEMA test_mcp_reload CASCADE")
+        .await
+        .unwrap();
     driver.abort();
 }

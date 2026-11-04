@@ -31,13 +31,15 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use pgvis_core::error::Error;
-use pgvis_core::pubsub::{PubSubBackend, PubSubConfig, PubSubErrorCode, PubSubMessage, PubSubStream};
-use tokio::sync::{broadcast, mpsc, Mutex};
+use pgvis_core::pubsub::{
+    PubSubBackend, PubSubConfig, PubSubErrorCode, PubSubMessage, PubSubStream,
+};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio_postgres::tls::MakeTlsConnect;
 use tokio_postgres::{AsyncMessage, Connection, Socket};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
-use crate::{create_pool, tls_connector};
+use crate::{pool::ManagedPool, tls_connector};
 
 // ---------------------------------------------------------------------------
 // Commands sent to the listener task
@@ -47,7 +49,6 @@ use crate::{create_pool, tls_connector};
 enum PubSubCmd {
     Listen(String),
     Unlisten(String),
-    Shutdown,
 }
 
 // ---------------------------------------------------------------------------
@@ -65,7 +66,8 @@ pub struct PgPubSub {
     /// Broadcast sender for outgoing notifications (hub subscribes to this).
     notify_tx: broadcast::Sender<PubSubMessage>,
     /// Pool for publish operations.
-    pool: deadpool_postgres::Pool,
+    pool: ManagedPool,
+    listener: tokio::task::JoinHandle<()>,
     /// Config (channel prefix, reconnect settings, etc.).
     config: Arc<PubSubConfig>,
     /// Set of channels currently being listened to.
@@ -92,7 +94,7 @@ impl PgPubSub {
         config: &PubSubConfig,
         pool_config: &pgvis_core::config::PoolConfig,
     ) -> Result<Self, Error> {
-        let pool = create_pool(dsn, pool_config)?;
+        let pool = ManagedPool::new(dsn, pool_config)?;
         let config = Arc::new(config.clone());
         let active: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
@@ -105,7 +107,7 @@ impl PgPubSub {
         let task_notify_tx = notify_tx.clone();
         let task_active = active.clone();
 
-        tokio::spawn(listener_task(
+        let listener = tokio::spawn(listener_task(
             task_dsn,
             task_config,
             cmd_rx,
@@ -119,9 +121,24 @@ impl PgPubSub {
             pool,
             config,
             active,
+            listener,
         })
     }
+}
 
+impl PgPubSub {
+    async fn send_command(&self, command: PubSubCmd) -> Result<(), Error> {
+        tokio::time::timeout(Duration::from_secs(5), self.cmd_tx.send(command))
+            .await
+            .map_err(|_| Error::PubSub {
+                message: "listener command queue deadline exceeded".into(),
+                code: PubSubErrorCode::ConnectionLost,
+            })?
+            .map_err(|_| Error::PubSub {
+                message: "listener task is not running".into(),
+                code: PubSubErrorCode::ConnectionLost,
+            })
+    }
 }
 
 impl PubSubBackend for PgPubSub {
@@ -130,13 +147,8 @@ impl PubSubBackend for PgPubSub {
         Box::pin(async move {
             // Only record the channel as active once the command is enqueued, so a
             // failed send doesn't leave a phantom entry that reconnect would re-LISTEN.
-            self.cmd_tx
-                .send(PubSubCmd::Listen(channel.clone()))
-                .await
-                .map_err(|_| Error::PubSub {
-                    message: "listener task is not running".to_string(),
-                    code: PubSubErrorCode::ConnectionLost,
-                })?;
+            self.send_command(PubSubCmd::Listen(channel.clone()))
+                .await?;
             self.active.lock().await.insert(channel);
             Ok(())
         })
@@ -146,13 +158,7 @@ impl PubSubBackend for PgPubSub {
         let channel = channel.to_string();
         Box::pin(async move {
             self.active.lock().await.remove(&channel);
-            self.cmd_tx
-                .send(PubSubCmd::Unlisten(channel))
-                .await
-                .map_err(|_| Error::PubSub {
-                    message: "listener task is not running".to_string(),
-                    code: PubSubErrorCode::ConnectionLost,
-                })
+            self.send_command(PubSubCmd::Unlisten(channel)).await
         })
     }
 
@@ -160,18 +166,21 @@ impl PubSubBackend for PgPubSub {
         let pg_channel = self.config.pg_channel(channel);
         let payload = payload.to_string();
         Box::pin(async move {
-            let client = self.pool.get().await.map_err(|e| Error::PubSub {
-                message: format!("pool error: {e}"),
-                code: PubSubErrorCode::ConnectionLost,
-            })?;
-
-            client
-                .execute("SELECT pg_notify($1, $2)", &[&pg_channel, &payload])
-                .await
-                .map_err(|e| Error::PubSub {
-                    message: format!("NOTIFY failed: {e}"),
-                    code: PubSubErrorCode::ConnectionLost,
-                })?;
+            let checkout = self.pool.checkout().await?;
+            self.pool
+                .execute(
+                    checkout,
+                    &pgvis_core::backend::ExecContext {
+                        is_mutation: true,
+                        ..Default::default()
+                    },
+                    "SELECT pg_notify($1, $2), 'null'::json AS body",
+                    &[
+                        serde_json::Value::String(pg_channel),
+                        serde_json::Value::String(payload),
+                    ],
+                )
+                .await?;
 
             Ok(())
         })
@@ -206,7 +215,7 @@ impl PubSubBackend for PgPubSub {
 
 impl Drop for PgPubSub {
     fn drop(&mut self) {
-        let _ = self.cmd_tx.try_send(PubSubCmd::Shutdown);
+        self.listener.abort();
     }
 }
 
@@ -229,7 +238,13 @@ async fn listener_task(
 
     loop {
         // Attempt to connect
-        let connect_result = tokio_postgres::connect(&dsn, tls_connector()).await;
+        let connect_result = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio_postgres::connect(&dsn, tls_connector()),
+        )
+        .await
+        .map_err(|_| "listener connection deadline exceeded".to_string())
+        .and_then(|result| result.map_err(|e| e.to_string()));
 
         let (client, connection) = match connect_result {
             Ok(pair) => {
@@ -239,7 +254,8 @@ async fn listener_task(
             }
             Err(e) => {
                 attempt = attempt.saturating_add(1);
-                let delay = backoff_delay(attempt, config.reconnect_base_ms, config.reconnect_max_ms);
+                let delay =
+                    backoff_delay(attempt, config.reconnect_base_ms, config.reconnect_max_ms);
                 tracing::warn!(
                     error = %e,
                     attempt,
@@ -248,23 +264,19 @@ async fn listener_task(
                 );
                 tokio::time::sleep(delay).await;
 
-                // Drain commands during sleep — honour Shutdown
-                while let Ok(cmd) = cmd_rx.try_recv() {
-                    if matches!(cmd, PubSubCmd::Shutdown) {
-                        return;
-                    }
-                }
                 continue;
             }
         };
 
-        // Spawn a task to drive the `Connection` and forward async messages
-        // (notifications) over an mpsc channel. This is essential: `Client`
-        // requests (LISTEN/UNLISTEN below) only make progress while the
-        // `Connection` future is being polled. Driving it in a separate task
-        // means our LISTEN commands complete instead of deadlocking.
-        let (async_tx, mut async_rx) = mpsc::unbounded_channel();
-        let conn_task = tokio::spawn(drive_connection(connection, async_tx));
+        // Drive notifications directly into the bounded broadcast ring. A
+        // slow subscriber cannot accumulate an unbounded intermediate queue.
+        // JoinSet aborts the driver even when this listener task is cancelled.
+        let mut conn_tasks = tokio::task::JoinSet::new();
+        conn_tasks.spawn(drive_connection(
+            connection,
+            config.clone(),
+            notify_tx.clone(),
+        ));
 
         // Re-issue LISTEN for all active channels. The connection is now being
         // polled by `conn_task`, so batch_execute makes progress.
@@ -273,7 +285,7 @@ async fn listener_task(
         for channel in &channels {
             let pg_ch = config.pg_channel(channel);
             let query = format!("LISTEN \"{}\"", escape_ident_inner(&pg_ch));
-            if let Err(e) = client.batch_execute(&query).await {
+            if let Err(e) = listener_command(&client, &query).await {
                 tracing::error!(channel = %channel, error = %e, "LISTEN failed on reconnect");
                 listen_failed = true;
                 break;
@@ -281,7 +293,7 @@ async fn listener_task(
         }
 
         if listen_failed {
-            conn_task.abort();
+            conn_tasks.abort_all();
             attempt = attempt.saturating_add(1);
             let delay = backoff_delay(attempt, config.reconnect_base_ms, config.reconnect_max_ms);
             tokio::time::sleep(delay).await;
@@ -289,18 +301,12 @@ async fn listener_task(
         }
 
         // Run the event loop on this connection
-        let should_shutdown = connection_event_loop(
-            &client,
-            &mut async_rx,
-            &config,
-            &mut cmd_rx,
-            &notify_tx,
-        )
-        .await;
+        let should_shutdown =
+            connection_event_loop(&client, &mut conn_tasks, &config, &mut cmd_rx).await;
 
         // Drop the client and stop driving the connection before reconnecting.
         drop(client);
-        conn_task.abort();
+        conn_tasks.abort_all();
 
         if should_shutdown {
             tracing::info!("pub/sub listener shutting down");
@@ -310,111 +316,70 @@ async fn listener_task(
         // Connection lost — backoff and retry
         attempt = attempt.saturating_add(1);
         let delay = backoff_delay(attempt, config.reconnect_base_ms, config.reconnect_max_ms);
-        tracing::info!(attempt, delay_ms = delay.as_millis(), "pub/sub reconnecting");
+        tracing::info!(
+            attempt,
+            delay_ms = delay.as_millis(),
+            "pub/sub reconnecting"
+        );
         tokio::time::sleep(delay).await;
-
-        // Honour shutdown during sleep
-        if let Ok(PubSubCmd::Shutdown) = cmd_rx.try_recv() {
-            return;
-        }
     }
 }
 
-/// Drive a `Connection` future to completion, forwarding every `AsyncMessage`
-/// (notifications, notices, …) over `async_tx`.
-///
-/// tokio-postgres only advances in-flight `Client` requests and delivers
-/// notifications while this future is polled, so it runs in its own task.
-/// When the connection ends (error or close), the channel is dropped, which
-/// signals the event loop to reconnect.
+/// Drive network progress without any unbounded intermediate message queue.
 async fn drive_connection(
     mut connection: Connection<Socket, <MakeRustlsConnect as MakeTlsConnect<Socket>>::Stream>,
-    async_tx: mpsc::UnboundedSender<Result<AsyncMessage, tokio_postgres::Error>>,
+    config: Arc<PubSubConfig>,
+    notify_tx: broadcast::Sender<PubSubMessage>,
 ) {
-    loop {
-        match std::future::poll_fn(|cx| connection.poll_message(cx)).await {
-            Some(msg) => {
-                // If the receiver is gone, the event loop has moved on — stop.
-                if async_tx.send(msg).is_err() {
-                    return;
-                }
+    while let Some(message) = std::future::poll_fn(|cx| connection.poll_message(cx)).await {
+        match message {
+            Ok(AsyncMessage::Notification(n)) => {
+                let _ = notify_tx.send(PubSubMessage {
+                    channel: config
+                        .strip_prefix(n.channel())
+                        .unwrap_or(n.channel())
+                        .to_string(),
+                    payload: n.payload().to_string(),
+                    timestamp: now_iso8601(),
+                });
             }
-            None => return, // Connection closed cleanly.
+            Err(error) => {
+                tracing::warn!(%error, "pub/sub connection lost");
+                return;
+            }
+            _ => {}
         }
     }
 }
 
-/// Drives command handling and consumes forwarded notifications.
-///
-/// Returns `true` if shutdown was requested, `false` if the connection broke.
+async fn listener_command(client: &tokio_postgres::Client, query: &str) -> Result<(), String> {
+    tokio::time::timeout(Duration::from_secs(5), client.batch_execute(query))
+        .await
+        .map_err(|_| "listener command deadline exceeded".to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// Returns true on shutdown, false when the driver exits or a command fails.
 async fn connection_event_loop(
     client: &tokio_postgres::Client,
-    async_rx: &mut mpsc::UnboundedReceiver<Result<AsyncMessage, tokio_postgres::Error>>,
+    conn_tasks: &mut tokio::task::JoinSet<()>,
     config: &PubSubConfig,
     cmd_rx: &mut mpsc::Receiver<PubSubCmd>,
-    notify_tx: &broadcast::Sender<PubSubMessage>,
 ) -> bool {
     loop {
         tokio::select! {
-            // Consume async messages forwarded by the connection driver task.
-            msg = async_rx.recv() => {
-                match msg {
-                    Some(Ok(AsyncMessage::Notification(n))) => {
-                        let logical_channel = config
-                            .strip_prefix(n.channel())
-                            .unwrap_or(n.channel())
-                            .to_string();
-
-                        let msg = PubSubMessage {
-                            channel: logical_channel,
-                            payload: n.payload().to_string(),
-                            timestamp: now_iso8601(),
-                        };
-
-                        // Broadcast — ignore "no receivers" error
-                        let _ = notify_tx.send(msg);
-                    }
-                    Some(Ok(AsyncMessage::Notice(notice))) => {
-                        tracing::debug!(message = %notice.message(), "pg notice on pub/sub connection");
-                    }
-                    Some(Ok(_)) => {
-                        // Other async messages — ignore
-                    }
-                    Some(Err(e)) => {
-                        tracing::error!(error = %e, "pub/sub connection error");
-                        return false; // Reconnect
-                    }
-                    None => {
-                        tracing::warn!("pub/sub connection closed");
-                        return false; // Reconnect
-                    }
-                }
-            }
-
-            // Process commands from the hub
-            cmd = cmd_rx.recv() => {
-                match cmd {
-                    Some(PubSubCmd::Listen(channel)) => {
-                        let pg_ch = config.pg_channel(&channel);
-                        let query = format!("LISTEN \"{}\"", escape_ident_inner(&pg_ch));
-                        if let Err(e) = client.batch_execute(&query).await {
-                            tracing::error!(channel = %channel, error = %e, "LISTEN failed");
-                            return false; // Connection likely broken
-                        }
-                        tracing::debug!(channel = %channel, "LISTEN issued");
-                    }
-                    Some(PubSubCmd::Unlisten(channel)) => {
-                        let pg_ch = config.pg_channel(&channel);
-                        let query = format!("UNLISTEN \"{}\"", escape_ident_inner(&pg_ch));
-                        if let Err(e) = client.batch_execute(&query).await {
-                            tracing::error!(channel = %channel, error = %e, "UNLISTEN failed");
-                            return false;
-                        }
-                        tracing::debug!(channel = %channel, "UNLISTEN issued");
-                    }
-                    Some(PubSubCmd::Shutdown) | None => {
-                        return true; // Shutdown
-                    }
+            _ = conn_tasks.join_next() => return false,
+            command = cmd_rx.recv() => {
+                let (verb, channel) = match command {
+                    Some(PubSubCmd::Listen(channel)) => ("LISTEN", channel),
+                    Some(PubSubCmd::Unlisten(channel)) => ("UNLISTEN", channel),
+                    None => return true,
+                };
+                let pg_channel = config.pg_channel(&channel);
+                let query = format!("{verb} \"{}\"", escape_ident_inner(&pg_channel));
+                if let Err(error) = listener_command(client, &query).await {
+                    tracing::warn!(%error, %verb, "pub/sub listener command failed");
+                    return false;
                 }
             }
         }
@@ -526,7 +491,10 @@ mod tests {
             let base = backoff_base(attempt, 500, 30_000);
             let d = backoff_delay(attempt, 500, 30_000).as_millis() as u64;
             assert!(d >= base, "delay {d} below base {base}");
-            assert!(d <= base + base / 5 + 1, "delay {d} exceeds base+20% {base}");
+            assert!(
+                d <= base + base / 5 + 1,
+                "delay {d} exceeds base+20% {base}"
+            );
         }
     }
 

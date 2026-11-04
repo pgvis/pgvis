@@ -223,7 +223,8 @@ impl AppState {
     /// # Errors
     ///
     /// Returns [`Error`] on call failure, or if the function produced no row or a
-    /// SQL `NULL` (use [`call_rpc`](Self::call_rpc) directly if `NULL` is valid).
+    /// value incompatible with `T`. Use `Option<T>` when SQL `NULL` is valid;
+    /// a missing row remains an error even for nullable types.
     pub async fn call_rpc_scalar<T: DeserializeOwned>(
         &self,
         schema: &str,
@@ -232,12 +233,9 @@ impl AppState {
         caller: &CallerIdentity,
     ) -> Result<T, Error> {
         let result = self.call_rpc(schema, function, args, caller).await?;
-        let value = unwrap_scalar_body(result.body);
-        if value.is_null() {
-            return Err(Error::Internal(format!(
-                "rpc {schema}.{function} returned no scalar value"
-            )));
-        }
+        let value = unwrap_scalar_body(result.body).ok_or_else(|| {
+            Error::Internal(format!("rpc {schema}.{function} returned no scalar value"))
+        })?;
         serde_json::from_value(value)
             .map_err(|e| Error::Internal(format!("rpc {schema}.{function} deserialize: {e}")))
     }
@@ -252,10 +250,9 @@ impl AppState {
         caller: &CallerIdentity,
     ) -> Result<Option<T>, Error> {
         let result = self.call_rpc(schema, function, args, caller).await?;
-        let value = unwrap_scalar_body(result.body);
-        if value.is_null() {
+        let Some(value) = unwrap_scalar_body(result.body).filter(|value| !value.is_null()) else {
             return Ok(None);
-        }
+        };
         serde_json::from_value(value)
             .map(Some)
             .map_err(|e| Error::Internal(format!("rpc {schema}.{function} deserialize: {e}")))
@@ -371,19 +368,19 @@ impl AppState {
 ///
 /// Scalar functions render as `SELECT fn(...) AS result`, producing a body of
 /// `[{"result": <value>}]`. This returns `<value>`, tolerating the bare-object
-/// and bare-value shapes too. Returns `Value::Null` for an empty result.
-fn unwrap_scalar_body(body: serde_json::Value) -> serde_json::Value {
+/// and bare-value shapes too. A missing row/column is distinct from SQL NULL.
+fn unwrap_scalar_body(body: serde_json::Value) -> Option<serde_json::Value> {
     use serde_json::Value;
     let row = match body {
         Value::Array(arr) => match arr.into_iter().next() {
             Some(row) => row,
-            None => return Value::Null,
+            None => return None,
         },
         other => other,
     };
     match row {
-        Value::Object(mut obj) => obj.remove("result").unwrap_or(Value::Null),
-        other => other,
+        Value::Object(mut obj) => obj.remove("result"),
+        other => Some(other),
     }
 }
 
@@ -731,6 +728,7 @@ async fn handle_cache_info(State(state): State<AppState>, headers: HeaderMap) ->
         "settings": settings,
         "stats": stats,
         "pool": state.backend.pool_status(),
+        "readers": state.backend.reader_pool_status(),
     });
 
     (StatusCode::OK, Json(body)).into_response()
@@ -921,8 +919,7 @@ async fn dispatch_request(
                     .map(|s| s.contains("application/vnd.pgrst.object"))
                     .unwrap_or(false);
 
-                let request_offset =
-                    params.get("offset").and_then(|s| s.parse::<u64>().ok());
+                let request_offset = params.get("offset").and_then(|s| s.parse::<u64>().ok());
 
                 return response::format_response(
                     &cached_result,
@@ -946,7 +943,12 @@ async fn dispatch_request(
     // 5b. Data cache: store result on cache miss. `cache_key` is `Some` only for
     // cacheable reads, so no need to re-match the plan here.
     if let (Some(key), Some(dc)) = (&cache_key, &state.data_cache) {
-        dc.store(key, result.json_bytes(), result.total_count, result.page_total);
+        dc.store(
+            key,
+            result.json_bytes(),
+            result.total_count,
+            result.page_total,
+        );
         tracing::debug!(cache_key = %key, "data cache store");
     }
 
@@ -991,8 +993,10 @@ async fn dispatch_request(
     // 6b. Mutation info for status/Location selection (derived from the plan).
     let mutation = match &plan {
         ActionPlan::Mutate(mutate_plan) => {
-            let was_insert =
-                matches!(mutate_plan.mutation, pgvis_core::plan::types::MutationType::Insert { .. });
+            let was_insert = matches!(
+                mutate_plan.mutation,
+                pgvis_core::plan::types::MutationType::Insert { .. }
+            );
             Some(response::MutationInfo {
                 was_insert,
                 primary_key_columns: mutate_plan.table_info.primary_key_columns.clone(),
@@ -1091,8 +1095,8 @@ fn build_api_request(
     // silent fall back to `SELECT *` (which would over-expose columns).
     let select = match params.get("select") {
         Some(s) => {
-            let parsed = query_params::parse_select(s)
-                .map_err(|e| Error::invalid_select(e.to_string()))?;
+            let parsed =
+                query_params::parse_select(s).map_err(|e| Error::invalid_select(e.to_string()))?;
             if parsed.is_empty() {
                 vec![SelectItem::Star]
             } else {
@@ -1133,12 +1137,11 @@ fn build_api_request(
     // A malformed order is a 400.
     let order = match params.get("order") {
         Some(s) => {
-            let items =
-                query_params::parse_order(s).map_err(|e| Error::Parse {
-                    message: e.to_string(),
-                    detail: None,
-                    code: pgvis_core::error::ErrorCode::InvalidOrder,
-                })?;
+            let items = query_params::parse_order(s).map_err(|e| Error::Parse {
+                message: e.to_string(),
+                detail: None,
+                code: pgvis_core::error::ErrorCode::InvalidOrder,
+            })?;
             items
                 .into_iter()
                 .filter_map(|item| match item {
@@ -1511,9 +1514,7 @@ fn is_logic_filter_key(key: &str) -> bool {
 /// Parse logic filter expressions (`and=`, `or=`, `not.and=`, `not.or=`) from query parameters.
 ///
 /// Returns parsed `LogicTree` nodes that express boolean combinations of leaf filters.
-fn parse_logic_filters_from_params(
-    params: &QueryParams,
-) -> Result<Vec<LogicTree>, Error> {
+fn parse_logic_filters_from_params(params: &QueryParams) -> Result<Vec<LogicTree>, Error> {
     let mut trees = Vec::new();
 
     for (key, value) in params.iter() {
@@ -1552,10 +1553,7 @@ fn parse_logic_filters_from_params(
 fn parse_range_from_params(
     params: &QueryParams,
 ) -> Result<Option<pgvis_core::query_params::RangeSpec>, Error> {
-    fn parse_u64(
-        params: &QueryParams,
-        key: &str,
-    ) -> Result<Option<u64>, Error> {
+    fn parse_u64(params: &QueryParams, key: &str) -> Result<Option<u64>, Error> {
         match params.get(key) {
             Some(s) => s.parse::<u64>().map(Some).map_err(|_| Error::Parse {
                 message: format!("Invalid {key}: {s}"),
@@ -1669,7 +1667,9 @@ mod tests {
     #[test]
     fn a_token_without_a_role_claim_is_refused_rather_than_run_as_the_dsn_role() {
         let headers = bearer(serde_json::json!({ "sub": "u1", "exp": exp() }));
-        let err = verify_jwt(&headers, &config(None, None)).err().expect("401");
+        let err = verify_jwt(&headers, &config(None, None))
+            .err()
+            .expect("401");
         assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
 
         // With anon_role configured the request falls back to it, as before.
@@ -1707,7 +1707,8 @@ mod tests {
         // treated as expired, and a string `nbf` was ignored.
         let expired = bearer(serde_json::json!({ "role": "r", "exp": "1" }));
         assert!(verify_jwt(&expired, &config(None, None)).is_err());
-        let not_yet = bearer(serde_json::json!({ "role": "r", "nbf": exp().to_string(), "exp": exp() }));
+        let not_yet =
+            bearer(serde_json::json!({ "role": "r", "nbf": exp().to_string(), "exp": exp() }));
         assert!(verify_jwt(&not_yet, &config(None, None)).is_err());
     }
 
