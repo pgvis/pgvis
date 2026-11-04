@@ -22,6 +22,7 @@
 
 pub mod execute;
 pub mod introspect;
+mod pool;
 pub mod pubsub;
 pub mod replica;
 mod schema_watch;
@@ -52,7 +53,7 @@ pub use replica::PgReplicaBackend;
 /// - `watch_schema()` — LISTEN/NOTIFY for schema changes (planned)
 /// - `dialect()` — returns [`POSTGRES`](pgvis_core::dialect::POSTGRES)
 pub struct PgBackend {
-    pool: Pool,
+    pool: pool::ManagedPool,
     /// For the schema-change listener's own connection.
     dsn: String,
 }
@@ -79,7 +80,7 @@ impl PgBackend {
     /// let backend = PgBackend::new("postgres://localhost/mydb", &PoolConfig::default())?;
     /// ```
     pub fn new(dsn: &str, pool_cfg: &pgvis_core::config::PoolConfig) -> Result<Self, Error> {
-        let pool = create_pool(dsn, pool_cfg)?;
+        let pool = pool::ManagedPool::new(dsn, pool_cfg)?;
         Ok(Self {
             pool,
             dsn: dsn.to_string(),
@@ -90,22 +91,14 @@ impl PgBackend {
     ///
     /// Useful for advanced use cases (custom queries, health checks, metrics).
     pub fn pool(&self) -> &Pool {
-        &self.pool
+        &self.pool.raw
     }
 }
 
 impl Backend for PgBackend {
     fn introspect(&self, cfg: &IntrospectConfig) -> BoxFuture<'_, Result<SchemaCache, Error>> {
         let cfg = cfg.clone();
-        Box::pin(async move {
-            let mut client = self
-                .pool
-                .get()
-                .await
-                .map_err(|e| Error::Introspection(format!("pool error: {e}")))?;
-
-            introspect::load_schema_cache(&mut client, &cfg).await
-        })
+        Box::pin(async move { self.pool.introspect(&cfg).await })
     }
 
     fn execute(
@@ -118,10 +111,8 @@ impl Backend for PgBackend {
         let params = params.to_vec();
         let ctx = ctx.clone();
         Box::pin(async move {
-            Checkout::get(&self.pool)
-                .await?
-                .execute(&ctx, &sql, &params)
-                .await
+            let checkout = self.pool.checkout().await?;
+            self.pool.execute(checkout, &ctx, &sql, &params).await
         })
     }
 
@@ -136,18 +127,7 @@ impl Backend for PgBackend {
     }
 
     fn pool_status(&self) -> Option<pgvis_core::backend::PoolStatus> {
-        Some(pool_status(&self.pool))
-    }
-}
-
-/// [`PoolStatus`](pgvis_core::backend::PoolStatus) of a deadpool pool.
-pub(crate) fn pool_status(pool: &Pool) -> pgvis_core::backend::PoolStatus {
-    let s = pool.status();
-    pgvis_core::backend::PoolStatus {
-        max_size: s.max_size,
-        size: s.size,
-        available: s.available,
-        waiting: s.waiting,
+        Some(self.pool.status())
     }
 }
 
@@ -167,6 +147,13 @@ pub(crate) struct Checkout(Option<deadpool_postgres::Object>);
 impl Checkout {
     pub(crate) async fn get(pool: &Pool) -> Result<Self, Error> {
         pool.get().await.map(|c| Self(Some(c))).map_err(pool_error)
+    }
+
+    async fn introspect(mut self, cfg: &IntrospectConfig) -> Result<SchemaCache, Error> {
+        let result =
+            introspect::load_schema_cache(self.0.as_mut().expect("checked out"), cfg).await;
+        drop(self.0.take());
+        result
     }
 
     /// Run one request; the connection goes back to the pool only once its

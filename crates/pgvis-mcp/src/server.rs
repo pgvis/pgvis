@@ -91,6 +91,11 @@ impl McpServer {
         }
     }
 
+    fn require_metadata_access(&self) -> Result<(), rmcp::ErrorData> {
+        require_anonymous_access(&self.config)
+            .map_err(|_| rmcp::ErrorData::invalid_request("Anonymous access is disabled", None))
+    }
+
     /// Attach a pub/sub backend to enable `pubsub_publish` and `pubsub_channels` tools.
     pub fn with_pubsub(mut self, pubsub: Arc<dyn PubSubBackend>) -> Self {
         self.pubsub = Some(pubsub);
@@ -129,6 +134,7 @@ impl ServerHandler for McpServer {
     ) -> impl std::future::Future<Output = Result<ListToolsResult, rmcp::ErrorData>> + Send + '_
     {
         async move {
+            self.require_metadata_access()?;
             let cache = self.cache.load();
             let tools = build_mcp_tools(&cache, &self.config);
 
@@ -221,14 +227,14 @@ impl ServerHandler for McpServer {
     ) -> impl std::future::Future<Output = Result<ListResourcesResult, rmcp::ErrorData>> + Send + '_
     {
         async move {
+            self.require_metadata_access()?;
             let cache = self.cache.load();
             let resources = build_mcp_resources(&cache, &self.config);
 
             let rmcp_resources = resources
                 .into_iter()
                 .map(|r| {
-                    let mut resource =
-                        Resource::new(r.uri, r.name).with_description(r.description);
+                    let mut resource = Resource::new(r.uri, r.name).with_description(r.description);
                     resource.mime_type = r.mime_type;
                     resource
                 })
@@ -245,6 +251,7 @@ impl ServerHandler for McpServer {
     ) -> impl std::future::Future<Output = Result<ReadResourceResponse, rmcp::ErrorData>> + Send + '_
     {
         async move {
+            self.require_metadata_access()?;
             let cache = self.cache.load();
             let uri = request.uri.as_str();
 
@@ -315,10 +322,7 @@ impl ServerHandler for McpServer {
                 }
             };
 
-            Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                content, uri,
-            )])
-            .into())
+            Ok(ReadResourceResult::new(vec![ResourceContents::text(content, uri)]).into())
         }
     }
 }
@@ -399,7 +403,9 @@ impl McpServer {
                         })
                         .to_string(),
                     )])),
-                    Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(e.to_string())])),
+                    Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(
+                        e.to_string(),
+                    )])),
                 }
             }
             "pubsub_channels" => {

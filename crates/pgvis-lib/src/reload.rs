@@ -30,6 +30,15 @@ const DEBOUNCE: Duration = Duration::from_millis(200);
 #[derive(Clone)]
 pub struct SchemaReloader {
     inner: Arc<Inner>,
+    _task: Arc<ReloadTask>,
+}
+
+struct ReloadTask(tokio::task::JoinHandle<()>);
+
+impl Drop for ReloadTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 struct Inner {
@@ -42,6 +51,7 @@ struct Inner {
 impl SchemaReloader {
     /// Start the reload task (it subscribes to the backend's schema-change
     /// notifications, if it has any) and return a handle to it.
+    /// Dropping the last handle stops the task and its schema listener.
     pub fn spawn(
         backend: Arc<dyn Backend>,
         cache: Arc<ArcSwap<SchemaCache>>,
@@ -53,8 +63,11 @@ impl SchemaReloader {
             config,
             requested: Notify::new(),
         });
-        tokio::spawn(run(inner.clone()));
-        Self { inner }
+        let task = tokio::spawn(run(inner.clone()));
+        Self {
+            inner,
+            _task: Arc::new(ReloadTask(task)),
+        }
     }
 
     /// Ask for a reload; returns at once. Requests that arrive together
@@ -98,7 +111,9 @@ async fn run(inner: Arc<Inner>) {
         }
         match reload(&inner).await {
             Ok(()) => tracing::info!("schema cache reloaded"),
-            Err(e) => tracing::error!(error = %e, "schema cache reload failed; keeping the current cache"),
+            Err(e) => {
+                tracing::error!(error = %e, "schema cache reload failed; keeping the current cache")
+            }
         }
     }
 }

@@ -159,7 +159,9 @@ impl ExecContext {
         if let Some(max) = self.max_affected {
             if rows > max as i64 {
                 return Err(Error::Plan {
-                    message: format!("Query result exceeds max-affected preference constraint ({rows} > {max})"),
+                    message: format!(
+                        "Query result exceeds max-affected preference constraint ({rows} > {max})"
+                    ),
                     detail: None,
                     hint: None,
                     code: crate::error::ErrorCode::MaxAffectedExceeded,
@@ -414,4 +416,24 @@ pub struct PoolStatus {
     /// Requests waiting for a connection. Persistently above zero means the
     /// pool is too small for the load (or connections are held too long).
     pub waiting: usize,
+    /// Configured hard ceiling, independent of the current adaptive limit.
+    pub hard_max_size: usize,
+    /// Cumulative backend checkout/query observations, excluding direct access
+    /// through PgBackend::pool(). Durations are in microseconds.
+    pub metrics: PoolMetrics,
+}
+
+/// Low-cardinality pool telemetry; no DSNs, SQL, roles or request identifiers.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct PoolMetrics {
+    pub checkout_attempts: u64,
+    pub checkout_errors: u64,
+    pub checkout_rejected: u64,
+    pub checkout_duration_us: u64,
+    pub queries: u64,
+    pub query_errors: u64,
+    pub query_cancelled: u64,
+    pub query_duration_us: u64,
+    pub adaptive_increases: u64,
+    pub adaptive_decreases: u64,
 }

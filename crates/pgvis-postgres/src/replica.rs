@@ -32,8 +32,7 @@ use pgvis_core::dialect::{self, Dialect};
 use pgvis_core::error::Error;
 use serde_json::Value;
 
-use crate::Checkout;
-use crate::introspect;
+use crate::pool::ManagedPool;
 
 // ---------------------------------------------------------------------------
 // Health state — shared between the monitor task and request routing
@@ -117,11 +116,11 @@ fn nth_set_bit(mut bits: u64, n: u32) -> u32 {
 /// (primary is appended only if `config.primary_reads == true`).
 pub struct PgReplicaBackend {
     /// The primary connection pool (writes always go here).
-    primary: Pool,
+    primary: ManagedPool,
     /// For the schema-change listener's own connection.
     primary_dsn: String,
     /// All reader pools in order: replicas first, then optionally primary.
-    readers: Vec<Pool>,
+    readers: Vec<ManagedPool>,
     /// Shared health state for routing decisions.
     health: Arc<HealthState>,
     /// Handle to the background health monitor task.
@@ -145,18 +144,23 @@ impl PgReplicaBackend {
         pool_cfg: &PoolConfig,
         config: &ReplicaConfig,
     ) -> Result<Self, Error> {
-        let primary = crate::create_pool(primary_dsn, pool_cfg)?;
+        if config.health_check_interval_ms == 0 {
+            return Err(Error::Introspection(
+                "replica health_check_interval_ms must be positive".into(),
+            ));
+        }
+        let primary = ManagedPool::new(primary_dsn, pool_cfg)?;
 
         let mut replica_pools = Vec::with_capacity(config.replica_dsns.len());
         for dsn in &config.replica_dsns {
-            replica_pools.push(crate::create_pool(dsn, pool_cfg)?);
+            replica_pools.push(ManagedPool::new(dsn, pool_cfg)?);
         }
 
         // Build the readers list: replicas first, then optionally primary.
         // The eligibility bitfield is a u64, so at most 64 readers are supported.
         // Reserve a slot for the primary when primary_reads is enabled, then
         // truncate the replicas so the total reader count never exceeds 64.
-        let mut readers: Vec<Pool> = replica_pools;
+        let mut readers: Vec<ManagedPool> = replica_pools;
         let replica_cap = if config.primary_reads {
             MAX_READERS - 1
         } else {
@@ -178,6 +182,15 @@ impl PgReplicaBackend {
 
         let reader_count = readers.len() as u32;
         let health = Arc::new(HealthState::new(reader_count));
+        // Until the first probe, no replica has demonstrated the configured
+        // lag bound. The primary needs no replay check.
+        if config.max_replication_lag_bytes > 0 {
+            health.set_eligible(if config.primary_reads {
+                1u64 << replica_count
+            } else {
+                0
+            });
+        }
 
         // The health monitor probes over its own one-connection pools with
         // short timeouts. Probing through the request pools made a saturated
@@ -240,19 +253,19 @@ impl PgReplicaBackend {
     }
 }
 
+impl Drop for PgReplicaBackend {
+    fn drop(&mut self) {
+        // Dropping JoinHandle alone detaches the task and retains every probe
+        // pool indefinitely (including when an application replaces a backend).
+        self._monitor_handle.abort();
+    }
+}
+
 impl Backend for PgReplicaBackend {
     fn introspect(&self, cfg: &IntrospectConfig) -> BoxFuture<'_, Result<SchemaCache, Error>> {
         // Always introspect from the primary (authoritative schema)
         let cfg = cfg.clone();
-        Box::pin(async move {
-            let mut client = self
-                .primary
-                .get()
-                .await
-                .map_err(|e| Error::Introspection(format!("pool error: {e}")))?;
-
-            introspect::load_schema_cache(&mut client, &cfg).await
-        })
+        Box::pin(async move { self.primary.introspect(&cfg).await })
     }
 
     fn execute(
@@ -268,10 +281,8 @@ impl Backend for PgReplicaBackend {
         Box::pin(async move {
             // Mutations always go to the primary.
             if ctx.is_mutation {
-                return Checkout::get(&self.primary)
-                    .await?
-                    .execute(&ctx, &sql, &params)
-                    .await;
+                let checkout = self.primary.checkout().await?;
+                return self.primary.execute(checkout, &ctx, &sql, &params).await;
             }
 
             // Reads: try an eligible reader, then retry once with the next
@@ -280,9 +291,11 @@ impl Backend for PgReplicaBackend {
                 let Some(idx) = self.pick_read_pool() else {
                     break;
                 };
-                match Checkout::get(&self.readers[idx]).await {
+                match self.readers[idx].checkout().await {
                     Ok(checkout) => {
-                        return checkout.execute(&ctx, &sql, &params).await;
+                        return self.readers[idx]
+                            .execute(checkout, &ctx, &sql, &params)
+                            .await;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -295,10 +308,8 @@ impl Backend for PgReplicaBackend {
             }
 
             // Fall back to the primary.
-            Checkout::get(&self.primary)
-                .await?
-                .execute(&ctx, &sql, &params)
-                .await
+            let checkout = self.primary.checkout().await?;
+            self.primary.execute(checkout, &ctx, &sql, &params).await
         })
     }
 
@@ -315,7 +326,7 @@ impl Backend for PgReplicaBackend {
     /// The primary's pool: it takes every write (and reads when no reader is
     /// eligible). See [`PgReplicaBackend::eligible_readers`] for read health.
     fn pool_status(&self) -> Option<pgvis_core::backend::PoolStatus> {
-        Some(crate::pool_status(&self.primary))
+        Some(self.primary.status())
     }
 }
 
@@ -336,14 +347,11 @@ async fn health_monitor_loop(
     let lag_disabled = config.max_replication_lag_bytes == 0;
 
     loop {
-        tokio::time::sleep(interval).await;
-
         let mut eligible: u64 = 0;
 
-        // Get primary WAL position (needed for lag calculation). If the primary
-        // is unreachable we can't compute lag, so we fall back to a connectivity-
-        // only check per replica (primary_lsn = None) rather than blindly marking
-        // every reader — including down replicas — eligible.
+        // Without the primary WAL position, an enabled lag limit cannot be
+        // verified. Only an explicitly disabled lag limit permits connectivity-
+        // only checks.
         let primary_lsn = if lag_disabled {
             None
         } else {
@@ -356,18 +364,29 @@ async fn health_monitor_loop(
                     tracing::error!(
                         error = %e,
                         "health monitor: failed to query primary WAL position; \
-                         falling back to connectivity-only replica checks"
+                         replicas excluded until lag can be verified"
                     );
                     None
                 }
             }
         };
 
-        // Check every replica at once, each against a deadline, so one
-        // black-holed host can't stall the others' checks. When primary_lsn
-        // is None (lag checking disabled OR primary unreachable),
-        // check_replica only verifies connectivity.
+        let primary_healthy = if lag_disabled && config.primary_reads {
+            tokio::time::timeout(probe_timeout, async {
+                let client = primary.get().await.map_err(|_| ())?;
+                client.query_one("SELECT 1", &[]).await.map_err(|_| ())
+            })
+            .await
+            .is_ok_and(|r| r.is_ok())
+        } else {
+            primary_lsn.is_some()
+        };
+        // Check every replica at once, each against a deadline. Unknown lag
+        // cannot satisfy an enabled lag limit, even if a replica is reachable.
         let checks = readers[..replica_count].iter().map(|pool| async {
+            if !lag_disabled && primary_lsn.is_none() {
+                return ReplicaStatus::Unreachable("primary WAL position unavailable".into());
+            }
             tokio::time::timeout(
                 probe_timeout,
                 check_replica(pool, primary_lsn, config.max_replication_lag_bytes),
@@ -402,9 +421,9 @@ async fn health_monitor_loop(
                     }
                 }
             } else {
-                // This is the primary in the readers list — always eligible
-                // (if primary can't be reached, execute() will fail naturally)
-                eligible |= 1u64 << i;
+                if primary_healthy {
+                    eligible |= 1u64 << i;
+                }
             }
         }
 
@@ -412,9 +431,7 @@ async fn health_monitor_loop(
         if prev != eligible {
             let eligible_count = eligible.count_ones();
             if eligible_count == 0 {
-                tracing::warn!(
-                    "all replicas excluded — reads will fall back to primary"
-                );
+                tracing::warn!("all replicas excluded — reads will fall back to primary");
             } else {
                 tracing::info!(
                     eligible_readers = eligible_count,
@@ -425,6 +442,7 @@ async fn health_monitor_loop(
         }
 
         health.set_eligible(eligible);
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -439,35 +457,27 @@ enum ReplicaStatus {
 async fn get_primary_lsn(pool: &Pool) -> Result<u64, String> {
     let client = pool.get().await.map_err(|e| format!("pool: {e}"))?;
     let row = client
-        .query_one(
-            "SELECT pg_current_wal_lsn() - '0/0'::pg_lsn AS lsn_bytes",
-            &[],
-        )
+        .query_one("SELECT pg_current_wal_lsn() AS lsn", &[])
         .await
         .map_err(|e| format!("query: {e}"))?;
 
     // Use try_get: pg_current_wal_lsn() is non-NULL on a primary, but if the
     // node is unexpectedly in recovery it returns NULL — treat that as an error
     // rather than panicking.
-    let lsn_bytes: i64 = row
-        .try_get("lsn_bytes")
+    let lsn: tokio_postgres::types::PgLsn = row
+        .try_get("lsn")
         .map_err(|e| format!("primary WAL lsn unavailable: {e}"))?;
-    Ok(lsn_bytes as u64)
+    Ok(lsn.into())
 }
 
 /// Check a replica's health and replication lag.
-async fn check_replica(
-    pool: &Pool,
-    primary_lsn: Option<u64>,
-    max_lag_bytes: u64,
-) -> ReplicaStatus {
+async fn check_replica(pool: &Pool, primary_lsn: Option<u64>, max_lag_bytes: u64) -> ReplicaStatus {
     let client = match pool.get().await {
         Ok(c) => c,
         Err(e) => return ReplicaStatus::Unreachable(format!("pool: {e}")),
     };
 
-    // If lag checking is unavailable (disabled, or the primary is unreachable),
-    // fall back to a connectivity-only probe. A replica that can't run a trivial
+    // Explicitly disabled lag checking permits a connectivity-only probe. A replica that can't run a trivial
     // query is unreachable and must not be marked eligible.
     let Some(primary_lsn) = primary_lsn else {
         return match client.query_one("SELECT 1", &[]).await {
@@ -479,10 +489,7 @@ async fn check_replica(
     // Query the replica's replayed LSN — the position actually visible to
     // queries on the replica (per plans/replica-support.md), not merely received.
     let row = match client
-        .query_one(
-            "SELECT pg_last_wal_replay_lsn() - '0/0'::pg_lsn AS lsn_bytes",
-            &[],
-        )
+        .query_one("SELECT pg_last_wal_replay_lsn() AS lsn", &[])
         .await
     {
         Ok(r) => r,
@@ -492,7 +499,7 @@ async fn check_replica(
     // pg_last_wal_replay_lsn() is NULL when the node is not in recovery (e.g. the
     // "replica" DSN actually points at a primary). Treat NULL/error as
     // ineligible rather than panicking (which would kill the monitor task).
-    let replica_lsn: i64 = match row.try_get("lsn_bytes") {
+    let replica_lsn: tokio_postgres::types::PgLsn = match row.try_get("lsn") {
         Ok(v) => v,
         Err(e) => {
             return ReplicaStatus::Unreachable(format!(
@@ -500,7 +507,7 @@ async fn check_replica(
             ));
         }
     };
-    let replica_lsn = replica_lsn as u64;
+    let replica_lsn = u64::from(replica_lsn);
 
     // Calculate lag (primary is always ahead or equal)
     let lag = primary_lsn.saturating_sub(replica_lsn);
@@ -511,7 +518,6 @@ async fn check_replica(
         ReplicaStatus::Healthy
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests

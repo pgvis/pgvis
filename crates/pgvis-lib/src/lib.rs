@@ -270,19 +270,12 @@ impl Builder {
         let pubsub = if config.pubsub.enabled && db_kind == DbKind::Postgres {
             #[cfg(feature = "postgres")]
             {
-                let pg_pubsub: Arc<dyn pgvis_core::pubsub::PubSubBackend> =
-                    Arc::new(pgvis_postgres::PgPubSub::new(
-                        &self.dsn,
-                        &config.pubsub,
-                        &config.pool,
-                    )?);
+                let pg_pubsub: Arc<dyn pgvis_core::pubsub::PubSubBackend> = Arc::new(
+                    pgvis_postgres::PgPubSub::new(&self.dsn, &config.pubsub, &config.pool)?,
+                );
                 pubsub_backend = Some(pg_pubsub.clone());
 
-                let hub = pgvis_router::PubSubHub::new(
-                    pg_pubsub,
-                    config.pubsub.clone(),
-                )
-                .await?;
+                let hub = pgvis_router::PubSubHub::new(pg_pubsub, config.pubsub.clone()).await?;
 
                 // Mount pub/sub router (config threads JWT settings for auth;
                 // the backend authorizes and publishes as the caller's role)
@@ -322,7 +315,8 @@ impl Builder {
             cache,
             config,
             dialect,
-            router: app,
+            // Keep automatic reload alive for Builder::build() callers too.
+            router: app.layer(axum::Extension(reloader.clone())),
             pubsub,
             reloader,
         })
@@ -374,10 +368,7 @@ impl Builder {
                 #[cfg(feature = "postgres")]
                 {
                     if config.replica.replica_dsns.is_empty() {
-                        let pg = pgvis_postgres::PgBackend::new(
-                            &self.dsn,
-                            &config.pool,
-                        )?;
+                        let pg = pgvis_postgres::PgBackend::new(&self.dsn, &config.pool)?;
                         Ok(Arc::new(pg))
                     } else {
                         let pg = pgvis_postgres::PgReplicaBackend::new(

@@ -37,7 +37,9 @@ async fn start() -> (String, pgvis_lib::SchemaReloader) {
         .await
         .unwrap();
     let port = free_port();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap();
     let router = components.router;
     tokio::spawn(async move { axum::serve(listener, router).await.ok() });
     (format!("http://127.0.0.1:{port}"), components.reloader)
@@ -89,4 +91,91 @@ async fn schema_changes_are_picked_up_without_a_restart() {
     assert_eq!(get("t4").await.unwrap().status(), StatusCode::NOT_FOUND);
 
     psql("DROP SCHEMA test_reload CASCADE").await;
+}
+
+#[tokio::test]
+async fn dropping_a_schema_watch_closes_its_idle_connection() {
+    use pgvis_core::Backend;
+    let name = "pgvis_schema_drop_regression";
+    let dsn = format!(
+        "{}{}application_name={name}",
+        test_dsn(),
+        if test_dsn().contains('?') { "&" } else { "?" }
+    );
+    let backend = pgvis_lib::pgvis_postgres::PgBackend::new(&dsn, &Default::default()).unwrap();
+    let stream = backend.watch_schema().await.unwrap();
+    let (client, conn) = tokio_postgres::connect(&test_dsn(), tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let driver = tokio::spawn(conn);
+    eventually("schema listener connected", async || {
+        client
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name=$1",
+                &[&name],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0)
+            == 1
+    })
+    .await;
+    drop(stream);
+    eventually("dropped schema listener disconnected", async || {
+        client
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name=$1",
+                &[&name],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0)
+            == 0
+    })
+    .await;
+    driver.abort();
+}
+
+#[tokio::test]
+async fn dropping_components_stops_the_reloader_and_its_connections() {
+    let name = "pgvis_components_drop_regression";
+    let dsn = format!(
+        "{}{}application_name={name}",
+        test_dsn(),
+        if test_dsn().contains('?') { "&" } else { "?" }
+    );
+    let components = pgvis_lib::Builder::new(&dsn)
+        .build_components()
+        .await
+        .unwrap();
+    let (client, conn) = tokio_postgres::connect(&test_dsn(), tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let driver = tokio::spawn(conn);
+    eventually("component schema listener connected", async || {
+        client
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name=$1",
+                &[&name],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0)
+            >= 2
+    })
+    .await;
+    drop(components);
+    eventually("dropped component connections closed", async || {
+        client
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name=$1",
+                &[&name],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0)
+            == 0
+    })
+    .await;
+    driver.abort();
 }

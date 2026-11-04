@@ -41,6 +41,72 @@ async fn a_saturated_replica_pool_does_not_get_the_replica_excluded() {
     // Probing through the request pool, the monitor's checkout would time out
     // after 1 s and exclude the (perfectly healthy) replica.
     tokio::time::sleep(Duration::from_millis(2500)).await;
-    assert_eq!(backend.eligible_readers(), 1, "healthy replica was excluded");
+    assert_eq!(
+        backend.eligible_readers(),
+        1,
+        "healthy replica was excluded"
+    );
     busy.await.unwrap();
+}
+
+#[tokio::test]
+async fn configured_lag_checks_do_not_accept_a_primary_as_a_replica() {
+    // A primary has no replay position. Previously the primary probe decoded
+    // NUMERIC as i64 and silently disabled lag checking for every replica.
+    let config = ReplicaConfig {
+        replica_dsns: vec![test_dsn()],
+        health_check_interval_ms: 50,
+        primary_reads: false,
+        ..Default::default()
+    };
+    let backend = PgReplicaBackend::new(&test_dsn(), &PoolConfig::default(), &config).unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        backend.eligible_readers(),
+        0,
+        "unknown replay position must not bypass the lag limit"
+    );
+}
+
+#[tokio::test]
+async fn dropping_the_replica_backend_stops_its_monitor() {
+    let application = "pgvis_monitor_drop_regression";
+    let dsn = format!(
+        "{}{}application_name={application}",
+        test_dsn(),
+        if test_dsn().contains('?') { "&" } else { "?" }
+    );
+    let config = ReplicaConfig {
+        replica_dsns: vec![dsn.clone()],
+        max_replication_lag_bytes: 0,
+        health_check_interval_ms: 50,
+        primary_reads: false,
+    };
+    let backend = PgReplicaBackend::new(&dsn, &PoolConfig::default(), &config).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(backend);
+    let (client, connection) = tokio_postgres::connect(&test_dsn(), tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let task = tokio::spawn(connection);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let count: i64 = client
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name=$1",
+                &[&application],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if count == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "monitor retained {count} connections after backend drop"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    task.abort();
 }

@@ -360,3 +360,53 @@ The architecture is designed so a new backend touches only its own crate:
 This is examined further, with the known sharp edges (e.g. `Dialect` is not yet
 `#[non_exhaustive]`, three-part names for catalog databases), in
 [08-future-scope.md](08-future-scope.md).
+
+
+## PostgreSQL admission and adaptive sizing
+
+The default PostgreSQL pool has a fixed ceiling. `pool.max_waiters` (default
+1024) bounds pending checkouts; excess requests fail with 503. `pool.timeout_ms`
+covers the whole checkout, including connect and recycle. A client-side
+`pool.query_timeout_ms` (default 30000) also bounds stalled queries and schema
+introspection. An explicit SQL statement timeout gets an extra second to return
+its server error. Setting a deadline to zero disables it; adaptive mode requires
+both deadlines. A cancelled or timed-out request discards its connection so
+transaction state cannot reach another caller. A timeout does not prove that a
+write failed: pgvis never automatically replays a submitted query.
+
+Optional AIMD controls the raw pool size within its configured ceiling:
+
+```toml
+[pool]
+size = 16
+max_waiters = 256
+timeout_ms = 5000
+query_timeout_ms = 30000
+
+[pool.adaptive]
+min_size = 2
+target_query_time_ms = 100
+adjustment_interval_ms = 1000
+```
+
+At most once per interval, healthy completed work with queued demand adds one
+connection; slow queries, connection failures or database overload halve the
+limit down to the minimum. Shrinking retires excess connections on return; it
+does not cancel active work. Mixed long/short workloads need a suitable latency
+target. This is application-local admission, not shared transaction multiplexing
+across processes. No equivalence to PgBouncer capacity has been established.
+Each primary/replica request pool has its own ceiling; reserve a total budget
+across **all instances and all pools**, plus one health probe connection per
+monitored endpoint, one schema listener and the separate optional pub/sub pool
+and listener. Direct raw-pool callers are responsible for their own admission
+and must not resize beyond their budget.
+
+Replica lag checks use replay LSN (not received WAL) and start with unverified
+replicas excluded. If primary LSN cannot be obtained, lag cannot be proven and
+readers are excluded for that check; `max_replication_lag_bytes = 0` explicitly opts
+into connectivity-only checks. Probes run immediately at startup, then at the
+configured positive interval. Health can change between probe and query;
+requests still need error handling. Promotion and writer endpoint selection
+belong to the PostgreSQL HA system; pgvis does not elect or promote a primary.
+Schema listeners reconnect with backoff and coalesce notifications. Dropping a
+backend/reloader stops its monitoring tasks and dedicated connections.
