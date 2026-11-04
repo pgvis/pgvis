@@ -28,12 +28,22 @@ async fn the_cache_endpoint_reports_pool_occupancy() {
     setup_test_db(&test_dsn()).await;
     let server = PgvisServer::start(&test_dsn(), "test").await;
     // Open at least one pooled connection.
-    assert!(server.get("/api/test/items?limit=1").await.status().is_success());
+    assert!(
+        server
+            .get("/api/test/items?limit=1")
+            .await
+            .status()
+            .is_success()
+    );
     let body: Value = server.get("/pgvis/cache").await.json().await.unwrap();
     let pool = &body["pool"];
     assert!(pool["max_size"].as_u64().unwrap() > 0, "{body}");
     assert!(pool["size"].as_u64().unwrap() >= 1, "{body}");
     assert!(pool["waiting"].is_u64(), "{body}");
+    assert!(pool["hard_max_size"].as_u64().unwrap() >= pool["max_size"].as_u64().unwrap());
+    assert!(pool["metrics"]["checkout_attempts"].as_u64().unwrap() >= 2);
+    assert!(pool["metrics"]["queries"].as_u64().unwrap() >= 1);
+    assert_eq!(body["readers"], json!([]));
 }
 
 #[tokio::test]
@@ -54,7 +64,12 @@ async fn metadata_needs_auth_when_the_data_api_does() {
         ("/pgvis/cache", "application/json"),
     ] {
         let url = format!("{}{path}", server.base_url);
-        let anon = client.get(&url).header("accept", accept).send().await.unwrap();
+        let anon = client
+            .get(&url)
+            .header("accept", accept)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(anon.status(), StatusCode::UNAUTHORIZED, "{path} ({accept})");
 
         let user = std::env::var("USER").unwrap_or_else(|_| "postgres".into());

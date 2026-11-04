@@ -173,13 +173,14 @@ so identical pool settings apply uniformly to the primary and all replica pools
 [`PgReplicaBackend`](../crates/pgvis-postgres/src/replica.rs) extends the
 single-server model with replica-aware routing:
 
-Every read picks an eligible reader from the health bitfield; writes, and
-anything that may write, stay on the primary.
+Eligible plans select a reader from a bounded snapshot of stable pool entries.
+Writes, unverified read plans, pre-request hooks and explicit primary-consistency
+requests stay on the primary. All adapters use `plan::replica_read_eligible`.
 
 ```mermaid
 flowchart TB
     exec(["Backend::execute(ctx, sql, params)"])
-    write{"ctx.is_mutation?"}
+    write{"mutation, require_primary,<br/>or pre_request?"}
     pick{"eligible reader?"}
     get{"reader checkout ok?"}
     reader["<b>Reader pool</b><br/>replica, or primary if primary_reads"]
@@ -199,8 +200,10 @@ flowchart TB
 - `is_mutation = true` → always the primary pool. The router sets it for
   mutations *and* for calls to `VOLATILE` functions (`plan_writes`), and the
   pub/sub handlers set it for their statements (NOTIFY, the authorize
-  function), so nothing that may write reaches a standby.
-- `is_mutation = false` → round-robin across eligible readers (replicas +
+  function). Unknown table metadata, views, foreign/nonpermanent tables, inheritance parents, RLS and computed
+  relationships set `require_primary`. Volatility is not proof of side-effect
+  freedom: reader transactions enforce READ ONLY and never replay execution errors.
+- Eligible read plans without a hook or `require_primary` → round-robin across readers (replicas +
   optionally the primary); on a checkout failure the next eligible reader is
   tried once.
 - No eligible reader, or both tries failed → the primary.
@@ -214,9 +217,11 @@ unreachable, excluding it and piling its load onto the rest. Each tick reads
 each under its own deadline, comparing `pg_last_wal_replay_lsn()` (the
 position visible to queries) with the primary's. Replicas more than
 `max_replication_lag_bytes` (default 10 MB) behind, unreachable, or not in
-recovery are excluded. When lag checking is disabled or the primary cannot be
-read, the check falls back to connectivity only (`SELECT 1`). The result is
-stored in an atomic `u64` bitfield (at most 64 readers) for lock-free routing.
+recovery are excluded. Unknown primary LSN excludes lag-checked readers. Static
+DSNs with explicitly disabled lag checking retain connectivity-only probes.
+A short mutex protects the topology snapshot; each entry has its own eligibility
+and retirement gate. No lock is held across network I/O and no old bitmap can
+select a different replacement pool. At most 64 reader slots are supported.
 
 ```mermaid
 flowchart TB
@@ -226,7 +231,7 @@ flowchart TB
     lag{"reachable, in recovery,<br/>lag within the limit?"}
     ok["<b>eligible</b>"]
     out["<b>excluded</b><br/>lagging or unreachable"]
-    bits[("AtomicU64 eligibility bits")]
+    bits[("Stable reader entries + eligibility")]
 
     tick --> lsn --> probe --> lag
     lag -->|yes| ok --> bits
@@ -249,9 +254,12 @@ in `Config.replica`:
 - `max_replication_lag_bytes` — lag threshold (0 disables checking)
 - `health_check_interval_ms` — monitor tick interval
 - `primary_reads` — whether primary participates in read load balancing
+- `discovery` — opt-in bounded physical streaming discovery, trusted networks,
+  listening port, refresh/stale intervals and capacity. See the
+  [configuration reference](../website/src/content/docs/reference/configuration.mdx).
 
 **Activation:** Automatic via the Builder. When `config.replica.replica_dsns`
-is non-empty and the DSN is Postgres, `pgvis-lib` constructs
+is non-empty or discovery is configured, and the DSN is Postgres, `pgvis-lib` constructs
 `PgReplicaBackend` instead of `PgBackend`. No surface-layer changes needed.
 
 ## The `Dialect` struct
@@ -360,3 +368,91 @@ The architecture is designed so a new backend touches only its own crate:
 This is examined further, with the known sharp edges (e.g. `Dialect` is not yet
 `#[non_exhaustive]`, three-part names for catalog databases), in
 [08-future-scope.md](08-future-scope.md).
+
+
+## PostgreSQL admission and adaptive sizing
+
+The default PostgreSQL pool has a fixed ceiling. `pool.max_waiters` (default
+1024) bounds pending checkouts; excess requests fail with 503. `pool.timeout_ms`
+covers the whole checkout, including connect and recycle. A client-side
+`pool.query_timeout_ms` (default 30000) also bounds stalled queries and schema
+introspection. An explicit SQL statement timeout gets an extra second to return
+its server error. Setting a deadline to zero disables it; adaptive mode requires
+both deadlines. A cancelled or timed-out request discards its connection so
+transaction state cannot reach another caller. A timeout does not prove that a
+write failed: pgvis never automatically replays a submitted query.
+
+Optional AIMD controls the raw pool size within its configured ceiling:
+
+```toml
+[pool]
+size = 16
+max_waiters = 256
+timeout_ms = 5000
+query_timeout_ms = 30000
+
+[pool.adaptive]
+min_size = 2
+target_query_time_ms = 100
+adjustment_interval_ms = 1000
+```
+
+At most once per interval, healthy completed work with queued demand adds one
+connection; slow queries, connection failures or database overload halve the
+limit down to the minimum. Shrinking retires excess connections on return; it
+does not cancel active work. Mixed long/short workloads need a suitable latency
+target. This is application-local admission, not shared transaction multiplexing
+across processes. No equivalence to PgBouncer capacity has been established.
+Each primary/replica request pool has its own ceiling; reserve a total budget
+across **all instances and all pools**, plus one health probe connection per
+monitored endpoint, one schema listener and the separate optional pub/sub pool
+and listener. Direct raw-pool callers are responsible for their own admission
+and must not resize beyond their budget.
+
+Replica lag checks use replay LSN (not received WAL) and start with unverified
+replicas excluded. If primary LSN cannot be obtained, lag cannot be proven and
+readers are excluded for that check; static DSNs with `max_replication_lag_bytes = 0`
+explicitly opt into connectivity-only checks. Discovery always verifies cluster
+identity, receiving timeline and recovery, even when the byte limit is disabled. Probes run immediately at startup, then at the
+configured positive interval. Health can change between probe and query;
+requests still need error handling. Promotion and writer endpoint selection
+belong to the PostgreSQL HA system; pgvis does not elect or promote a primary.
+Schema listeners reconnect with backoff and coalesce notifications. Dropping a
+backend/reloader stops its monitoring tasks and dedicated connections.
+
+
+The opt-in `failover` integration test starts and removes its own primary and
+streaming standby (`initdb`, `pg_basebackup`, `pg_ctl` required). It exercises
+paused replay, catch-up, primary loss, external promotion, a multi-host
+`target_session_attrs=read-write` writer DSN, and a timed-out mutation whose
+nontransactional attempt counter must remain one. A promoted node retains its
+last replay LSN, so lag-based readers also require `pg_is_in_recovery()`.
+
+```sh
+cargo test -p pgvis-server --test failover -- --ignored --nocapture
+cargo test -p pgvis-server --test pool compare_fixed_and_adaptive -- --ignored --nocapture
+```
+
+A local PostgreSQL 18.4 run on 2026-11-04, with 2048 concurrent callers, 8192
+2 ms sleeping queries per mode, and a 16-connection ceiling, completed without
+checkout/query errors or exceeding that ceiling. Fixed sizing took 1.296 s
+(p95 request latency 325 ms); adaptive 2→16 took 1.419 s (p95 402 ms), including
+its ramp-up. This synthetic single-process run validates bounds and records
+ramp-up cost; it does not model a multi-node production workload, network
+partitions, or compare PgBouncer throughput. A separate regression verifies
+that shrinking preserves active work and retires excess connections on return.
+
+The opt-in `discovery` integration test needs an isolated Linux Ubuntu host,
+passwordless sudo, iproute2 and PostgreSQL tools in the Nix development shell:
+
+```sh
+PGVIS_DISCOVERY_NETNS=1 cargo test -p pgvis-server --test discovery -- --ignored --nocapture
+```
+
+It creates and cleans up a private bridge, two network namespaces and three
+PostgreSQL clusters. Namespaces make each WAL receiver originate from its query
+address, unlike multiple loopback listeners. It checks plan routing and schema
+reload, discovery membership and privilege failure, draining reads, bounded
+flapping, restoration, pooled-session promotion safety and task cleanup. It never
+uses an existing PostgreSQL database. Do not run the privileged fixture on a
+shared production host.

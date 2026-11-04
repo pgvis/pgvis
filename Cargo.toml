@@ -25,6 +25,8 @@ categories = ["database", "web-programming::http-server", "api-bindings"]
 [workspace.dependencies]
 # async / http
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+ipnet = "2"
 axum = "0.8"
 http = "1"
 
@@ -59,7 +61,8 @@ serde_ignored = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 
 # auth
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+# AWS-LC avoids the unpatched rsa/old crypto-bigint paths in rust_crypto.
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 
 # observability
 tracing = "0.1"

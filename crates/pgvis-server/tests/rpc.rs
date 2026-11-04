@@ -762,10 +762,7 @@ async fn test_in_process_rpc_with_args() {
         .await
         .expect("call_rpc should succeed");
 
-    let arr = result
-        .body
-        .as_array()
-        .expect("search should return array");
+    let arr = result.body.as_array().expect("search should return array");
     assert!(!arr.is_empty(), "should find at least one Widget");
     for item in arr {
         let name = item["name"].as_str().unwrap_or("");
@@ -972,4 +969,76 @@ async fn test_in_process_rpc_overload_resolution() {
         .await
         .expect_err("unknown argument must be rejected");
     assert_eq!(err.code().as_str(), "PGRST202");
+}
+
+#[tokio::test]
+async fn nullable_scalar_distinguishes_sql_null_from_no_row() {
+    let dsn = test_dsn();
+    let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let driver = tokio::spawn(connection);
+    client.batch_execute("CREATE SCHEMA IF NOT EXISTS test_scalar_contract;
+        CREATE OR REPLACE FUNCTION test_scalar_contract.nullable(p_value bigint DEFAULT NULL) RETURNS bigint LANGUAGE sql STABLE AS 'SELECT p_value';
+        CREATE OR REPLACE FUNCTION test_scalar_contract.no_rows() RETURNS SETOF bigint LANGUAGE sql STABLE AS 'SELECT 1::bigint WHERE false';").await.unwrap();
+    let components = pgvis_lib::Builder::new(&dsn)
+        .schemas(vec!["test_scalar_contract"])
+        .build_components()
+        .await
+        .unwrap();
+    let state = pgvis_router::AppState::new(
+        components.cache,
+        components.config,
+        components.dialect,
+        components.backend,
+    );
+    let caller = pgvis_router::CallerIdentity::anonymous();
+    let value = state
+        .call_rpc_scalar::<Option<i64>>("test_scalar_contract", "nullable", json!({}), &caller)
+        .await
+        .expect("a SQL NULL is a present nullable scalar");
+    assert_eq!(value, None);
+    assert_eq!(
+        state
+            .call_rpc_scalar::<Option<i64>>(
+                "test_scalar_contract",
+                "nullable",
+                json!({"p_value": 42}),
+                &caller
+            )
+            .await
+            .unwrap(),
+        Some(42)
+    );
+    assert!(
+        state
+            .call_rpc_scalar::<i64>("test_scalar_contract", "nullable", json!({}), &caller)
+            .await
+            .is_err()
+    );
+    assert!(
+        state
+            .call_rpc_scalar::<Option<i64>>("test_scalar_contract", "no_rows", json!({}), &caller)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        state
+            .call_rpc_scalar_opt::<i64>("test_scalar_contract", "nullable", json!({}), &caller)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        state
+            .call_rpc_scalar_opt::<i64>("test_scalar_contract", "no_rows", json!({}), &caller)
+            .await
+            .unwrap(),
+        None
+    );
+    client
+        .batch_execute("DROP SCHEMA test_scalar_contract CASCADE")
+        .await
+        .unwrap();
+    driver.abort();
 }

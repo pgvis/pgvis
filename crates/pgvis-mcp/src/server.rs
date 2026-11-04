@@ -69,6 +69,7 @@ pub struct McpServer {
     pub backend: Arc<dyn Backend>,
     /// Optional pub/sub backend for publish operations via MCP tools.
     pub pubsub: Option<Arc<dyn PubSubBackend>>,
+    lifetime_guard: Option<Arc<dyn Send + Sync>>,
 }
 
 impl McpServer {
@@ -88,7 +89,20 @@ impl McpServer {
             dialect,
             backend,
             pubsub: None,
+            lifetime_guard: None,
         }
+    }
+
+    /// Retain a service owner (for example the schema reloader) until the last
+    /// server clone is dropped. The MCP crate does not depend on the builder.
+    pub fn with_lifetime_guard<T: Send + Sync + 'static>(mut self, guard: T) -> Self {
+        self.lifetime_guard = Some(Arc::new(guard));
+        self
+    }
+
+    fn require_metadata_access(&self) -> Result<(), rmcp::ErrorData> {
+        require_anonymous_access(&self.config)
+            .map_err(|_| rmcp::ErrorData::invalid_request("Anonymous access is disabled", None))
     }
 
     /// Attach a pub/sub backend to enable `pubsub_publish` and `pubsub_channels` tools.
@@ -129,6 +143,7 @@ impl ServerHandler for McpServer {
     ) -> impl std::future::Future<Output = Result<ListToolsResult, rmcp::ErrorData>> + Send + '_
     {
         async move {
+            self.require_metadata_access()?;
             let cache = self.cache.load();
             let tools = build_mcp_tools(&cache, &self.config);
 
@@ -221,14 +236,14 @@ impl ServerHandler for McpServer {
     ) -> impl std::future::Future<Output = Result<ListResourcesResult, rmcp::ErrorData>> + Send + '_
     {
         async move {
+            self.require_metadata_access()?;
             let cache = self.cache.load();
             let resources = build_mcp_resources(&cache, &self.config);
 
             let rmcp_resources = resources
                 .into_iter()
                 .map(|r| {
-                    let mut resource =
-                        Resource::new(r.uri, r.name).with_description(r.description);
+                    let mut resource = Resource::new(r.uri, r.name).with_description(r.description);
                     resource.mime_type = r.mime_type;
                     resource
                 })
@@ -245,6 +260,7 @@ impl ServerHandler for McpServer {
     ) -> impl std::future::Future<Output = Result<ReadResourceResponse, rmcp::ErrorData>> + Send + '_
     {
         async move {
+            self.require_metadata_access()?;
             let cache = self.cache.load();
             let uri = request.uri.as_str();
 
@@ -315,10 +331,7 @@ impl ServerHandler for McpServer {
                 }
             };
 
-            Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                content, uri,
-            )])
-            .into())
+            Ok(ReadResourceResult::new(vec![ResourceContents::text(content, uri)]).into())
         }
     }
 }
@@ -399,7 +412,9 @@ impl McpServer {
                         })
                         .to_string(),
                     )])),
-                    Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(e.to_string())])),
+                    Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(
+                        e.to_string(),
+                    )])),
                 }
             }
             "pubsub_channels" => {

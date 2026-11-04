@@ -266,19 +266,21 @@ Pool and listener connections negotiate TLS per the DSN's `sslmode` (`disable`, 
 
 ```mermaid
 flowchart TB
-    q(["Backend::execute"]) --> mut{"is_mutation?"}
+    q(["Backend::execute"]) --> mut{"mutation / require_primary / hook?"}
     mut -->|yes| primary[("Primary")]
     mut -->|no| pick{"reader left?"}
     pick -->|no| primary
     pick -->|yes| co{"checkout ok?"}
     co -->|yes| reader[("Reader<br/>replica, or primary<br/>with primary_reads")]
     co -->|"no: retry once"| pick
-    health["<b>Health monitor</b><br/>reachability + lag"] -.->|"eligible bitfield"| pick
+    health["<b>Health monitor</b><br/>reachability + lag"] -.->|"stable reader entries"| pick
 ```
 
-`is_mutation` is set for table writes and for volatile function calls. A failed checkout on a reader is retried once on the next eligible reader before falling back to the primary.
+`is_mutation` is set for table writes and volatile function calls. Shared plan analysis sets `require_primary` for unverified reads, views, foreign/nonpermanent tables, inheritance parents, RLS, computed relationships and explicit casts/aggregates. Pre-request hooks also stay primary. Reader execution uses READ ONLY, with a transaction-level recovery assertion for lag-checked/discovered standbys. No execution error is replayed. A failed checkout on a reader is retried once on the next eligible reader before falling back to the primary.
 
-A background health monitor runs every `health_check_interval_ms`. It probes over its own one-connection pools with short timeouts — never the request pools, so a saturated but healthy replica is not mistaken for a dead one — and checks every replica concurrently, each under a deadline. A replica is excluded when unreachable or when its replication lag exceeds `max_replication_lag_bytes` (0 disables the lag check). Eligibility lives in an atomic bitfield, read lock-free on the request path; `eligible_readers()` exposes the current count.
+A background health monitor runs every `health_check_interval_ms`. It probes over its own one-connection pools with short timeouts — never the request pools, so a saturated but healthy replica is not mistaken for a dead one — and checks every replica concurrently, each under a deadline. A replica is excluded when unreachable or when its replication lag exceeds `max_replication_lag_bytes` (0 disables the lag check). Eligibility belongs to stable pool entries in a brief mutex-protected topology snapshot; `eligible_readers()` exposes the current count.
+
+Opt-in streaming discovery verifies trusted endpoints, cluster identity, receiving timeline and replay lag. Removed pools reject new checkouts while checked-out reads drain; retiring pools retain capacity until drained. See [replica discovery configuration](/reference/configuration/#automatic-physical-standby-discovery-opt-in).
 
 ## Data Cache
 

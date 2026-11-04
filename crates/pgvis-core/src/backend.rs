@@ -134,8 +134,13 @@ pub struct ExecContext {
     /// (serialized via mutex) vs the reader pool (concurrent). Set by the
     /// adapter layer based on the HTTP method / plan type.
     ///
-    /// On Postgres this field is informational only (all queries use pooled connections).
+    /// On Postgres replica backends this forces the primary; other reads also
+    /// respect `require_primary` and pre-request hooks.
     pub is_mutation: bool,
+
+    /// Require the authoritative primary, including for read-after-write consistency
+    /// or a plan whose read safety cannot be established from schema metadata.
+    pub require_primary: bool,
 
     /// Return the body as the database's JSON text ([`QueryResult::raw_body`])
     /// instead of a parsed [`QueryResult::body`]: no parse and re-serialize
@@ -159,7 +164,9 @@ impl ExecContext {
         if let Some(max) = self.max_affected {
             if rows > max as i64 {
                 return Err(Error::Plan {
-                    message: format!("Query result exceeds max-affected preference constraint ({rows} > {max})"),
+                    message: format!(
+                        "Query result exceeds max-affected preference constraint ({rows} > {max})"
+                    ),
                     detail: None,
                     hint: None,
                     code: crate::error::ErrorCode::MaxAffectedExceeded,
@@ -400,12 +407,49 @@ pub trait Backend: Send + Sync + 'static {
     fn pool_status(&self) -> Option<PoolStatus> {
         None
     }
+
+    /// Reader pools and last sampled eligibility; empty for non-replica backends.
+    fn reader_pool_status(&self) -> Vec<ReaderPoolStatus> {
+        Vec::new()
+    }
+
+    fn replica_discovery_status(&self) -> Option<ReplicaDiscoveryStatus> {
+        None
+    }
+}
+
+/// One reader's bounded pool counters and last sampled routing eligibility.
+/// Index is snapshot order; use `id` across refreshes. No connection strings are exposed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReaderPoolStatus {
+    /// Stable for an endpoint across refreshes; never contains a DSN.
+    pub id: String,
+    pub discovered: bool,
+    pub retiring: bool,
+    pub status: &'static str,
+    pub index: usize,
+    /// True for the shared primary pool when primary reads are enabled.
+    pub is_primary: bool,
+    pub eligible: bool,
+    pub pool: PoolStatus,
+}
+
+/// Bounded discovery health, including capacity retained for draining reads.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReplicaDiscoveryStatus {
+    pub status: &'static str,
+    pub successful_refreshes: u64,
+    pub failed_refreshes: u64,
+    pub last_success_age_ms: Option<u64>,
+    pub active_nodes: usize,
+    pub retiring_nodes: usize,
 }
 
 /// Connection-pool occupancy, as reported by [`Backend::pool_status`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct PoolStatus {
-    /// The most connections the pool will open.
+    /// Current admission limit. Active connections can exceed a recently reduced
+    /// adaptive limit until they return; `hard_max_size` is the configured ceiling.
     pub max_size: usize,
     /// Connections currently open (idle or checked out).
     pub size: usize,
@@ -414,4 +458,24 @@ pub struct PoolStatus {
     /// Requests waiting for a connection. Persistently above zero means the
     /// pool is too small for the load (or connections are held too long).
     pub waiting: usize,
+    /// Configured hard ceiling, independent of the current adaptive limit.
+    pub hard_max_size: usize,
+    /// Cumulative backend checkout/query observations, excluding direct access
+    /// through PgBackend::pool(). Durations are in microseconds.
+    pub metrics: PoolMetrics,
+}
+
+/// Low-cardinality pool telemetry; no DSNs, SQL, roles or request identifiers.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct PoolMetrics {
+    pub checkout_attempts: u64,
+    pub checkout_errors: u64,
+    pub checkout_rejected: u64,
+    pub checkout_duration_us: u64,
+    pub queries: u64,
+    pub query_errors: u64,
+    pub query_cancelled: u64,
+    pub query_duration_us: u64,
+    pub adaptive_increases: u64,
+    pub adaptive_decreases: u64,
 }

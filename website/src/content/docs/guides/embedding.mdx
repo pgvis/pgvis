@@ -444,7 +444,7 @@ A request dropped mid-flight never hands an open transaction back to the pool: i
 
 ## Read Replicas and Pool Status
 
-Set `config.replica.replica_dsns` and the `Builder` uses a replica-aware Postgres backend: reads (including `STABLE`/`IMMUTABLE` RPCs) are spread across the primary and replicas, while writes and `VOLATILE` RPCs stay on the primary.
+Set `config.replica.replica_dsns` or opt into `config.replica.discovery` and the `Builder` uses a replica-aware Postgres backend. Metadata-eligible base table reads and STABLE/IMMUTABLE RPCs can use readers; writes, VOLATILE RPCs, views, RLS, computed relationships and pre-request hooks stay primary. Reader transactions enforce READ ONLY. See [discovery and consistency limits](/reference/configuration/#read-replicas-postgres-only).
 
 ```rust
 use pgvis_lib::pgvis_core::config::{Config, ReplicaConfig};
@@ -455,6 +455,7 @@ let config = Config {
         max_replication_lag_bytes: 10 * 1024 * 1024, // exclude replicas further behind
         health_check_interval_ms: 5_000,
         primary_reads: true,                         // primary also serves reads
+        ..Default::default()
     },
     ..Default::default()
 };

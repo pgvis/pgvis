@@ -318,15 +318,82 @@ Each request takes one pooled connection for two round trips, however many claim
 #### How replica routing works
 
 1. **Writes** (`POST`, `PATCH`, `PUT`, `DELETE` on tables) and calls to `VOLATILE` functions always go to the primary
-2. **Reads** (`GET` on tables/views, `STABLE`/`IMMUTABLE` RPC) are distributed round-robin across healthy replicas (and the primary if `primary_reads = true`)
+2. **Eligible reads** (local base tables without RLS, including safe FK joins, and `STABLE`/`IMMUTABLE` RPC) are distributed round-robin across healthy replicas. Views, foreign tables, unlogged/temporary tables, ordinary inheritance parents, RLS, computed relationships, explicit select casts/aggregates and unknown table metadata stay on the primary. A configured `pre_request` hook always stays on the primary.
 3. A background health monitor checks every replica concurrently each `health_check_interval_ms`, over its own dedicated connections with short timeouts — so a replica whose request pool is merely busy is not marked unhealthy, and one unreachable host doesn't stall the checks of the others
-4. Replicas whose WAL receive position is more than `max_replication_lag_bytes` behind the primary are temporarily excluded
-5. If all replicas are unhealthy, reads fall back to the primary automatically
+4. Replicas whose WAL replay position is more than `max_replication_lag_bytes` behind the primary are temporarily excluded
+5. If no eligible reader can be checked out, reads fall back to the primary. Query execution errors are never replayed. Eligible read transactions use `BEGIN READ ONLY`, including primary readers and checkout fallback; lag-checked and discovered readers additionally assert `pg_is_in_recovery()` inside that transaction, protecting pooled sessions during promotion.
+
+Function volatility is a routing hint, not proof of all side effects: a STABLE wrapper can call a VOLATILE function. READ ONLY blocks writes to non-temporary tables, but cannot sandbox session-local or external effects of privileged extensions. Replica reads are eventually consistent. For a direct `Backend::execute` call, set `ExecContext.require_primary = true` when primary consistency is required; replica lag bounds do not guarantee read-after-write. Schema/security changes need schema reload and WAL replay before replica behavior converges. Function volatility cannot reveal dependencies on unlogged data: STABLE RPCs that read unlogged tables require explicit primary execution too. Temporary/session-local data additionally requires connection affinity, which replica routing does not provide.
+
+#### Automatic physical standby discovery (opt-in)
+
+Static `replica_dsns` continue to work. Set `[replica.discovery]` to discover
+**direct physical streaming standbys** from the primary's `pg_stat_replication`:
+
+```toml
+[replica]
+primary_reads = false
+health_check_interval_ms = 1000
+max_replication_lag_bytes = 10485760
+
+[replica.discovery]
+trusted_cidrs = ["10.20.0.0/24"]
+port = 5432
+max_nodes = 8
+refresh_interval_ms = 5000
+stale_after_ms = 30000
+# allow_insecure = false  # keep false outside isolated development fixtures
+```
+
+The primary DSN must use `sslmode=require`. Discovered connections preserve its
+authentication, TLS and session options while replacing all hosts/addresses/ports
+and setting `target_session_attrs=read-only`. The replication **client port is
+never a database listening port**. `port` defaults to the primary's single port
+(or 5432); a primary DSN with differing ports requires an explicit discovery port.
+
+`client_addr` must be the standby's directly reachable query address. A validated
+`client_hostname`, when available, supplies the TLS name while `hostaddr` pins the
+actual connection to the observed IP; otherwise the certificate needs that IP's
+SAN. Only allow CIDRs whose endpoints you trust to receive the primary DSN's
+credentials. Cluster identity verification happens after authentication and does
+not replace this trust boundary or TLS verification. Narrow CIDRs and appropriate
+DB credentials matter. Discovery does not find cascading standbys and does not
+support NAT, multiple query ports behind one source IP, Unix replication sockets,
+or logical subscribers; use static DSNs for those topologies. Ambiguous/masked or
+untrusted physical membership fails closed.
+
+The connection role needs effective `pg_read_all_stats` membership (or equivalent
+superuser/`pg_monitor` access) plus EXECUTE on `pg_control_system()` and
+`pg_control_checkpoint()`. It needs visibility of `pg_stat_wal_receiver` on each
+standby. Grant only these monitoring privileges to the connection role, separately
+from request roles. Each discovered node must be in recovery, share the primary's
+system identifier and current receiving timeline, and meet the replay-lag limit.
+Setting lag bytes to zero disables only the byte limit for discovery; identity,
+timeline and recovery checks remain mandatory. Static DSNs retain their explicit
+connectivity-only mode when lag bytes are zero.
+
+Refresh/probes have bounded deadlines and run sequential refresh rounds. Errors
+disable discovered routing immediately; expiry also prevents routing while a
+refresh is delayed. After `stale_after_ms` without a successful refresh, retained
+pools retire. Successful removal retires immediately: queued checkouts and new
+dials stop, while checked-out reads finish. Retiring entries occupy `max_nodes`
+until drained, so repeated topology changes cannot multiply connection capacity.
+Unchanged endpoints reuse pools. Budget request connections as
+`pool.size × (1 + static replicas + discovery.max_nodes)`, plus one probe per
+endpoint, schema listener, and any enabled pub/sub connections, **per process**.
+Static readers, discovery capacity and an optional primary reader together cannot
+exceed 64. Discovery does not provide cross-process pooling or promote a primary.
+
+`GET /pgvis/cache` and backend status methods expose reader identity, source,
+eligibility/reason, retiring state and pool counters; discovery adds refresh
+success/failure counts, last-success age and active/retiring counts. Discovered
+identities contain system identifier/address/port, never credentials or DSNs.
+Counters describe a pool lifetime and reset when a drained endpoint is recreated.
 
 #### Failover behaviour
 
 pgvis does **not** handle promotion. External tools (Patroni, pg_auto_failover, DNS/VIP) handle that. When the primary becomes unreachable:
-- Active connections fail with a pool error (503 to the client)
+- Checkout failures report unavailability (503); an executing query can fail with an uncertain outcome and is never replayed
 - Once the external tool updates DNS/VIP, the next pool checkout resolves to the new primary
 - No manual restart required — `deadpool-postgres` evicts broken connections automatically
 

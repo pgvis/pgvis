@@ -193,6 +193,11 @@ config keys map directly — see the table in that file). Most-used fields:
 > env vars (`__` for nested keys, e.g. `PGVIS_POOL__SIZE`) → CLI flags. The
 > config file is strict: an unknown key stops startup.
 
+Replica routing supports static DSNs and opt-in discovery of direct physical
+streaming standbys. See the [configuration reference](website/src/content/docs/reference/configuration.mdx)
+for trusted networks/TLS, metadata privileges, bounded pool retirement and
+consistency limits.
+
 ## Advantages
 
 - **Database → LLM tools with zero glue.** Every table and function becomes a

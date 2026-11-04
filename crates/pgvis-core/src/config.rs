@@ -332,7 +332,7 @@ pub struct Config {
     // --- Replicas ---
     /// Read replica configuration for load balancing and failover.
     ///
-    /// When `replica.replica_dsns` is non-empty, the Postgres backend creates
+    /// When `replica.replica_dsns` is non-empty or discovery is configured, the Postgres backend creates
     /// separate connection pools for each replica and distributes read queries
     /// across them using lag-aware round-robin.
     #[serde(default)]
@@ -429,7 +429,7 @@ pub enum OpenApiMode {
 
 /// Configuration for read replicas and load balancing.
 ///
-/// When `replica_dsns` is non-empty, pgvis creates a replica-aware backend that:
+/// When `replica_dsns` is non-empty or discovery is configured, pgvis creates a replica-aware backend that:
 /// - Routes mutations (`is_mutation = true`) exclusively to the primary
 /// - Distributes reads across healthy replicas (and optionally the primary)
 /// - Excludes replicas whose replication lag exceeds `max_replication_lag_bytes`
@@ -464,9 +464,13 @@ pub struct ReplicaConfig {
     #[serde(default)]
     pub replica_dsns: Vec<String>,
 
+    /// Opt-in discovery of direct physical streaming standbys. Static DSNs remain supported.
+    #[serde(default)]
+    pub discovery: Option<ReplicaDiscoveryConfig>,
+
     /// Maximum acceptable replication lag in bytes.
     ///
-    /// Replicas whose WAL receive position is more than this many bytes behind
+    /// Replicas whose WAL replay position is more than this many bytes behind
     /// the primary's current WAL position are excluded from the read pool.
     /// Checked by the health monitor on each tick.
     ///
@@ -477,7 +481,7 @@ pub struct ReplicaConfig {
     /// How often to check replica health and replication lag (milliseconds).
     ///
     /// The health monitor queries `pg_current_wal_lsn()` on the primary and
-    /// `pg_last_wal_receive_lsn()` on each replica at this interval.
+    /// `pg_last_wal_replay_lsn()` on each replica at this interval.
     ///
     /// Default: 5000 (5 seconds).
     #[serde(default = "default_health_check_interval_ms")]
@@ -499,9 +503,44 @@ impl Default for ReplicaConfig {
     fn default() -> Self {
         Self {
             replica_dsns: Vec::new(),
+            discovery: None,
             max_replication_lag_bytes: default_max_replication_lag_bytes(),
             health_check_interval_ms: default_health_check_interval_ms(),
             primary_reads: default_primary_reads(),
+        }
+    }
+}
+
+/// Discovery uses the primary's `pg_stat_replication`, never a replication
+/// client's ephemeral TCP port. Only directly reachable physical standbys on
+/// an explicitly trusted network are supported; cascading/NAT needs static DSNs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReplicaDiscoveryConfig {
+    pub refresh_interval_ms: u64,
+    /// Failed refreshes disable discovered routing immediately. Retained pools
+    /// are retired after this deadline without successful discovery.
+    pub stale_after_ms: u64,
+    /// Includes retiring entries until their in-flight connections drain.
+    pub max_nodes: usize,
+    /// PostgreSQL listening port; otherwise inherit the primary's single port.
+    pub port: Option<u16>,
+    /// Required allow-list, evaluated before sending credentials to any address.
+    pub trusted_cidrs: Vec<String>,
+    /// Development-only escape hatch. Normally discovery requires sslmode=require
+    /// and a valid platform-trusted certificate for the observed hostname/IP.
+    pub allow_insecure: bool,
+}
+
+impl Default for ReplicaDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            refresh_interval_ms: 5000,
+            stale_after_ms: 30000,
+            max_nodes: 8,
+            port: None,
+            trusted_cidrs: Vec::new(),
+            allow_insecure: false,
         }
     }
 }
@@ -596,6 +635,22 @@ pub struct PoolConfig {
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
 
+    /// Maximum simultaneous backend checkouts waiting on the pool. Further
+    /// requests fail with 503 instead of retaining an unbounded queue.
+    #[serde(default = "default_pool_max_waiters")]
+    pub max_waiters: usize,
+
+    /// Client-side query deadline, including transaction setup and completion.
+    /// A configured SQL statement timeout gets an additional second to report
+    /// its own error. Zero explicitly disables this network deadline.
+    #[serde(default = "default_pool_query_timeout_ms")]
+    pub query_timeout_ms: u64,
+
+    /// Optional additive-increase/multiplicative-decrease pool sizing. `size`
+    /// remains the hard ceiling; resizing never cancels checked-out work.
+    #[serde(default)]
+    pub adaptive: Option<AdaptivePoolConfig>,
+
     /// Connection recycling method.
     ///
     /// Controls how connections are validated when returned to the pool:
@@ -621,8 +676,38 @@ impl Default for PoolConfig {
             keepalives_idle_secs: default_keepalives_idle_secs(),
             connect_timeout_secs: default_connect_timeout_secs(),
             recycling_method: RecyclingMethod::default(),
+            max_waiters: default_pool_max_waiters(),
+            query_timeout_ms: default_pool_query_timeout_ms(),
+            adaptive: None,
         }
     }
+}
+
+/// AIMD feedback is measured over a complete query/transaction, excluding
+/// checkout wait. Choose a target for this pool's workload, not a global SLO.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdaptivePoolConfig {
+    pub min_size: usize,
+    pub target_query_time_ms: u64,
+    pub adjustment_interval_ms: u64,
+}
+
+impl Default for AdaptivePoolConfig {
+    fn default() -> Self {
+        Self {
+            min_size: 2,
+            target_query_time_ms: 100,
+            adjustment_interval_ms: 1000,
+        }
+    }
+}
+
+fn default_pool_max_waiters() -> usize {
+    1024
+}
+fn default_pool_query_timeout_ms() -> u64 {
+    30_000
 }
 
 /// Connection recycling method for pooled Postgres connections.

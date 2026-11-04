@@ -368,7 +368,10 @@ pub async fn handle_tool_call(
                 pgvis_core::error::ErrorCode::InvalidOrder.as_str(),
                 e,
                 None,
-                Some("Use PostgREST order syntax, e.g. \"name.asc\", \"age.desc.nullslast\".".to_string()),
+                Some(
+                    "Use PostgREST order syntax, e.g. \"name.asc\", \"age.desc.nullslast\"."
+                        .to_string(),
+                ),
             );
         }
     };
@@ -438,7 +441,8 @@ pub async fn handle_tool_call(
     }
 
     // 7. Build ExecContext.
-    let exec_ctx = anonymous_exec_context(config, is_mutation);
+    let mut exec_ctx = anonymous_exec_context(config, is_mutation);
+    exec_ctx.require_primary = !pgvis_core::plan::replica_read_eligible(&plan, cache);
 
     // 8. Execute via backend, bounded by a per-call deadline.
     //
@@ -538,6 +542,7 @@ pub(crate) fn anonymous_exec_context(config: &Config, is_mutation: bool) -> Exec
         statement_timeout: config.statement_timeout_ms,
         tx_end: None,
         is_mutation,
+        require_primary: false,
         raw_body: false,
         max_affected: None,
         single_row: false,
@@ -928,9 +933,7 @@ fn parse_mcp_filters(
     args: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Vec<Filter>, String> {
     let mut filters = Vec::new();
-    let filters_arg = args
-        .and_then(|a| a.get("filters"))
-        .filter(|v| !v.is_null());
+    let filters_arg = args.and_then(|a| a.get("filters")).filter(|v| !v.is_null());
     // LLMs often send `"id.eq.5"` or `[{"id": "eq.5"}]` here. Ignoring a
     // non-object would leave an UPDATE/DELETE with no WHERE clause.
     if let Some(v) = filters_arg {
@@ -954,7 +957,8 @@ fn parse_mcp_filters(
 /// string. LLMs frequently emit `"limit": "10"` (a string) rather than a number;
 /// without this coercion the value is silently dropped.
 fn json_as_u64(v: &serde_json::Value) -> Option<u64> {
-    v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
 /// Coerce a JSON value into a `bool`, accepting both a JSON bool and the strings
@@ -1219,7 +1223,10 @@ mod tests {
     fn malformed_select_is_an_error_not_star() {
         assert!(parse_mcp_select("id,(").is_err());
         assert!(parse_mcp_select("id,name").is_ok());
-        assert!(matches!(parse_mcp_select(" * ").unwrap()[..], [SelectItem::Star]));
+        assert!(matches!(
+            parse_mcp_select(" * ").unwrap()[..],
+            [SelectItem::Star]
+        ));
     }
 
     // ---- item 5: numeric-string / bool-string coercion ----------------------

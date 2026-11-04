@@ -229,6 +229,12 @@ pub struct Table {
     /// Whether this is a view (as opposed to a base table).
     pub is_view: bool,
 
+    /// Introspection confirmed permanent local table storage without RLS or
+    /// unknown inheritance descendants. Unknown metadata
+    /// stays on the primary; replica execution also enforces READ ONLY.
+    #[serde(default)]
+    pub replica_readable: bool,
+
     /// Whether INSERT is allowed.
     ///
     /// False for: views without INSTEAD OF INSERT triggers, generated-always tables.

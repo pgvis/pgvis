@@ -205,9 +205,8 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(unix)]
             {
                 let reloader = components.reloader.clone();
-                let mut usr1 = tokio::signal::unix::signal(
-                    tokio::signal::unix::SignalKind::user_defined1(),
-                )?;
+                let mut usr1 =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
                 tokio::spawn(async move {
                     while usr1.recv().await.is_some() {
                         tracing::info!("SIGUSR1: reloading the schema cache");
@@ -369,26 +368,20 @@ async fn shutdown_signal() {
     tracing::info!("shutdown requested: finishing in-flight requests");
 }
 
-/// The DSN with any password replaced, for logging.
-///
-/// Handles both URL (`postgres://user:pass@host/db`) and key/value
-/// (`host=h password=pass`) forms.
+/// A connection target safe for logs. URL query parameters can contain
+/// credentials too; libpq keyword values can be quoted and contain spaces.
+/// Avoid an incomplete password parser: omit query/userinfo and redact the
+/// entire keyword form. Never fall back to printing an unrecognised DSN.
 fn redact_dsn(dsn: &str) -> String {
-    if let Some((scheme, rest)) = dsn.split_once("://") {
-        if let Some((userinfo, host)) = rest.split_once('@') {
-            if let Some((user, _)) = userinfo.split_once(':') {
-                return format!("{scheme}://{user}:***@{host}");
-            }
-        }
+    if dsn.starts_with("sqlite:") {
         return dsn.to_string();
     }
-    dsn.split_whitespace()
-        .map(|kv| match kv.split_once('=') {
-            Some((key, _)) if key.eq_ignore_ascii_case("password") => format!("{key}=***"),
-            _ => kv.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    if let Some((scheme @ ("postgres" | "postgresql"), rest)) = dsn.split_once("://") {
+        let target = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+        let target = target.split(['?', '#']).next().unwrap_or_default();
+        return format!("{scheme}://{target}");
+    }
+    "<PostgreSQL connection details redacted>".into()
 }
 
 #[cfg(test)]
@@ -420,22 +413,38 @@ mod tests {
 
     #[test]
     fn a_valid_config_file_still_loads() {
-        let path = write("valid.toml", "jwt_secret = \"s3cret\"\nanon_role = \"web_anon\"\n");
+        let path = write(
+            "valid.toml",
+            "jwt_secret = \"s3cret\"\nanon_role = \"web_anon\"\n",
+        );
         let config = load_config(Some(&path)).unwrap();
         assert_eq!(config.anon_role.as_deref(), Some("web_anon"));
         assert!(config.jwt_secret.is_some());
     }
 
     #[test]
+    fn query_and_quoted_passwords_never_reach_logs() {
+        for dsn in [
+            "postgres://app@db/prod?password=topsecret",
+            "postgres://app:firstsecret@db/prod?password=secondsecret",
+            "host=db password='firstsecret secondsecret' user=app",
+            "host=db password = 'firstsecret secondsecret' user=app",
+        ] {
+            let redacted = redact_dsn(dsn);
+            assert!(!redacted.contains("secret"), "password leaked: {redacted}");
+        }
+    }
+
+    #[test]
     fn dsn_passwords_are_redacted() {
         assert_eq!(
             redact_dsn("postgres://app:hunter2@db:5432/prod"),
-            "postgres://app:***@db:5432/prod"
+            "postgres://db:5432/prod"
         );
-        assert_eq!(redact_dsn("postgres://app@db/prod"), "postgres://app@db/prod");
+        assert_eq!(redact_dsn("postgres://app@db/prod"), "postgres://db/prod");
         assert_eq!(
             redact_dsn("host=db user=app password=hunter2"),
-            "host=db user=app password=***"
+            "<PostgreSQL connection details redacted>"
         );
         assert_eq!(redact_dsn("sqlite:///tmp/x.db"), "sqlite:///tmp/x.db");
     }

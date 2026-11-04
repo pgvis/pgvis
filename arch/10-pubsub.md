@@ -245,3 +245,16 @@ CLI flags on `pgvis serve`: `--pubsub-enabled`, `--pubsub-channel-prefix`
 | `crates/pgvis-mcp/src/server.rs` | MCP `pubsub_publish`/`pubsub_channels` tools |
 | `crates/pgvis-lib/src/lib.rs` | Wiring: creates hub, mounts router |
 | `crates/pgvis-server/src/main.rs` | CLI flags: `--pubsub-enabled`, `--pubsub-channel-prefix` |
+
+
+### Listener resource bounds
+
+PostgreSQL notifications flow directly from the connection driver into the
+bounded broadcast ring; there is no unbounded intermediate queue. Slow
+subscribers can lose messages, reported by the existing lag warning. LISTEN
+connect/commands and command-queue admission have five-second deadlines.
+Dropping `PgPubSub` aborts both its listener and the nested connection driver,
+including during connection establishment or reconnect backoff. Publishing uses
+the bounded managed pool and request deadline; failed or timed-out publishes
+are not replayed automatically. LISTEN/NOTIFY remains best-effort: messages
+sent while disconnected are not recovered.

@@ -1,7 +1,19 @@
 # Metrics and Health
 
-`[Proposed]` — design and phased plan; nothing here is implemented yet beyond
-`Backend::pool_status()` and the `pool` field of `GET /pgvis/cache`.
+The design below remains proposed except for `Backend::pool_status()` and the
+`pool` field of `GET /pgvis/cache`. PostgreSQL snapshots now include the current
+adaptive limit (`max_size`), configured ceiling (`hard_max_size`), occupancy and
+waiters, plus cumulative checkout attempts/errors/rejections/wait microseconds,
+query completions/errors/cancellations/execution microseconds, and AIMD
+increases/decreases. Query counters include dropped requests; errors and
+cancellations are separate. Checkout counters include schema introspection.
+Metrics have no SQL, credentials, table names or other high-cardinality labels.
+Direct use of `PgBackend::pool()` bypasses admission, deadlines and counters.
+Replica `pool_status()` reports the primary pool. `reader_pool_status()` and
+`GET /pgvis/cache`'s `readers` array expose each reader's index, last sampled
+eligibility and pool counters. `is_primary` identifies the shared primary pool
+so aggregate accounting does not double-count it. Histograms, sampled lag bytes
+and a Prometheus exporter remain unimplemented.
 
 pgvis sits between every caller and the database, so it is the natural place to
 answer two questions an operator or an embedding application keeps asking:

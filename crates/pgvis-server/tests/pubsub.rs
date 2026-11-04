@@ -426,3 +426,71 @@ where
     }
     out
 }
+
+#[tokio::test]
+async fn dropping_pubsub_interrupts_a_stalled_connect_and_closes_its_stream() {
+    use pgvis_core::pubsub::PubSubBackend;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let dsn = format!("host=127.0.0.1 port={port} user=pgvis_test dbname=unused sslmode=disable");
+    let backend =
+        pgvis_lib::pgvis_postgres::PgPubSub::new(&dsn, &Default::default(), &Default::default())
+            .unwrap();
+    let mut stream = backend.notification_stream().await.unwrap();
+    let (_socket, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(backend);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            std::future::poll_fn(|cx| stream.as_mut().poll_next(cx))
+        )
+        .await
+        .expect("listener survived its owner")
+        .is_none()
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_queued_subscription_releases_its_admission() {
+    use pgvis_core::pubsub::PubSubBackend;
+    use std::sync::Arc;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dsn = format!(
+        "host=127.0.0.1 port={} user=pgvis_test dbname=unused sslmode=disable",
+        listener.local_addr().unwrap().port()
+    );
+    let config = pgvis_core::pubsub::PubSubConfig {
+        max_subscribers: 1,
+        max_subscribers_per_identity: 1,
+        ..Default::default()
+    };
+    let backend = Arc::new(
+        pgvis_lib::pgvis_postgres::PgPubSub::new(&dsn, &config, &Default::default()).unwrap(),
+    );
+    let (_socket, _) = listener.accept().await.unwrap();
+    for n in 0..64 {
+        backend.listen(&format!("queued{n}")).await.unwrap();
+    }
+    let hub = pgvis_lib::pgvis_router::PubSubHub::new(backend, config)
+        .await
+        .unwrap();
+    let pending = {
+        let hub = hub.clone();
+        tokio::spawn(async move { hub.subscribe_as("cancelled", Some("identity")).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !pending.is_finished(),
+        "subscription should wait on the full command queue"
+    );
+    pending.abort();
+    let _ = pending.await;
+    assert_eq!(
+        hub.status().await.total_subscribers,
+        0,
+        "cancelled subscribe leaked its global slot"
+    );
+}
