@@ -373,7 +373,8 @@ impl Builder {
             DbKind::Postgres => {
                 #[cfg(feature = "postgres")]
                 {
-                    if config.replica.replica_dsns.is_empty() {
+                    if config.replica.replica_dsns.is_empty() && config.replica.discovery.is_none()
+                    {
                         let pg = pgvis_postgres::PgBackend::new(&self.dsn, &config.pool)?;
                         Ok(Arc::new(pg))
                     } else {

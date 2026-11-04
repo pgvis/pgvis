@@ -103,6 +103,23 @@ pub async fn execute_query(
     sql: &str,
     params: &[Value],
 ) -> Result<QueryResult, Error> {
+    execute_query_mode(client, ctx, sql, params, ReadMode::Writer).await
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ReadMode {
+    Writer,
+    ReadOnly,
+    Standby,
+}
+
+pub(crate) async fn execute_query_mode(
+    client: &Client,
+    ctx: &ExecContext,
+    sql: &str,
+    params: &[Value],
+    mode: ReadMode,
+) -> Result<QueryResult, Error> {
     let settings = collect_guc_settings(ctx);
     let setup_sql = set_config_sql(settings.len());
     let setup_params: Vec<(&(dyn ToSql + Sync), Type)> = settings
@@ -123,7 +140,13 @@ pub async fn execute_query(
     // the server rejects the rest of the transaction, so the first error is
     // the real one.
     let (begin, setup, pre_request, main) = futures::join!(
-        client.batch_execute("BEGIN"),
+        client.batch_execute(match mode {
+            ReadMode::Writer => "BEGIN",
+            ReadMode::ReadOnly => "BEGIN READ ONLY",
+            // A promoted endpoint may retain pooled sessions and its replay LSN.
+            // Fail the transaction before the request executes; never replay it.
+            ReadMode::Standby => "BEGIN READ ONLY; SELECT 1 OPERATOR(pg_catalog./) pg_catalog.pg_is_in_recovery()::pg_catalog.int4",
+        }),
         async {
             match &setup_sql {
                 Some(sql) => client.query_typed(sql, &setup_params).await.map(drop),
@@ -242,7 +265,11 @@ fn extract_cte_result(rows: &[tokio_postgres::Row], raw: bool) -> Result<QueryRe
     let Some(row) = rows.first() else {
         // No rows from CTE means something went wrong, but we handle gracefully
         return Ok(QueryResult {
-            body: if raw { Value::Null } else { Value::Array(vec![]) },
+            body: if raw {
+                Value::Null
+            } else {
+                Value::Array(vec![])
+            },
             total_count: None,
             page_total: Some(0),
             response_status: None,
@@ -258,7 +285,10 @@ fn extract_cte_result(rows: &[tokio_postgres::Row], raw: bool) -> Result<QueryRe
         let text = try_get_column::<RawJson>(row, "body").map_or_else(empty, |r| r.0);
         (Value::Null, Some(text))
     } else {
-        (try_get_column(row, "body").unwrap_or(Value::Array(vec![])), None)
+        (
+            try_get_column(row, "body").unwrap_or(Value::Array(vec![])),
+            None,
+        )
     };
 
     // page_total
@@ -298,7 +328,8 @@ impl<'a> tokio_postgres::types::FromSql<'a> for RawJson {
     ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
         // jsonb's binary format is a version byte (1) followed by the text.
         let text = if *ty == Type::JSONB {
-            raw.strip_prefix(&[1]).ok_or("unsupported jsonb binary version")?
+            raw.strip_prefix(&[1])
+                .ok_or("unsupported jsonb binary version")?
         } else {
             raw
         };
@@ -392,7 +423,10 @@ mod tests {
         // Regardless of the inferred type, the format must be Text.
         assert!(matches!(param.encode_format(&Type::INT4), Format::Text));
         assert!(matches!(param.encode_format(&Type::NUMERIC), Format::Text));
-        assert!(matches!(param.encode_format(&Type::TIMESTAMPTZ), Format::Text));
+        assert!(matches!(
+            param.encode_format(&Type::TIMESTAMPTZ),
+            Format::Text
+        ));
     }
 
     #[test]
@@ -498,10 +532,15 @@ mod tests {
             ..Default::default()
         };
         let settings = collect_guc_settings(&ctx);
-        let claims: Value = serde_json::from_str(guc(&settings, "request.jwt.claims").unwrap()).unwrap();
+        let claims: Value =
+            serde_json::from_str(guc(&settings, "request.jwt.claims").unwrap()).unwrap();
         assert_eq!(claims["sub"], "user123");
         // No per-claim `request.jwt.claim.<key>` GUCs any more.
-        assert!(settings.iter().all(|(k, _)| !k.starts_with("request.jwt.claim.")));
+        assert!(
+            settings
+                .iter()
+                .all(|(k, _)| !k.starts_with("request.jwt.claim."))
+        );
     }
 
     #[test]
@@ -523,6 +562,7 @@ mod tests {
             statement_timeout: Some(30000),
             tx_end: None,
             is_mutation: false,
+            require_primary: false,
             raw_body: false,
             max_affected: None,
             single_row: false,
@@ -542,7 +582,10 @@ mod tests {
         assert_eq!(&json.0[..], text);
         let mut jsonb = vec![1u8];
         jsonb.extend_from_slice(text);
-        assert_eq!(&RawJson::from_sql(&Type::JSONB, &jsonb).unwrap().0[..], text);
+        assert_eq!(
+            &RawJson::from_sql(&Type::JSONB, &jsonb).unwrap().0[..],
+            text
+        );
         assert!(RawJson::from_sql(&Type::JSONB, &[2, b'1']).is_err());
     }
 

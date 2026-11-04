@@ -20,6 +20,7 @@
 //! println!("Found {} tables", cache.tables.len());
 //! ```
 
+mod discovery;
 pub mod execute;
 pub mod introspect;
 mod pool;
@@ -149,6 +150,14 @@ impl Checkout {
         pool.get().await.map(|c| Self(Some(c))).map_err(pool_error)
     }
 
+    pub(crate) fn client(&self) -> &tokio_postgres::Client {
+        self.0.as_ref().expect("checked out")
+    }
+
+    pub(crate) fn recycle(mut self) {
+        drop(self.0.take());
+    }
+
     async fn introspect(mut self, cfg: &IntrospectConfig) -> Result<SchemaCache, Error> {
         let result =
             introspect::load_schema_cache(self.0.as_mut().expect("checked out"), cfg).await;
@@ -163,9 +172,10 @@ impl Checkout {
         ctx: &ExecContext,
         sql: &str,
         params: &[Value],
+        mode: execute::ReadMode,
     ) -> Result<QueryResult, Error> {
         let client = self.0.as_ref().expect("checked out");
-        let result = execute::execute_query(client, ctx, sql, params).await;
+        let result = execute::execute_query_mode(client, ctx, sql, params, mode).await;
         drop(self.0.take());
         result
     }
@@ -198,13 +208,23 @@ pub(crate) fn create_pool(dsn: &str, pool_cfg: &PoolConfig) -> Result<Pool, Erro
     let mut cfg = DeadpoolConfig::new();
     cfg.url = Some(dsn.to_string());
 
+    let pg = cfg
+        .get_pg_config()
+        .map_err(|_| Error::Introspection("invalid PostgreSQL configuration".into()))?;
+    create_pool_config(pg, pool_cfg)
+}
+
+pub(crate) fn create_pool_config(
+    mut pg: tokio_postgres::Config,
+    pool_cfg: &PoolConfig,
+) -> Result<Pool, Error> {
     // Connection-level settings
-    cfg.keepalives = Some(pool_cfg.keepalives);
+    pg.keepalives(pool_cfg.keepalives);
     if pool_cfg.keepalives {
-        cfg.keepalives_idle = Some(Duration::from_secs(pool_cfg.keepalives_idle_secs));
+        pg.keepalives_idle(Duration::from_secs(pool_cfg.keepalives_idle_secs));
     }
     if pool_cfg.connect_timeout_secs > 0 {
-        cfg.connect_timeout = Some(Duration::from_secs(pool_cfg.connect_timeout_secs));
+        pg.connect_timeout(Duration::from_secs(pool_cfg.connect_timeout_secs));
     }
 
     // Pool-level timeouts
@@ -226,23 +246,30 @@ pub(crate) fn create_pool(dsn: &str, pool_cfg: &PoolConfig) -> Result<Pool, Erro
         },
     };
 
-    cfg.pool = Some(deadpool_postgres::PoolConfig {
+    let config = deadpool_postgres::PoolConfig {
         max_size: pool_cfg.size as usize,
         timeouts,
         ..Default::default()
-    });
+    };
 
     // Recycling method
-    cfg.manager = Some(ManagerConfig {
+    let manager_config = ManagerConfig {
         recycling_method: match pool_cfg.recycling_method {
             pgvis_core::config::RecyclingMethod::Fast => RecyclingMethod::Fast,
             pgvis_core::config::RecyclingMethod::Verified => RecyclingMethod::Verified,
             pgvis_core::config::RecyclingMethod::Clean => RecyclingMethod::Clean,
         },
-    });
+    };
 
-    cfg.create_pool(Some(Runtime::Tokio1), tls_connector())
-        .map_err(|e| Error::Introspection(format!("failed to create pool: {e}")))
+    Pool::builder(deadpool_postgres::Manager::from_config(
+        pg,
+        tls_connector(),
+        manager_config,
+    ))
+    .config(config)
+    .runtime(Runtime::Tokio1)
+    .build()
+    .map_err(|e| Error::Introspection(format!("failed to create pool: {e}")))
 }
 
 /// TLS connector shared by every Postgres connection (pool and pub/sub).

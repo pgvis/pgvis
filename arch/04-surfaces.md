@@ -155,7 +155,7 @@ mounted at `/mcp`) ([transport.rs](../crates/pgvis-mcp/src/transport.rs)).
 [pgvis-lib](../crates/pgvis-lib/src/lib.rs) is a fluent `Builder` for host
 Rust apps: `Builder::new(dsn).schemas([...]).build().await -> axum::Router`.
 `build_components()` picks the backend from the DSN (`PgBackend`, or
-`PgReplicaBackend` when `replica.replica_dsns` is set, or `SqliteBackend`),
+`PgReplicaBackend` when `replica.replica_dsns` or `replica.discovery` is set, or `SqliteBackend`),
 introspects into an `ArcSwap<SchemaCache>`, spawns the `SchemaReloader`, calls
 `pgvis-router::build_app`, nests the pub/sub router at `/pubsub` when enabled
 (Postgres only), and optionally merges the MCP Streamable-HTTP service at

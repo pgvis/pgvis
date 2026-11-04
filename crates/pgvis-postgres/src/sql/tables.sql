@@ -147,6 +147,14 @@ SELECT
   c.relname::text AS table_name,
   d.description AS table_description,
   c.relkind IN ('v','m') AS is_view,
+  (c.relkind IN ('r','p') AND c.relpersistence = 'p' AND NOT c.relrowsecurity
+   -- Traditional inheritance may hide foreign descendants; partition trees
+   -- are checked recursively below, ordinary inheritance stays primary.
+   AND (c.relkind = 'p' OR NOT EXISTS (
+     SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhparent = c.oid))
+   AND NOT EXISTS (SELECT 1 FROM pg_partition_tree(c.oid) pt
+     JOIN pg_class pc ON pc.oid = pt.relid
+     WHERE pc.relkind = 'f' OR pc.relpersistence <> 'p' OR pc.relrowsecurity)) AS replica_readable,
   (
     c.relkind IN ('r','p')
     OR (

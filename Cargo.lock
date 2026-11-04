@@ -1639,6 +1639,7 @@ dependencies = [
  "deadpool-postgres",
  "futures",
  "indexmap",
+ "ipnet",
  "pgvis-core",
  "rustls",
  "rustls-native-certs",
@@ -1648,6 +1649,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
+ "tokio-util",
  "tracing",
 ]
 
@@ -2718,6 +2720,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",

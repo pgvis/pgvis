@@ -23,20 +23,17 @@ pub async fn query_tables(
         let mut tables = IndexMap::new();
 
         // Step 1: Get all table/view names from sqlite_master
-        let mut table_stmt = conn
-            .prepare(
-                "SELECT name, type FROM sqlite_master \
+        let mut table_stmt = conn.prepare(
+            "SELECT name, type FROM sqlite_master \
                  WHERE type IN ('table', 'view') \
                  AND name NOT LIKE 'sqlite_%' \
                  ORDER BY name",
-            )
-            ?;
+        )?;
 
         let table_entries: Vec<(String, String)> = table_stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            ?
+            })?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -46,16 +43,13 @@ pub async fn query_tables(
             let ident = QualifiedIdentifier::new("main", name.as_str());
 
             // Query columns via PRAGMA table_xinfo (includes hidden/generated cols)
-            let columns =
-                query_columns(conn, name)?;
+            let columns = query_columns(conn, name)?;
 
             // Query unique constraints (includes PK) via PRAGMA index_list + index_info
-            let unique_constraints = query_unique_constraints(conn, name)
-                ?;
+            let unique_constraints = query_unique_constraints(conn, name)?;
 
             // Determine PK columns
-            let pk_cols = determine_pk_cols(conn, name, &unique_constraints)
-                ?;
+            let pk_cols = determine_pk_cols(conn, name, &unique_constraints)?;
 
             tables.insert(
                 ident.clone(),
@@ -63,6 +57,7 @@ pub async fn query_tables(
                     ident,
                     description: None, // SQLite has no COMMENT mechanism
                     is_view,
+                    replica_readable: false,
                     insertable: !is_view,
                     updatable: !is_view,
                     deletable: !is_view,

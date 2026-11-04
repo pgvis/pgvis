@@ -108,6 +108,7 @@ pub async fn query_tables(
                 ident,
                 description,
                 is_view,
+                replica_readable: row.get("replica_readable"),
                 insertable,
                 updatable,
                 deletable,

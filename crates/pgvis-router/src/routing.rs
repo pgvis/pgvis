@@ -188,6 +188,7 @@ impl AppState {
             statement_timeout: self.config.statement_timeout_ms,
             tx_end: None,
             is_mutation: plan_writes(&plan),
+            require_primary: !pgvis_core::plan::replica_read_eligible(&plan, &cache),
             raw_body: false,
             max_affected: None,
             single_row: false,
@@ -341,6 +342,7 @@ impl AppState {
             statement_timeout: self.config.statement_timeout_ms,
             tx_end: None,
             is_mutation: false,
+            require_primary: !pgvis_core::plan::replica_read_eligible(&plan, &cache),
             raw_body: false,
             max_affected: None,
             single_row: false,
@@ -729,6 +731,7 @@ async fn handle_cache_info(State(state): State<AppState>, headers: HeaderMap) ->
         "stats": stats,
         "pool": state.backend.pool_status(),
         "readers": state.backend.reader_pool_status(),
+        "replica_discovery": state.backend.replica_discovery_status(),
     });
 
     (StatusCode::OK, Json(body)).into_response()
@@ -856,6 +859,7 @@ async fn dispatch_request(
     // 4. Build ExecContext (JWT already verified above, before planning).
     let is_mutation = plan_writes(&plan);
     let mut exec_ctx = build_exec_context(&state.config, &auth, &preferences, is_mutation);
+    exec_ctx.require_primary = !pgvis_core::plan::replica_read_eligible(&plan, &cache);
     // Table reads are forwarded as the database's JSON text: no parse and
     // re-serialize. (RPC/mutation bodies are reshaped below, so stay parsed.)
     exec_ctx.raw_body = matches!(plan, ActionPlan::Read(_));
@@ -1391,6 +1395,7 @@ pub(crate) fn build_exec_context(
         statement_timeout: config.statement_timeout_ms,
         tx_end,
         is_mutation,
+        require_primary: false,
         raw_body: false,
         max_affected: None,
         single_row: false,

@@ -332,7 +332,7 @@ pub struct Config {
     // --- Replicas ---
     /// Read replica configuration for load balancing and failover.
     ///
-    /// When `replica.replica_dsns` is non-empty, the Postgres backend creates
+    /// When `replica.replica_dsns` is non-empty or discovery is configured, the Postgres backend creates
     /// separate connection pools for each replica and distributes read queries
     /// across them using lag-aware round-robin.
     #[serde(default)]
@@ -429,7 +429,7 @@ pub enum OpenApiMode {
 
 /// Configuration for read replicas and load balancing.
 ///
-/// When `replica_dsns` is non-empty, pgvis creates a replica-aware backend that:
+/// When `replica_dsns` is non-empty or discovery is configured, pgvis creates a replica-aware backend that:
 /// - Routes mutations (`is_mutation = true`) exclusively to the primary
 /// - Distributes reads across healthy replicas (and optionally the primary)
 /// - Excludes replicas whose replication lag exceeds `max_replication_lag_bytes`
@@ -463,6 +463,10 @@ pub struct ReplicaConfig {
     /// Environment variable: `PGVIS_REPLICA_DSNS` (comma-separated).
     #[serde(default)]
     pub replica_dsns: Vec<String>,
+
+    /// Opt-in discovery of direct physical streaming standbys. Static DSNs remain supported.
+    #[serde(default)]
+    pub discovery: Option<ReplicaDiscoveryConfig>,
 
     /// Maximum acceptable replication lag in bytes.
     ///
@@ -499,9 +503,44 @@ impl Default for ReplicaConfig {
     fn default() -> Self {
         Self {
             replica_dsns: Vec::new(),
+            discovery: None,
             max_replication_lag_bytes: default_max_replication_lag_bytes(),
             health_check_interval_ms: default_health_check_interval_ms(),
             primary_reads: default_primary_reads(),
+        }
+    }
+}
+
+/// Discovery uses the primary's `pg_stat_replication`, never a replication
+/// client's ephemeral TCP port. Only directly reachable physical standbys on
+/// an explicitly trusted network are supported; cascading/NAT needs static DSNs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReplicaDiscoveryConfig {
+    pub refresh_interval_ms: u64,
+    /// Failed refreshes disable discovered routing immediately. Retained pools
+    /// are retired after this deadline without successful discovery.
+    pub stale_after_ms: u64,
+    /// Includes retiring entries until their in-flight connections drain.
+    pub max_nodes: usize,
+    /// PostgreSQL listening port; otherwise inherit the primary's single port.
+    pub port: Option<u16>,
+    /// Required allow-list, evaluated before sending credentials to any address.
+    pub trusted_cidrs: Vec<String>,
+    /// Development-only escape hatch. Normally discovery requires sslmode=require
+    /// and a valid platform-trusted certificate for the observed hostname/IP.
+    pub allow_insecure: bool,
+}
+
+impl Default for ReplicaDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            refresh_interval_ms: 5000,
+            stale_after_ms: 30000,
+            max_nodes: 8,
+            port: None,
+            trusted_cidrs: Vec::new(),
+            allow_insecure: false,
         }
     }
 }

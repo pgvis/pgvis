@@ -172,6 +172,7 @@ async fn replica_lag_recovery_primary_loss_and_external_promotion() {
     let replicas = ReplicaConfig {
         replica_dsns: vec![cluster.dsn(cluster.standby_port)],
         primary_reads: false,
+        discovery: None,
         health_check_interval_ms: 50,
         max_replication_lag_bytes: 4096,
     };

@@ -69,6 +69,7 @@ impl Adaptive {
 
 struct Inner {
     config: PoolConfig,
+    retired: tokio_util::sync::CancellationToken,
     waiting: AtomicUsize,
     counters: Counters,
     adaptive: Mutex<Option<Adaptive>>,
@@ -82,6 +83,17 @@ pub(crate) struct ManagedPool {
 
 impl ManagedPool {
     pub(crate) fn new(dsn: &str, config: &PoolConfig) -> Result<Self, Error> {
+        Self::from_raw(crate::create_pool(dsn, config)?, config)
+    }
+
+    pub(crate) fn from_config(
+        pg: tokio_postgres::Config,
+        config: &PoolConfig,
+    ) -> Result<Self, Error> {
+        Self::from_raw(crate::create_pool_config(pg, config)?, config)
+    }
+
+    fn from_raw(raw: Pool, config: &PoolConfig) -> Result<Self, Error> {
         if config.size == 0 || config.max_waiters == 0 {
             return Err(Error::Introspection(
                 "pool size and max_waiters must be positive".into(),
@@ -97,7 +109,6 @@ impl ManagedPool {
         {
             return Err(Error::Introspection("adaptive pool requires positive deadlines/interval/target and min_size within size".into()));
         }
-        let raw = crate::create_pool(dsn, config)?;
         let adaptive = config.adaptive.clone().map(|config| {
             raw.resize(config.min_size);
             Adaptive {
@@ -113,6 +124,7 @@ impl ManagedPool {
             raw,
             inner: Arc::new(Inner {
                 config: config.clone(),
+                retired: tokio_util::sync::CancellationToken::new(),
                 waiting: AtomicUsize::new(0),
                 counters: Counters::default(),
                 adaptive: Mutex::new(adaptive),
@@ -139,7 +151,20 @@ impl ManagedPool {
         let waiting = Waiting(&self.inner, Instant::now());
         let status = self.raw.status();
         let demand = status.available == 0 && status.size >= status.max_size;
-        let get = Checkout::get(&self.raw);
+        let get = async {
+            tokio::select! {
+                biased;
+                _ = self.inner.retired.cancelled() => Err(Error::Introspection("reader pool retired".into())),
+                result = Checkout::get(&self.raw) => {
+                    // A stale topology snapshot must not return a newly acquired
+                    // connection after retirement, even when both futures were ready.
+                    if self.inner.retired.is_cancelled() {
+                        drop(result);
+                        Err(Error::Introspection("reader pool retired".into()))
+                    } else { result }
+                }
+            }
+        };
         // A single overall checkout deadline, not one full timeout per phase.
         let result = if self.inner.config.timeout_ms == 0 {
             get.await
@@ -189,13 +214,25 @@ impl ManagedPool {
         sql: &str,
         params: &[Value],
     ) -> Result<QueryResult, Error> {
+        self.execute_mode(checkout, ctx, sql, params, crate::execute::ReadMode::Writer)
+            .await
+    }
+
+    pub(crate) async fn execute_mode(
+        &self,
+        checkout: Checkout,
+        ctx: &ExecContext,
+        sql: &str,
+        params: &[Value],
+        mode: crate::execute::ReadMode,
+    ) -> Result<QueryResult, Error> {
         let mut running = Running {
             pool: self,
             started: Instant::now(),
             completed: false,
             success: false,
         };
-        let query = checkout.execute(ctx, sql, params);
+        let query = checkout.execute(ctx, sql, params, mode);
         let deadline_ms = self.inner.config.query_timeout_ms;
         let result = if deadline_ms == 0 {
             query.await
@@ -232,6 +269,9 @@ impl ManagedPool {
 
     fn feedback(&self, congested: bool, demand: bool, success: bool) {
         let mut adaptive = self.inner.adaptive.lock().expect("adaptive pool lock");
+        if self.inner.retired.is_cancelled() {
+            return;
+        }
         if let Some(state) = adaptive.as_mut() {
             let old = state.limit;
             if let Some(next) = state.observe(
@@ -249,6 +289,17 @@ impl ManagedPool {
                 }
             }
         }
+    }
+
+    pub(crate) fn retire(&self) {
+        // Serialize against AIMD resize so feedback cannot reopen admission.
+        let _adaptive = self.inner.adaptive.lock().expect("adaptive pool lock");
+        self.inner.retired.cancel();
+        self.raw.close();
+    }
+
+    pub(crate) fn drained(&self) -> bool {
+        self.raw.status().size == 0 && self.inner.waiting.load(Relaxed) == 0
     }
 
     pub(crate) fn status(&self) -> PoolStatus {
@@ -326,6 +377,46 @@ fn micros(elapsed: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn retirement_cancels_pending_connect_and_stale_clones_cannot_dial() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let pool = ManagedPool::new(
+            &format!("host=127.0.0.1 port={port} user=probe dbname=probe sslmode=disable"),
+            &PoolConfig {
+                size: 1,
+                timeout_ms: 10000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let stale = pool.clone();
+        let pending = tokio::spawn(async move { stale.checkout().await });
+        let (mut socket, _) = listener.accept().await.unwrap();
+        pool.retire();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(pool.checkout().await.is_err());
+        assert!(pool.drained());
+        // The cancelled handshake closes its socket; no new dial from stale clones.
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), socket.read_to_end(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn aimd_grows_under_demand_backs_off_and_never_exceeds_its_bounds() {
         let now = Instant::now();

@@ -10,8 +10,10 @@
 
 pub mod planner;
 pub mod resolve;
+pub mod routing;
 pub mod types;
 pub mod validate;
+pub use routing::replica_read_eligible;
 
 pub use planner::{PlanConfig, plan_request};
 pub use types::*;

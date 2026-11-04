@@ -173,13 +173,14 @@ so identical pool settings apply uniformly to the primary and all replica pools
 [`PgReplicaBackend`](../crates/pgvis-postgres/src/replica.rs) extends the
 single-server model with replica-aware routing:
 
-Every read picks an eligible reader from the health bitfield; writes, and
-anything that may write, stay on the primary.
+Eligible plans select a reader from a bounded snapshot of stable pool entries.
+Writes, unverified read plans, pre-request hooks and explicit primary-consistency
+requests stay on the primary. All adapters use `plan::replica_read_eligible`.
 
 ```mermaid
 flowchart TB
     exec(["Backend::execute(ctx, sql, params)"])
-    write{"ctx.is_mutation?"}
+    write{"mutation, require_primary,<br/>or pre_request?"}
     pick{"eligible reader?"}
     get{"reader checkout ok?"}
     reader["<b>Reader pool</b><br/>replica, or primary if primary_reads"]
@@ -199,8 +200,10 @@ flowchart TB
 - `is_mutation = true` → always the primary pool. The router sets it for
   mutations *and* for calls to `VOLATILE` functions (`plan_writes`), and the
   pub/sub handlers set it for their statements (NOTIFY, the authorize
-  function), so nothing that may write reaches a standby.
-- `is_mutation = false` → round-robin across eligible readers (replicas +
+  function). Unknown table metadata, views, foreign/nonpermanent tables, inheritance parents, RLS and computed
+  relationships set `require_primary`. Volatility is not proof of side-effect
+  freedom: reader transactions enforce READ ONLY and never replay execution errors.
+- Eligible read plans without a hook or `require_primary` → round-robin across readers (replicas +
   optionally the primary); on a checkout failure the next eligible reader is
   tried once.
 - No eligible reader, or both tries failed → the primary.
@@ -214,9 +217,11 @@ unreachable, excluding it and piling its load onto the rest. Each tick reads
 each under its own deadline, comparing `pg_last_wal_replay_lsn()` (the
 position visible to queries) with the primary's. Replicas more than
 `max_replication_lag_bytes` (default 10 MB) behind, unreachable, or not in
-recovery are excluded. When lag checking is disabled or the primary cannot be
-read, the check falls back to connectivity only (`SELECT 1`). The result is
-stored in an atomic `u64` bitfield (at most 64 readers) for lock-free routing.
+recovery are excluded. Unknown primary LSN excludes lag-checked readers. Static
+DSNs with explicitly disabled lag checking retain connectivity-only probes.
+A short mutex protects the topology snapshot; each entry has its own eligibility
+and retirement gate. No lock is held across network I/O and no old bitmap can
+select a different replacement pool. At most 64 reader slots are supported.
 
 ```mermaid
 flowchart TB
@@ -226,7 +231,7 @@ flowchart TB
     lag{"reachable, in recovery,<br/>lag within the limit?"}
     ok["<b>eligible</b>"]
     out["<b>excluded</b><br/>lagging or unreachable"]
-    bits[("AtomicU64 eligibility bits")]
+    bits[("Stable reader entries + eligibility")]
 
     tick --> lsn --> probe --> lag
     lag -->|yes| ok --> bits
@@ -249,9 +254,12 @@ in `Config.replica`:
 - `max_replication_lag_bytes` — lag threshold (0 disables checking)
 - `health_check_interval_ms` — monitor tick interval
 - `primary_reads` — whether primary participates in read load balancing
+- `discovery` — opt-in bounded physical streaming discovery, trusted networks,
+  listening port, refresh/stale intervals and capacity. See the
+  [configuration reference](../website/src/content/docs/reference/configuration.mdx).
 
 **Activation:** Automatic via the Builder. When `config.replica.replica_dsns`
-is non-empty and the DSN is Postgres, `pgvis-lib` constructs
+is non-empty or discovery is configured, and the DSN is Postgres, `pgvis-lib` constructs
 `PgReplicaBackend` instead of `PgBackend`. No surface-layer changes needed.
 
 ## The `Dialect` struct
@@ -403,8 +411,9 @@ and must not resize beyond their budget.
 
 Replica lag checks use replay LSN (not received WAL) and start with unverified
 replicas excluded. If primary LSN cannot be obtained, lag cannot be proven and
-readers are excluded for that check; `max_replication_lag_bytes = 0` explicitly opts
-into connectivity-only checks. Probes run immediately at startup, then at the
+readers are excluded for that check; static DSNs with `max_replication_lag_bytes = 0`
+explicitly opt into connectivity-only checks. Discovery always verifies cluster
+identity, receiving timeline and recovery, even when the byte limit is disabled. Probes run immediately at startup, then at the
 configured positive interval. Health can change between probe and query;
 requests still need error handling. Promotion and writer endpoint selection
 belong to the PostgreSQL HA system; pgvis does not elect or promote a primary.
@@ -432,3 +441,18 @@ its ramp-up. This synthetic single-process run validates bounds and records
 ramp-up cost; it does not model a multi-node production workload, network
 partitions, or compare PgBouncer throughput. A separate regression verifies
 that shrinking preserves active work and retires excess connections on return.
+
+The opt-in `discovery` integration test needs an isolated Linux Ubuntu host,
+passwordless sudo, iproute2 and PostgreSQL tools in the Nix development shell:
+
+```sh
+PGVIS_DISCOVERY_NETNS=1 cargo test -p pgvis-server --test discovery -- --ignored --nocapture
+```
+
+It creates and cleans up a private bridge, two network namespaces and three
+PostgreSQL clusters. Namespaces make each WAL receiver originate from its query
+address, unlike multiple loopback listeners. It checks plan routing and schema
+reload, discovery membership and privilege failure, draining reads, bounded
+flapping, restoration, pooled-session promotion safety and task cleanup. It never
+uses an existing PostgreSQL database. Do not run the privileged fixture on a
+shared production host.
