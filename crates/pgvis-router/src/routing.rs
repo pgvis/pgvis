@@ -944,16 +944,20 @@ async fn dispatch_request(
         Err(err) => return response::format_error(&err),
     };
 
-    // 5b. Data cache: store result on cache miss. `cache_key` is `Some` only for
-    // cacheable reads, so no need to re-match the plan here.
-    if let (Some(key), Some(dc)) = (&cache_key, &state.data_cache) {
-        dc.store(
-            key,
-            result.json_bytes(),
-            result.total_count,
-            result.page_total,
-        );
-        tracing::debug!(cache_key = %key, "data cache store");
+    // 5b. A read can set response GUCs through a view or policy even without
+    // a pre-request hook. Cached entries contain only body/counts: storing
+    // such a result would drop its status or headers (including no-store and
+    // cookies) on the next hit. Keep customized responses on the live path.
+    if result.response_status.is_none() && result.response_headers.is_none() {
+        if let (Some(key), Some(dc)) = (&cache_key, &state.data_cache) {
+            dc.store(
+                key,
+                result.json_bytes(),
+                result.total_count,
+                result.page_total,
+            );
+            tracing::debug!(cache_key = %key, "data cache store");
+        }
     }
 
     // 5c. Data cache: invalidate on writes. Mutations target a known table;
@@ -1638,6 +1642,125 @@ fn http_method_to_request_method(method: &axum::http::Method) -> RequestMethod {
 mod tests {
     use super::*;
     use jsonwebtoken::{EncodingKey, Header, encode};
+
+    struct ResponseBackend {
+        result: QueryResult,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Backend for ResponseBackend {
+        fn introspect(
+            &self,
+            _: &pgvis_core::backend::IntrospectConfig,
+        ) -> futures::future::BoxFuture<'_, Result<SchemaCache, Error>> {
+            Box::pin(async { Ok(SchemaCache::default()) })
+        }
+
+        fn execute(
+            &self,
+            _: &ExecContext,
+            _: &str,
+            _: &[serde_json::Value],
+        ) -> futures::future::BoxFuture<'_, Result<QueryResult, Error>> {
+            Box::pin(async {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(self.result.clone())
+            })
+        }
+
+        fn dialect(&self) -> &'static Dialect {
+            &pgvis_core::POSTGRES
+        }
+    }
+
+    // Exercise the actual dispatch/cache/response pipeline, including a normal
+    // cache hit as a control. A database may set these overrides while reading
+    // a view or evaluating a policy, even without a pre-request hook.
+    #[tokio::test]
+    async fn cached_reads_do_not_drop_database_response_overrides() {
+        use pgvis_core::cache::{QualifiedIdentifier, Table};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for (status, headers) in [
+            (None, None),
+            (Some(202), None),
+            (
+                None,
+                Some(vec![("cache-control".to_string(), "no-store".to_string())]),
+            ),
+            (
+                Some(403),
+                Some(vec![("x-policy".to_string(), "denied".to_string())]),
+            ),
+        ] {
+            let backend = Arc::new(ResponseBackend {
+                result: QueryResult {
+                    body: serde_json::json!([]),
+                    total_count: None,
+                    page_total: Some(0),
+                    response_status: status,
+                    response_headers: headers.clone(),
+                    was_insert: None,
+                    raw_body: None,
+                },
+                calls: AtomicUsize::new(0),
+            });
+            let mut schema = SchemaCache::default();
+            let ident = QualifiedIdentifier::new("public", "items");
+            schema.tables.insert(
+                ident.clone(),
+                Table {
+                    ident,
+                    description: None,
+                    is_view: false,
+                    replica_readable: false,
+                    insertable: true,
+                    updatable: true,
+                    deletable: true,
+                    pk_cols: vec![],
+                    unique_constraints: vec![],
+                    columns: Default::default(),
+                },
+            );
+            let mut config = Config::default();
+            config.cache.enabled = true;
+            config.cache.cache_lists = true;
+            config.cache.ttl_seconds = 60;
+            let state = AppState::new(
+                Arc::new(ArcSwap::new(Arc::new(schema))),
+                Arc::new(config),
+                Arc::new(pgvis_core::POSTGRES.clone()),
+                backend.clone(),
+            );
+            for _ in 0..2 {
+                let response = dispatch_request(
+                    &state,
+                    "public".into(),
+                    "items".into(),
+                    RequestMethod::Get,
+                    false,
+                    &HeaderMap::new(),
+                    &QueryParams::from(&HashMap::new()),
+                    None,
+                )
+                .await;
+                assert_eq!(response.status().as_u16(), status.unwrap_or(200));
+                for (name, value) in headers.iter().flatten() {
+                    assert_eq!(response.headers().get(name).unwrap(), value);
+                }
+            }
+            let customized = status.is_some() || headers.is_some();
+            assert_eq!(
+                backend.calls.load(Ordering::Relaxed),
+                if customized { 2 } else { 1 }
+            );
+            assert_eq!(
+                state.data_cache.as_ref().unwrap().stats().hits,
+                if customized { 0 } else { 1 }
+            );
+        }
+    }
 
     const SECRET: &str = "a-test-secret-that-is-long-enough";
 

@@ -70,9 +70,21 @@ cacheability and returns `Some(key)` or `None`:
 | Any query with embeds | Never |
 | Mutations (`POST`/`PATCH`/`PUT`/`DELETE`), RPC | Never read-cached |
 | Any read while `pre_request` is configured | Never (the hook must see every request) |
+| Read result with a database-supplied status or headers | Never stored (custom status, cookies and cache directives must not disappear on a hit) |
 
 Embeds are excluded because a join pulls rows from multiple tables; only the
 top-level table is tracked.
+
+Read expressions, views and policies can set `response.status` or
+`response.headers` even without a pre-request hook. Those responses bypass
+storage because cached entries retain only body bytes and counts. Ordinary
+responses still use the cache. This does not discover arbitrary database-side
+authorization dependencies: keep authorization-sensitive reads live when
+revocation must take effect before the configured TTL.
+
+The in-process `AppState::call_read` and `call_rpc*` APIs always execute against
+the backend; they do not read from this HTTP response cache. Mutating in-process
+RPCs invalidate the cache belonging to that same `AppState`.
 
 ### Key identity
 
